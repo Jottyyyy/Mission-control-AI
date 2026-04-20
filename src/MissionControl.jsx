@@ -1,9 +1,17 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import Data from './data.jsx';
 import Icon from './icons.jsx';
+import {
+  API_BASE,
+  SoulSection,
+  RulesSection,
+  AboutYouSection,
+  WorkspaceSection,
+  NewSkillModal,
+} from './SettingsEditor.jsx';
 
-function MissionControl({ onBack }) {
-  const [tab, setTab] = useState("apps"); // apps | skills | memory | activity
+function MissionControl({ onBack, onOpenChatPrefilled }) {
+  const [tab, setTab] = useState("apps"); // apps | skills | soul | rules | aboutyou | memory | workspace | activity
   const [panelApp, setPanelApp] = useState(null);
 
   const Header = () => (
@@ -26,10 +34,14 @@ function MissionControl({ onBack }) {
 
   const TabRail = () => {
     const tabs = [
-      { id: "apps", label: "Connected apps", icon: "Grid" },
-      { id: "skills", label: "Skills", icon: "Sparkles" },
-      { id: "memory", label: "Memory", icon: "Brain" },
-      { id: "activity", label: "Activity log", icon: "Activity" },
+      { id: "apps",      label: "Connected apps", icon: "Grid" },
+      { id: "skills",    label: "Skills",         icon: "Sparkles" },
+      { id: "soul",      label: "Soul",           icon: "Brain" },
+      { id: "rules",     label: "Rules",          icon: "FileText" },
+      { id: "aboutyou",  label: "About you",      icon: "Users" },
+      { id: "memory",    label: "Memory",         icon: "BookOpen" },
+      { id: "workspace", label: "Workspace",      icon: "Folder" },
+      { id: "activity",  label: "Activity log",   icon: "Activity" },
     ];
     return (
       <div
@@ -55,7 +67,8 @@ function MissionControl({ onBack }) {
   };
 
   const Apps = () => (
-    <div className="px-8 py-8 overflow-y-auto flex-1">
+    <div className="px-4 sm:px-6 lg:px-8 py-8 overflow-y-auto flex-1">
+      <div className="mx-auto w-full" style={{ maxWidth: 1120 }}>
       <div className="mb-8">
         <h2 style={{ fontSize: 20, fontWeight: 500, marginBottom: 4 }}>Connected apps</h2>
         <p style={{ color: "var(--fg-muted)", fontSize: 14 }}>
@@ -65,7 +78,7 @@ function MissionControl({ onBack }) {
 
       <div style={{ color: "var(--fg-faint)", fontSize: 12, marginBottom: 12 }}>Connected</div>
       {Data.connectedApps.length > 0 ? (
-        <div className="grid grid-cols-3 gap-4 mb-10">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-10">
           {Data.connectedApps.map((a) => (
             <div key={a.name} className="card p-4">
               <div className="flex items-center gap-3">
@@ -96,7 +109,7 @@ function MissionControl({ onBack }) {
       )}
 
       <div style={{ color: "var(--fg-faint)", fontSize: 12, marginBottom: 12 }}>Available to add</div>
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {Data.availableApps.map((a) => (
           <button
             key={a.name}
@@ -122,19 +135,45 @@ function MissionControl({ onBack }) {
           </button>
         ))}
       </div>
+      </div>
     </div>
   );
 
   const Skills = () => {
-    const [toggles, setToggles] = useState(() => {
-      const init = {};
-      Data.skills.forEach((s) => { init[s.id] = s.on; });
-      return init;
-    });
-    const [galleryOpen, setGalleryOpen] = useState(false);
+    const [skills, setSkills] = useState(Data.skills);
+    const [fetchError, setFetchError] = useState(null);
+    const [modalOpen, setModalOpen] = useState(false);
 
-    const personal  = Data.skills.filter((s) => s.group === "personal");
-    const marketing = Data.skills.filter((s) => s.group === "marketing");
+    const loadSkills = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/skills`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (Array.isArray(data.skills)) setSkills(data.skills);
+        setFetchError(null);
+      } catch (err) {
+        setFetchError(err.message || "Could not load skills from backend.");
+        // Fall back to the baked-in client list so the UI still shows something.
+        setSkills(Data.skills);
+      }
+    };
+
+    useEffect(() => { loadSkills(); }, []);
+
+    const toggleSkill = async (id) => {
+      // Optimistic flip
+      setSkills((prev) => prev.map((s) => s.id === id ? { ...s, on: !s.on } : s));
+      try {
+        const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(id)}/toggle`, { method: "PUT" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch {
+        // Roll back if the backend refused.
+        setSkills((prev) => prev.map((s) => s.id === id ? { ...s, on: !s.on } : s));
+      }
+    };
+
+    const personal  = skills.filter((s) => s.group === "personal");
+    const marketing = skills.filter((s) => s.group === "marketing");
 
     const ScaffoldBadge = () => (
       <span
@@ -154,21 +193,40 @@ function MissionControl({ onBack }) {
       </span>
     );
 
+    const CustomBadge = () => (
+      <span
+        style={{
+          fontSize: 10,
+          padding: "1px 6px",
+          borderRadius: 999,
+          color: "var(--accent)",
+          background: "var(--accent-soft)",
+          letterSpacing: "0.02em",
+          textTransform: "uppercase",
+          flexShrink: 0,
+        }}
+        title="Created via the UI."
+      >
+        Custom
+      </span>
+    );
+
     const SkillRow = ({ s, first }) => (
       <div
         className="flex items-center gap-4 px-5 py-4"
         style={{ borderTop: first ? "none" : "1px solid var(--border)" }}
       >
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span style={{ fontSize: 14, fontWeight: 500 }}>{s.name}</span>
+            {s.custom && <CustomBadge />}
             {s.status === "scaffold" && <ScaffoldBadge />}
           </div>
           <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 2 }}>{s.description}</div>
         </div>
         <div
-          className={"toggle " + (toggles[s.id] ? "on" : "")}
-          onClick={() => setToggles((t) => ({ ...t, [s.id]: !t[s.id] }))}
+          className={"toggle " + (s.on ? "on" : "")}
+          onClick={() => toggleSkill(s.id)}
         >
           <div className="knob" />
         </div>
@@ -184,13 +242,25 @@ function MissionControl({ onBack }) {
           {title}
         </div>
         <div className="card">
-          {items.map((s, i) => <SkillRow key={s.id} s={s} first={i === 0} />)}
+          {items.length === 0 ? (
+            <div className="px-5 py-6 text-center" style={{ fontSize: 13, color: "var(--fg-muted)" }}>
+              No skills in this group yet.
+            </div>
+          ) : (
+            items.map((s, i) => <SkillRow key={s.id} s={s} first={i === 0} />)
+          )}
         </div>
       </section>
     );
 
+    const handleDescribeInChat = () => {
+      if (!onOpenChatPrefilled) return;
+      onOpenChatPrefilled("personal", "I'd like to create a new skill. What should it do?");
+    };
+
     return (
-      <div className="px-8 py-8 overflow-y-auto flex-1">
+      <div className="px-4 sm:px-6 lg:px-8 py-8 overflow-y-auto flex-1">
+        <div className="mx-auto w-full" style={{ maxWidth: 1120 }}>
         <div className="mb-8">
           <h2 style={{ fontSize: 20, fontWeight: 500, marginBottom: 4 }}>Skills</h2>
           <p style={{ color: "var(--fg-muted)", fontSize: 14 }}>
@@ -198,37 +268,51 @@ function MissionControl({ onBack }) {
           </p>
         </div>
 
-        <GroupCard title="Personal" items={personal} />
-        <GroupCard title="Marketing" items={marketing} />
-
-        <div className="mt-6">
-          <button className="btn-secondary px-4 py-2 flex items-center gap-2" onClick={() => setGalleryOpen(!galleryOpen)}>
-            <Icon.Plus className="lucide-sm" />
-            Add new skill
-          </button>
-        </div>
-
-        {galleryOpen && (
-          <div className="mt-6 slide-in-top">
-            <div style={{ color: "var(--fg-faint)", fontSize: 12, marginBottom: 12 }}>Available skills</div>
-            <div className="grid grid-cols-2 gap-4">
-              {Data.skillGallery.map((s) => (
-                <div key={s.name} className="card p-4 flex items-start gap-3">
-                  <div className="logo-square" style={{ color: "var(--fg-muted)" }}>
-                    <Icon.Zap className="lucide-sm" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div style={{ fontSize: 14, fontWeight: 500 }}>{s.name}</div>
-                    <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 2 }}>{s.desc}</div>
-                    <button className="btn-ghost mt-3 px-2 py-1" style={{ fontSize: 13, color: "var(--accent)" }}>
-                      Add
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
+        {fetchError && (
+          <div
+            className="mb-4 px-3 py-2"
+            style={{
+              fontSize: 13,
+              border: "1px solid var(--border-strong)",
+              borderRadius: 6,
+              color: "var(--fg-muted)",
+              background: "var(--bg-elev)",
+            }}
+          >
+            {fetchError} — showing a fallback list. Changes won't persist until the backend is reachable.
           </div>
         )}
+
+        <GroupCard title="Personal specialist"  items={personal} />
+        <GroupCard title="Marketing specialist" items={marketing} />
+
+        <div className="mt-6 flex items-center gap-2">
+          <button className="btn-secondary px-4 py-2 flex items-center gap-2" onClick={() => setModalOpen(true)}>
+            <Icon.Plus className="lucide-sm" />
+            Add custom skill
+          </button>
+          {onOpenChatPrefilled && (
+            <button
+              className="btn-ghost px-3 py-2"
+              style={{ fontSize: 13 }}
+              onClick={handleDescribeInChat}
+              title="Open chat and describe the skill to your assistant"
+            >
+              <span className="flex items-center gap-1.5">
+                <Icon.Sparkles className="lucide-xs" />
+                Describe a skill to my assistant
+              </span>
+            </button>
+          )}
+        </div>
+
+        <NewSkillModal
+          open={modalOpen}
+          onClose={() => setModalOpen(false)}
+          onCreated={() => loadSkills()}
+          onDescribeInChat={onOpenChatPrefilled ? handleDescribeInChat : null}
+        />
+        </div>
       </div>
     );
   };
@@ -244,7 +328,8 @@ function MissionControl({ onBack }) {
     const filtered = convos.filter((c) => c.title.toLowerCase().includes(query.toLowerCase()));
 
     return (
-      <div className="px-8 py-8 overflow-y-auto flex-1">
+      <div className="px-4 sm:px-6 lg:px-8 py-8 overflow-y-auto flex-1">
+        <div className="mx-auto w-full" style={{ maxWidth: 960 }}>
         <div className="mb-8">
           <h2 style={{ fontSize: 20, fontWeight: 500, marginBottom: 4 }}>Memory</h2>
           <p style={{ color: "var(--fg-muted)", fontSize: 14 }}>
@@ -387,6 +472,7 @@ function MissionControl({ onBack }) {
             </div>
           )}
         </section>
+        </div>
       </div>
     );
   };
@@ -407,7 +493,8 @@ function MissionControl({ onBack }) {
     let lastGroup = null;
 
     return (
-      <div className="px-8 py-8 overflow-y-auto flex-1">
+      <div className="px-4 sm:px-6 lg:px-8 py-8 overflow-y-auto flex-1">
+        <div className="mx-auto w-full" style={{ maxWidth: 960 }}>
         <div className="mb-8">
           <h2 style={{ fontSize: 20, fontWeight: 500, marginBottom: 4 }}>Activity log</h2>
           <p style={{ color: "var(--fg-muted)", fontSize: 14 }}>
@@ -512,6 +599,7 @@ function MissionControl({ onBack }) {
             );
           })}
         </div>
+        </div>
       </div>
     );
   };
@@ -524,7 +612,11 @@ function MissionControl({ onBack }) {
         <div className="flex-1 flex min-w-0">
           {tab === "apps" && <Apps />}
           {tab === "skills" && <Skills />}
+          {tab === "soul" && <SoulSection />}
+          {tab === "rules" && <RulesSection />}
+          {tab === "aboutyou" && <AboutYouSection />}
           {tab === "memory" && <Memory />}
+          {tab === "workspace" && <WorkspaceSection />}
           {tab === "activity" && <Activity />}
         </div>
       </div>

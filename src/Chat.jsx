@@ -106,12 +106,12 @@ function Chat({
     } catch (err) {
       let text;
       if (err && err.name === "AbortError") {
-        text = "That took longer than expected. Try asking again or rephrase your question.";
+        text = "That took longer than expected. Try asking again.";
       } else if (err instanceof TypeError) {
         // Fetch throws TypeError on network / connection-refused failures.
         text = "I can't reach the local service. Make sure the app's backend is running.";
       } else {
-        text = "Something went wrong. Check the app logs for details.";
+        text = "Something went wrong. Check the app logs.";
       }
       setMessages((m) => [...m, { from: "assistant", text, error: true }]);
     } finally {

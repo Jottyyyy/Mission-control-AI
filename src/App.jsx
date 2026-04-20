@@ -189,7 +189,10 @@ function App() {
       )}
 
       {screen === "mission" && (
-        <MissionControl onBack={() => setScreen(missionReturn)} />
+        <MissionControl
+          onBack={() => setScreen(missionReturn)}
+          onOpenChatPrefilled={(key, text) => handleOpenAssistant(key, text)}
+        />
       )}
 
       <Tweaks visible={tweaksOpen} state={tweakState} setState={setTweakState} />

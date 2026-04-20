@@ -4,7 +4,7 @@ import Icon from './icons.jsx';
 
 function StepPills({ currentIndex }) {
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center flex-wrap gap-y-2 gap-x-2">
       {Data.pipelineSteps.map((s, i) => {
         const done = i < currentIndex;
         const current = i === currentIndex;
