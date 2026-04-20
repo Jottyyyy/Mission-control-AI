@@ -1,5 +1,6 @@
-// Center column chat
-const { useState: chUseState, useEffect: chUseEffect, useRef: chUseRef } = React;
+import React, { useState, useEffect, useRef } from 'react';
+import Data from './data.jsx';
+import Icon from './icons.jsx';
 
 function getGreetingTime() {
   const h = new Date().getHours();
@@ -22,22 +23,21 @@ function Chat({
   const chips = a.chips;
   const seed = Data.seedMessages[assistantKey] || [];
 
-  const [input, setInput] = chUseState(prefill || "");
-  const [confirmReset, setConfirmReset] = chUseState(false);
-  const [menuOpen, setMenuOpen] = chUseState(false);
-  const [thinking, setThinking] = chUseState(false);
-  const [messages, setMessages] = chUseState(() => seed.slice());
-  const [briefingExpanded, setBriefingExpanded] = chUseState(false);
-  const inputRef = chUseRef(null);
-  const scrollRef = chUseRef(null);
+  const [input, setInput] = useState(prefill || "");
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [thinking, setThinking] = useState(false);
+  const [messages, setMessages] = useState(() => seed.slice());
+  const inputRef = useRef(null);
+  const scrollRef = useRef(null);
 
   // Reset messages when assistant changes
-  chUseEffect(() => {
+  useEffect(() => {
     setMessages(Data.seedMessages[assistantKey] ? Data.seedMessages[assistantKey].slice() : []);
   }, [assistantKey]);
 
   // Focus input on first-run + recurring
-  chUseEffect(() => {
+  useEffect(() => {
     if (mode !== "active" && inputRef.current) {
       inputRef.current.focus();
       if (prefill) {
@@ -51,18 +51,20 @@ function Chat({
   }, [mode, assistantKey, prefill]);
 
   // Scroll to bottom when messages change (active mode)
-  chUseEffect(() => {
+  useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, thinking, mode]);
 
-  const handleSend = () => {
+  const handleSend = async () => {
+    if (thinking) return;                // guard against parallel sends
     const v = input.trim();
     if (!v) return;
     setInput("");
 
-    // Pipeline demo trigger (only for marketing)
+    // Pipeline demo trigger (only for marketing) — still opens the side panel,
+    // but the assistant's words come from the backend.
     const lower = v.toLowerCase();
     const isPipeline =
       assistantKey === "marketing" && (
@@ -77,30 +79,45 @@ function Chat({
 
     setMessages((m) => [...m, { from: "user", text: v }]);
     setThinking(true);
+    if (isPipeline) onTriggerPipeline();
 
-    setTimeout(() => {
-      setThinking(false);
-      if (isPipeline) {
-        setMessages((m) => [
-          ...m,
-          {
-            from: "assistant",
-            text:
-              "On it. Pulling the 50-company Zint batch and finding the MAN at each, then enriching contacts. I'll keep the progress in the side panel — feel free to carry on.",
-          },
-        ]);
-        onTriggerPipeline();
-      } else {
-        setMessages((m) => [
-          ...m,
-          {
-            from: "assistant",
-            text:
-              "Got it. I'll take a look and come back in a moment with a short answer.",
-          },
-        ]);
+    // Mode for the backend — matches the specialist ownership in AGENTS.md.
+    const backendMode = assistantKey === "marketing" ? "marketing" : "personal";
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
+
+    try {
+      const res = await fetch("http://127.0.0.1:8001/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: v, mode: backendMode }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
       }
-    }, 900);
+      const data = await res.json();
+      setMessages((m) => [
+        ...m,
+        { from: "assistant", text: data.reply ?? "" },
+      ]);
+    } catch (err) {
+      let text;
+      if (err && err.name === "AbortError") {
+        text = "That took longer than expected. Try asking again or rephrase your question.";
+      } else if (err instanceof TypeError) {
+        // Fetch throws TypeError on network / connection-refused failures.
+        text = "I can't reach the local service. Make sure the app's backend is running.";
+      } else {
+        text = "Something went wrong. Check the app logs for details.";
+      }
+      setMessages((m) => [...m, { from: "assistant", text, error: true }]);
+    } finally {
+      clearTimeout(timeoutId);
+      setThinking(false);
+    }
   };
 
   const handleKey = (e) => {
@@ -141,9 +158,7 @@ function Chat({
     >
       <div className="flex items-center gap-2" style={{ color: "var(--fg-muted)", fontSize: 13 }}>
         {mode === "active" ? (
-          <span style={{ color: "var(--fg)" }}>
-            {assistantKey === "marketing" ? "Acme Manufacturing enrichment" : "Morning briefing"}
-          </span>
+          <span style={{ color: "var(--fg)" }}>{a.name}</span>
         ) : (
           <span>New conversation</span>
         )}
@@ -229,8 +244,11 @@ function Chat({
             {a.name}
           </div>
           <h1 className="font-serif-display" style={{ fontSize: 40, lineHeight: 1.1, color: "var(--fg)" }}>
-            What's on your mind, Adam?
+            I'm ready when you are, Adam.
           </h1>
+          <p style={{ marginTop: 12, color: "var(--fg-muted)", fontSize: 16 }}>
+            What shall we start with?
+          </p>
         </div>
 
         <div
@@ -241,24 +259,14 @@ function Chat({
             borderLeftWidth: 2,
             borderLeftColor: "var(--accent-line)",
             borderRadius: 8,
-            cursor: briefingExpanded ? "default" : "pointer",
           }}
-          onClick={() => !briefingExpanded && setBriefingExpanded(true)}
         >
           <div style={{ fontSize: 12, color: "var(--fg-faint)", marginBottom: 4 }}>
             Today at a glance
           </div>
-          <div style={{ fontSize: 15, color: "var(--fg)", lineHeight: 1.6 }}>
-            {Data.briefing}
+          <div style={{ fontSize: 15, color: Data.briefing ? "var(--fg)" : "var(--fg-muted)", lineHeight: 1.6 }}>
+            {Data.briefing || "Your daily briefing will appear here once your calendar and inbox are connected."}
           </div>
-          {briefingExpanded && (
-            <div className="mt-4 slide-in-top" style={{ fontSize: 14, color: "var(--fg-muted)", lineHeight: 1.6 }}>
-              <div><span style={{ color: "var(--fg)" }}>11:00</span> — Reynolds (prep ready)</div>
-              <div><span style={{ color: "var(--fg)" }}>14:00</span> — Internal</div>
-              <div><span style={{ color: "var(--fg)" }}>16:30</span> — Cotswold</div>
-              <div className="mt-2">Acme replied at 22:41 and Pennine at 07:08 — both want to keep talking.</div>
-            </div>
-          )}
         </div>
 
         <div className="mt-8">
@@ -295,7 +303,16 @@ function Chat({
                 ))}
               </div>
             ) : (
-              <div className="msg-body" style={{ maxWidth: "100%", color: "var(--fg)", lineHeight: 1.65 }}>
+              <div
+                className="msg-body"
+                style={{
+                  maxWidth: "100%",
+                  color: m.error ? "var(--fg-muted)" : "var(--fg)",
+                  lineHeight: 1.65,
+                  borderLeft: m.error ? "2px solid var(--border-strong)" : "none",
+                  paddingLeft: m.error ? 12 : 0,
+                }}
+              >
                 {m.text.split("\n").map((line, j) =>
                   line.trim() === "" ? <p key={j}>&nbsp;</p> : <p key={j}>{line}</p>
                 )}
@@ -358,7 +375,8 @@ function Chat({
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKey}
               rows={1}
-              placeholder={mode === "active" ? "Reply…" : "Type or say anything…"}
+              disabled={thinking}
+              placeholder={thinking ? "Thinking…" : mode === "active" ? "Reply…" : "Type or say anything…"}
               style={{
                 flex: 1,
                 padding: "6px 4px",
@@ -367,15 +385,19 @@ function Chat({
                 overflowY: "auto",
                 fontSize: 15,
                 lineHeight: 1.5,
+                opacity: thinking ? 0.6 : 1,
+                cursor: thinking ? "not-allowed" : "text",
               }}
             />
             <button
               onClick={handleSend}
               className="btn-ghost p-1.5"
+              disabled={thinking || !input.trim()}
               style={{
-                color: input.trim() ? "var(--accent)" : "var(--fg-faint)",
+                color: input.trim() && !thinking ? "var(--accent)" : "var(--fg-faint)",
+                cursor: thinking || !input.trim() ? "not-allowed" : "pointer",
               }}
-              title="Send (Enter)"
+              title={thinking ? "Waiting for reply…" : "Send (Enter)"}
             >
               <Icon.Send className="lucide-sm" />
             </button>
@@ -393,7 +415,7 @@ function Chat({
       {pipelineMinimized && !rightRailOpen && (
         <div className="bg-status-dot" onClick={onRestorePipeline} title="Show progress">
           <span className="green-dot pulse-dot" />
-          <span>Enriching leads — in progress</span>
+          <span>Pipeline running — in progress</span>
           <Icon.ChevronRight className="lucide-xs" style={{ color: "var(--fg-muted)" }}/>
         </div>
       )}
@@ -401,4 +423,4 @@ function Chat({
   );
 }
 
-window.Chat = Chat;
+export default Chat;

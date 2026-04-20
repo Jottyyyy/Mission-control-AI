@@ -1,46 +1,52 @@
-// Main App
-const { useState: aUseState, useEffect: aUseEffect } = React;
+import React, { useState, useEffect } from 'react';
+import Data from './data.jsx';
+import Sidebar from './Sidebar.jsx';
+import Dashboard from './Dashboard.jsx';
+import Chat from './Chat.jsx';
+import PipelinePanel from './PipelinePanel.jsx';
+import MissionControl from './MissionControl.jsx';
+import Tweaks from './Tweaks.jsx';
 
 function App() {
   const defaults = window.__TWEAKS || {};
 
-  const [dark, setDark] = aUseState(() => {
+  const [dark, setDark] = useState(() => {
     const saved = localStorage.getItem("adam.dark");
     if (saved !== null) return saved === "1";
     return !!defaults.dark;
   });
   // screen: "dashboard" | "assistant" | "mission"
-  const [screen, setScreen] = aUseState(() => {
+  const [screen, setScreen] = useState(() => {
     return localStorage.getItem("adam.screen") || "dashboard";
   });
   // Where to return from Mission Control
-  const [missionReturn, setMissionReturn] = aUseState("dashboard");
+  const [missionReturn, setMissionReturn] = useState("dashboard");
   // Which assistant is active: "personal" | "marketing"
-  const [assistantKey, setAssistantKey] = aUseState(() => {
+  const [assistantKey, setAssistantKey] = useState(() => {
     return localStorage.getItem("adam.assistant") || "personal";
   });
-  const [dashboardState, setDashboardState] = aUseState(() => {
+  const [dashboardState, setDashboardState] = useState(() => {
     return localStorage.getItem("adam.dashState") || "empty-recurring";
   });
-  const [activeConvoId, setActiveConvoId] = aUseState(null);
-  const [prefill, setPrefill] = aUseState("");
-  const [rightRailOpen, setRightRailOpen] = aUseState(false);
-  const [pipelineState, setPipelineState] = aUseState(defaults.pipelineState || "starting");
-  const [pipelineMinimized, setPipelineMinimized] = aUseState(false);
+  const [activeConvoId, setActiveConvoId] = useState(null);
+  const [prefill, setPrefill] = useState("");
+  const [rightRailOpen, setRightRailOpen] = useState(false);
+  const [pipelineState, setPipelineState] = useState(defaults.pipelineState || "starting");
+  const [pipelineMinimized, setPipelineMinimized] = useState(false);
 
-  const [tweaksOpen, setTweaksOpen] = aUseState(false);
+  const [tweaksOpen, setTweaksOpen] = useState(false);
 
-  aUseEffect(() => {
+  useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
     localStorage.setItem("adam.dark", dark ? "1" : "0");
   }, [dark]);
 
-  aUseEffect(() => { localStorage.setItem("adam.screen", screen); }, [screen]);
-  aUseEffect(() => { localStorage.setItem("adam.assistant", assistantKey); }, [assistantKey]);
-  aUseEffect(() => { localStorage.setItem("adam.dashState", dashboardState); }, [dashboardState]);
+  useEffect(() => { localStorage.setItem("adam.screen", screen); }, [screen]);
+  useEffect(() => { localStorage.setItem("adam.assistant", assistantKey); }, [assistantKey]);
+  useEffect(() => { localStorage.setItem("adam.dashState", dashboardState); }, [dashboardState]);
 
   // Keyboard shortcuts
-  aUseEffect(() => {
+  useEffect(() => {
     const onKey = (e) => {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.shiftKey && (e.key === "D" || e.key === "d")) {
@@ -65,7 +71,7 @@ function App() {
   }, []);
 
   // Tweaks host
-  aUseEffect(() => {
+  useEffect(() => {
     const onMsg = (e) => {
       const m = e.data;
       if (!m || !m.type) return;
@@ -191,5 +197,4 @@ function App() {
   );
 }
 
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<App />);
+export default App;

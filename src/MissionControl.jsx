@@ -1,9 +1,10 @@
-// Mission Control — opens in same window; four tabs
-const { useState: mcUseState } = React;
+import React, { useState } from 'react';
+import Data from './data.jsx';
+import Icon from './icons.jsx';
 
 function MissionControl({ onBack }) {
-  const [tab, setTab] = mcUseState("apps"); // apps | skills | memory | activity
-  const [panelApp, setPanelApp] = mcUseState(null);
+  const [tab, setTab] = useState("apps"); // apps | skills | memory | activity
+  const [panelApp, setPanelApp] = useState(null);
 
   const Header = () => (
     <div
@@ -63,27 +64,36 @@ function MissionControl({ onBack }) {
       </div>
 
       <div style={{ color: "var(--fg-faint)", fontSize: 12, marginBottom: 12 }}>Connected</div>
-      <div className="grid grid-cols-3 gap-4 mb-10">
-        {Data.connectedApps.map((a) => (
-          <div key={a.name} className="card p-4">
-            <div className="flex items-center gap-3">
-              <div className="logo-square" style={{ color: "var(--accent)" }}>
-                {React.createElement(Icon[a.icon], { className: "lucide-sm" })}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div style={{ fontSize: 14, fontWeight: 500 }}>{a.name}</div>
-                <div className="flex items-center gap-1.5 mt-0.5" style={{ fontSize: 12, color: "var(--fg-muted)" }}>
-                  <span className="green-dot" />
-                  <span>Connected</span>
+      {Data.connectedApps.length > 0 ? (
+        <div className="grid grid-cols-3 gap-4 mb-10">
+          {Data.connectedApps.map((a) => (
+            <div key={a.name} className="card p-4">
+              <div className="flex items-center gap-3">
+                <div className="logo-square" style={{ color: "var(--accent)" }}>
+                  {React.createElement(Icon[a.icon], { className: "lucide-sm" })}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div style={{ fontSize: 14, fontWeight: 500 }}>{a.name}</div>
+                  <div className="flex items-center gap-1.5 mt-0.5" style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+                    <span className="green-dot" />
+                    <span>Connected</span>
+                  </div>
                 </div>
               </div>
+              <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 10, lineHeight: 1.5 }}>
+                {a.desc}
+              </div>
             </div>
-            <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 10, lineHeight: 1.5 }}>
-              {a.desc}
-            </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      ) : (
+        <div
+          className="card px-5 py-6 mb-10"
+          style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.55 }}
+        >
+          Nothing connected yet. Connect tools below to unlock assistant capabilities.
+        </div>
+      )}
 
       <div style={{ color: "var(--fg-faint)", fontSize: 12, marginBottom: 12 }}>Available to add</div>
       <div className="grid grid-cols-3 gap-4">
@@ -116,8 +126,69 @@ function MissionControl({ onBack }) {
   );
 
   const Skills = () => {
-    const [toggles, setToggles] = mcUseState(() => Data.skills.map((s) => s.on));
-    const [galleryOpen, setGalleryOpen] = mcUseState(false);
+    const [toggles, setToggles] = useState(() => {
+      const init = {};
+      Data.skills.forEach((s) => { init[s.id] = s.on; });
+      return init;
+    });
+    const [galleryOpen, setGalleryOpen] = useState(false);
+
+    const personal  = Data.skills.filter((s) => s.group === "personal");
+    const marketing = Data.skills.filter((s) => s.group === "marketing");
+
+    const ScaffoldBadge = () => (
+      <span
+        style={{
+          fontSize: 10,
+          padding: "1px 6px",
+          borderRadius: 999,
+          border: "1px solid var(--border-strong)",
+          color: "var(--fg-faint)",
+          letterSpacing: "0.02em",
+          textTransform: "uppercase",
+          flexShrink: 0,
+        }}
+        title="Defined as a scaffold — not yet connected to real APIs."
+      >
+        Scaffold
+      </span>
+    );
+
+    const SkillRow = ({ s, first }) => (
+      <div
+        className="flex items-center gap-4 px-5 py-4"
+        style={{ borderTop: first ? "none" : "1px solid var(--border)" }}
+      >
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span style={{ fontSize: 14, fontWeight: 500 }}>{s.name}</span>
+            {s.status === "scaffold" && <ScaffoldBadge />}
+          </div>
+          <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 2 }}>{s.description}</div>
+        </div>
+        <div
+          className={"toggle " + (toggles[s.id] ? "on" : "")}
+          onClick={() => setToggles((t) => ({ ...t, [s.id]: !t[s.id] }))}
+        >
+          <div className="knob" />
+        </div>
+      </div>
+    );
+
+    const GroupCard = ({ title, items }) => (
+      <section className="mb-6">
+        <div
+          className="px-1 mb-2"
+          style={{ fontSize: 12, color: "var(--fg-faint)", letterSpacing: "0.02em" }}
+        >
+          {title}
+        </div>
+        <div className="card">
+          {items.map((s, i) => <SkillRow key={s.id} s={s} first={i === 0} />)}
+        </div>
+      </section>
+    );
+
     return (
       <div className="px-8 py-8 overflow-y-auto flex-1">
         <div className="mb-8">
@@ -127,32 +198,8 @@ function MissionControl({ onBack }) {
           </p>
         </div>
 
-        <div className="card">
-          {Data.skills.map((s, i) => (
-            <div
-              key={s.name}
-              className="flex items-center gap-4 px-5 py-4"
-              style={{
-                borderTop: i === 0 ? "none" : "1px solid var(--border)",
-              }}
-            >
-              <div className="flex-1 min-w-0">
-                <div style={{ fontSize: 14, fontWeight: 500 }}>{s.name}</div>
-                <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 2 }}>{s.desc}</div>
-              </div>
-              <div
-                className={"toggle " + (toggles[i] ? "on" : "")}
-                onClick={() => {
-                  const n = toggles.slice();
-                  n[i] = !n[i];
-                  setToggles(n);
-                }}
-              >
-                <div className="knob" />
-              </div>
-            </div>
-          ))}
-        </div>
+        <GroupCard title="Personal" items={personal} />
+        <GroupCard title="Marketing" items={marketing} />
 
         <div className="mt-6">
           <button className="btn-secondary px-4 py-2 flex items-center gap-2" onClick={() => setGalleryOpen(!galleryOpen)}>
@@ -187,12 +234,12 @@ function MissionControl({ onBack }) {
   };
 
   const Memory = () => {
-    const [bullets, setBullets] = mcUseState(Data.memory);
-    const [query, setQuery] = mcUseState("");
-    const [convos, setConvos] = mcUseState(Data.recentConvos);
-    const [advOpen, setAdvOpen] = mcUseState(false);
-    const [confirmReset, setConfirmReset] = mcUseState(false);
-    const [confirmClear, setConfirmClear] = mcUseState(false);
+    const [bullets, setBullets] = useState(Data.memory);
+    const [query, setQuery] = useState("");
+    const [convos, setConvos] = useState(Data.recentConvos);
+    const [advOpen, setAdvOpen] = useState(false);
+    const [confirmReset, setConfirmReset] = useState(false);
+    const [confirmClear, setConfirmClear] = useState(false);
 
     const filtered = convos.filter((c) => c.title.toLowerCase().includes(query.toLowerCase()));
 
@@ -270,7 +317,7 @@ function MissionControl({ onBack }) {
             ))}
             {filtered.length === 0 && (
               <div className="px-5 py-6 text-center" style={{ fontSize: 13, color: "var(--fg-muted)" }}>
-                No matches.
+                {query ? "No matches." : "No conversations yet."}
               </div>
             )}
           </div>
@@ -345,8 +392,8 @@ function MissionControl({ onBack }) {
   };
 
   const Activity = () => {
-    const [filter, setFilter] = mcUseState("All");
-    const [expanded, setExpanded] = mcUseState(new Set());
+    const [filter, setFilter] = useState("All");
+    const [expanded, setExpanded] = useState(new Set());
     const chips = ["All", "Personal", "Marketing", "Mission Control"];
     const entries = filter === "All" ? Data.activity : Data.activity.filter((a) => a.cat === filter);
 
@@ -384,6 +431,15 @@ function MissionControl({ onBack }) {
             </button>
           ))}
         </div>
+
+        {entries.length === 0 && (
+          <div
+            className="card px-5 py-6"
+            style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.55 }}
+          >
+            Nothing yet. Activity will appear here as your assistant does work.
+          </div>
+        )}
 
         <div className="relative">
           {entries.map((e, i) => {
@@ -547,4 +603,4 @@ function MissionControl({ onBack }) {
   );
 }
 
-window.MissionControl = MissionControl;
+export default MissionControl;

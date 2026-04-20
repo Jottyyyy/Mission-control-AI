@@ -1,5 +1,6 @@
-// Right-rail marketing pipeline panel
-const { useState: ppUseState, useEffect: ppUseEffect, useRef: ppUseRef } = React;
+import React, { useState, useEffect, useRef } from 'react';
+import Data from './data.jsx';
+import Icon from './icons.jsx';
 
 function StepPills({ currentIndex }) {
   return (
@@ -61,36 +62,39 @@ function PipelinePanel({
   onClose,
   onMinimize,
 }) {
-  const [feed, setFeed] = ppUseState([]);
-  const [flashIds, setFlashIds] = ppUseState(new Set());
-  const [count, setCount] = ppUseState(0);
-  const feedIdx = ppUseRef(0);
+  const hasRunData = Data.pipelineRun.length > 0;
+  const hasResults = Data.pipelineResults.length > 0;
 
-  // Auto-advance through states for the demo (20s total: starting 3s → running 14s → done)
-  ppUseEffect(() => {
-    if (state !== "starting") return;
+  const [feed, setFeed] = useState([]);
+  const [flashIds, setFlashIds] = useState(new Set());
+  const [count, setCount] = useState(0);
+  const feedIdx = useRef(0);
+
+  // Auto-advance through states for the demo (only when seed data is present).
+  useEffect(() => {
+    if (state !== "starting" || !hasRunData) return;
     const t = setTimeout(() => setState("running"), 2200);
     return () => clearTimeout(t);
-  }, [state]);
+  }, [state, hasRunData]);
 
-  ppUseEffect(() => {
-    if (state !== "running") return;
+  useEffect(() => {
+    if (state !== "running" || !hasRunData) return;
 
-    // seed with a couple of items
     setFeed([]);
     setCount(0);
     feedIdx.current = 0;
 
+    const templates = Data.pipelineRun;
+    const total = Math.max(templates.length, 50);
+
     const interval = setInterval(() => {
       feedIdx.current += 1;
       const i = feedIdx.current;
-      const templates = Data.pipelineRun;
       const tpl = templates[(i - 1) % templates.length];
       const id = "p" + i;
       const item = { id, company: tpl.company, status: tpl.status };
 
       setFeed((prev) => [item, ...prev].slice(0, 8));
-      // Flash if it's a "found" status
       if (tpl.status.startsWith("Found")) {
         setFlashIds((prev) => {
           const n = new Set(prev);
@@ -105,18 +109,17 @@ function PipelinePanel({
           });
         }, 900);
       }
-      setCount((c) => Math.min(50, c + 1));
+      setCount((c) => Math.min(total, c + 1));
 
-      if (feedIdx.current >= 50) {
+      if (feedIdx.current >= total) {
         clearInterval(interval);
         setTimeout(() => setState("done"), 600);
       }
     }, 280);
 
-    // Speed demo: jump to done after ~14s for the staged flow
     const doneTimer = setTimeout(() => {
       clearInterval(interval);
-      setCount(50);
+      setCount(total);
       setState("done");
     }, 14000);
 
@@ -124,7 +127,7 @@ function PipelinePanel({
       clearInterval(interval);
       clearTimeout(doneTimer);
     };
-  }, [state]);
+  }, [state, hasRunData]);
 
   const currentStepIdx =
     state === "starting" ? 0 :
@@ -144,6 +147,31 @@ function PipelinePanel({
     </div>
   );
 
+  // Shared empty state used whenever there is no real pipeline data yet.
+  const EmptyBody = () => (
+    <div className="flex-1 flex flex-col">
+      <div className="p-5" style={{ borderBottom: "1px solid var(--border)" }}>
+        <StepPills currentIndex={0} />
+      </div>
+      <div className="flex-1 flex flex-col items-center justify-center px-6 text-center">
+        <div style={{ fontSize: 14, color: "var(--fg)", fontWeight: 500 }}>
+          No leads in pipeline yet
+        </div>
+        <div
+          className="mt-2"
+          style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.55, maxWidth: 240 }}
+        >
+          Import a batch or start a lead-batch-run skill to begin enrichment.
+        </div>
+      </div>
+      <div className="p-4" style={{ borderTop: "1px solid var(--border)" }}>
+        <button className="btn-ghost w-full py-2" style={{ fontSize: 13 }} onClick={onMinimize}>
+          Run in background
+        </button>
+      </div>
+    </div>
+  );
+
   const StartingBody = () => (
     <div className="flex-1 flex flex-col">
       <div className="p-5" style={{ borderBottom: "1px solid var(--border)" }}>
@@ -155,7 +183,7 @@ function PipelinePanel({
           <span>Starting…</span>
         </div>
         <div className="text-center mt-3" style={{ fontSize: 12, color: "var(--fg-faint)", lineHeight: 1.5, maxWidth: 220 }}>
-          Looking through the Zint batch and queuing up 50 companies.
+          Queueing companies from your batch.
         </div>
       </div>
       <div className="p-4" style={{ borderTop: "1px solid var(--border)" }}>
@@ -188,7 +216,7 @@ function PipelinePanel({
         style={{ borderTop: "1px solid var(--border)", fontSize: 13 }}
       >
         <span style={{ color: "var(--fg-muted)" }}>
-          <span style={{ color: "var(--fg)", fontWeight: 500 }}>{count}</span> of 50 complete
+          <span style={{ color: "var(--fg)", fontWeight: 500 }}>{count}</span> processed
         </span>
         <button className="btn-ghost px-2 py-1" style={{ fontSize: 13 }} onClick={onMinimize}>
           Run in background
@@ -205,23 +233,8 @@ function PipelinePanel({
       <div className="p-5 flex-1 overflow-y-auto">
         <div className="card p-4">
           <div style={{ fontSize: 13, color: "var(--fg-faint)", marginBottom: 6 }}>Summary</div>
-          <div style={{ fontSize: 14, color: "var(--fg)", lineHeight: 1.55 }}>
-            Found <span style={{ color: "var(--fg)", fontWeight: 500 }}>47</span> of 50 MANs. Got email + mobile for <span style={{ fontWeight: 500 }}>41</span>, email only for <span style={{ fontWeight: 500 }}>6</span>, nothing for <span style={{ fontWeight: 500 }}>3</span>.
-          </div>
-        </div>
-
-        <div className="mt-4 flex flex-col gap-2 text-[13px]" style={{ color: "var(--fg-muted)" }}>
-          <div className="flex items-center justify-between">
-            <span>Sources used</span>
-            <span style={{ color: "var(--fg)" }}>Lusha · Cognism · Companies House</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span>Time taken</span>
-            <span style={{ color: "var(--fg)" }}>11m 22s</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span>Batch</span>
-            <span style={{ color: "var(--fg)" }}>Zint — UK manufacturers, Q2</span>
+          <div style={{ fontSize: 14, color: "var(--fg-muted)", lineHeight: 1.55 }}>
+            Summary will appear here once a real batch completes.
           </div>
         </div>
       </div>
@@ -229,10 +242,15 @@ function PipelinePanel({
         className="p-4 flex items-center gap-2"
         style={{ borderTop: "1px solid var(--border)" }}
       >
-        <button className="btn-primary px-3 py-2 flex-1" style={{ fontSize: 13 }} onClick={() => setState("review")}>
+        <button
+          className="btn-primary px-3 py-2 flex-1"
+          style={{ fontSize: 13 }}
+          onClick={() => setState("review")}
+          disabled={!hasResults}
+        >
           Review results
         </button>
-        <button className="btn-secondary px-3 py-2" style={{ fontSize: 13 }}>
+        <button className="btn-secondary px-3 py-2" style={{ fontSize: 13 }} disabled={!hasResults}>
           <span className="flex items-center gap-1.5">
             <Icon.Download className="lucide-xs" />
             Export CSV
@@ -248,37 +266,63 @@ function PipelinePanel({
         <button className="btn-ghost p-1" onClick={() => setState("done")}>
           <Icon.ArrowLeft className="lucide-sm" />
         </button>
-        <div style={{ fontSize: 14, fontWeight: 500 }}>Results — 47 contacts</div>
+        <div style={{ fontSize: 14, fontWeight: 500 }}>
+          {hasResults ? `Results — ${Data.pipelineResults.length} contacts` : "Results"}
+        </div>
       </div>
       <div className="flex-1 overflow-y-auto">
-        {Data.pipelineResults.map((r, i) => (
-          <div key={i} style={{ borderBottom: "1px solid var(--border)" }} className="px-4 py-3">
-            <div style={{ fontSize: 13, fontWeight: 500, color: "var(--fg)" }}>{r.company}</div>
-            <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 2 }}>{r.name}</div>
-            <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
-              {r.email}{r.phone ? ` · ${r.phone}` : ""}
+        {hasResults ? (
+          Data.pipelineResults.map((r, i) => (
+            <div key={i} style={{ borderBottom: "1px solid var(--border)" }} className="px-4 py-3">
+              <div style={{ fontSize: 13, fontWeight: 500, color: "var(--fg)" }}>{r.company}</div>
+              <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 2 }}>{r.name}</div>
+              <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
+                {r.email}{r.phone ? ` · ${r.phone}` : ""}
+              </div>
+              <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                {r.sources.map((s) => (
+                  <span
+                    key={s}
+                    style={{
+                      fontSize: 11,
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      border: "1px solid var(--border-strong)",
+                      color: "var(--fg-muted)",
+                    }}
+                  >
+                    {s}
+                  </span>
+                ))}
+              </div>
             </div>
-            <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-              {r.sources.map((s) => (
-                <span
-                  key={s}
-                  style={{
-                    fontSize: 11,
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    border: "1px solid var(--border-strong)",
-                    color: "var(--fg-muted)",
-                  }}
-                >
-                  {s}
-                </span>
-              ))}
-            </div>
+          ))
+        ) : (
+          <div className="px-5 py-8 text-center" style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.55 }}>
+            No results yet. Run a batch to see enriched contacts here.
           </div>
-        ))}
+        )}
       </div>
     </div>
   );
+
+  // If no real pipeline data exists, show the empty state across all states.
+  if (!hasRunData && !hasResults) {
+    return (
+      <aside
+        className="h-full flex flex-col slide-in-right"
+        style={{
+          width: 320,
+          flexShrink: 0,
+          borderLeft: "1px solid var(--border)",
+          background: "var(--bg)",
+        }}
+      >
+        <Header title="Pipeline" />
+        <EmptyBody />
+      </aside>
+    );
+  }
 
   return (
     <aside
@@ -291,11 +335,11 @@ function PipelinePanel({
       }}
     >
       {state === "starting" && <>
-        <Header title="Enriching 50 leads from Zint batch" />
+        <Header title="Starting batch" />
         <StartingBody />
       </>}
       {state === "running" && <>
-        <Header title="Enriching 50 leads from Zint batch" />
+        <Header title="Enriching batch" />
         <RunningBody />
       </>}
       {state === "done" && <>
@@ -310,4 +354,4 @@ function PipelinePanel({
   );
 }
 
-window.PipelinePanel = PipelinePanel;
+export default PipelinePanel;

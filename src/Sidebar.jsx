@@ -1,3 +1,7 @@
+import React from 'react';
+import Data from './data.jsx';
+import Icon from './icons.jsx';
+
 // Left rail — assistant-scoped
 function Sidebar({ assistantKey, activeConvoId, setActiveConvoId, onNewConvo, onOpenSettings, onBackToDashboard }) {
   const a = Data.assistants[assistantKey];
@@ -75,9 +79,17 @@ function Sidebar({ assistantKey, activeConvoId, setActiveConvoId, onNewConvo, on
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 pt-2">
-        <Group title="Today" items={convos.today} />
-        <Group title="Yesterday" items={convos.yesterday} />
-        <Group title="Last 7 days" items={convos.last7} />
+        {(convos.today.length + convos.yesterday.length + convos.last7.length) === 0 ? (
+          <div className="px-2 py-6" style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.5 }}>
+            Your recent conversations will appear here.
+          </div>
+        ) : (
+          <>
+            {convos.today.length > 0 && <Group title="Today" items={convos.today} />}
+            {convos.yesterday.length > 0 && <Group title="Yesterday" items={convos.yesterday} />}
+            {convos.last7.length > 0 && <Group title="Last 7 days" items={convos.last7} />}
+          </>
+        )}
       </div>
 
       <div
@@ -97,4 +109,4 @@ function Sidebar({ assistantKey, activeConvoId, setActiveConvoId, onNewConvo, on
   );
 }
 
-window.Sidebar = Sidebar;
+export default Sidebar;

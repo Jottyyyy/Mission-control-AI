@@ -1,6 +1,6 @@
-// Floating tweaks panel — visible when toolbar Tweaks mode is on.
-const { useState: twUseState, useEffect: twUseEffect } = React;
+import React from 'react';
 
+// Floating tweaks panel — visible when toolbar Tweaks mode is on.
 function Tweaks({ visible, state, setState }) {
   if (!visible) return null;
 
@@ -95,11 +95,11 @@ function Tweaks({ visible, state, setState }) {
 
       <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
         <div style={{ fontSize: 11, color: "var(--fg-faint)", lineHeight: 1.5 }}>
-          Also try: type <span style={{ color: "var(--fg-muted)" }}>"enrich leads"</span> in the chat to trigger the live pipeline demo. ⌘⇧D dark mode, ⌘, mission control.
+          Shortcuts: ⌘⇧D dark mode, ⌘, mission control, ⌘N new conversation.
         </div>
       </div>
     </div>
   );
 }
 
-window.Tweaks = Tweaks;
+export default Tweaks;

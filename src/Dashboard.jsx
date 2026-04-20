@@ -1,3 +1,7 @@
+import React from 'react';
+import Data from './data.jsx';
+import Icon from './icons.jsx';
+
 // Landing dashboard: overview + two assistant cards
 function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
   const pa = Data.assistants.personal;
@@ -32,14 +36,20 @@ function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
         <div style={{ fontSize: 12, color: "var(--fg-faint)", marginBottom: 8 }}>
           Recent
         </div>
-        <div className="flex flex-col gap-2">
-          {a.recent.map((r) => (
-            <div key={r.title} className="flex items-center justify-between">
-              <div style={{ fontSize: 14, color: "var(--fg)" }} className="truncate pr-4">{r.title}</div>
-              <div style={{ fontSize: 12, color: "var(--fg-faint)", flexShrink: 0 }}>{r.time}</div>
-            </div>
-          ))}
-        </div>
+        {a.recent.length > 0 ? (
+          <div className="flex flex-col gap-2">
+            {a.recent.map((r) => (
+              <div key={r.title} className="flex items-center justify-between">
+                <div style={{ fontSize: 14, color: "var(--fg)" }} className="truncate pr-4">{r.title}</div>
+                <div style={{ fontSize: 12, color: "var(--fg-faint)", flexShrink: 0 }}>{r.time}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.5 }}>
+            No activity yet. Start a chat to begin.
+          </div>
+        )}
       </div>
 
       <div
@@ -47,10 +57,16 @@ function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
         style={{ borderTop: "1px solid var(--border)" }}
       >
         <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
-          <span style={{ color: "var(--fg)", fontWeight: 500 }}>{a.activityToday}</span> things done today
+          {a.activityToday > 0 ? (
+            <>
+              <span style={{ color: "var(--fg)", fontWeight: 500 }}>{a.activityToday}</span> things done today
+            </>
+          ) : (
+            <span>No activity yet</span>
+          )}
         </div>
         <div className="flex items-center gap-1.5" style={{ fontSize: 13, color: "var(--accent)" }}>
-          <span>Open</span>
+          <span>{a.recent.length > 0 ? "Open" : "Start chat"}</span>
           <Icon.ChevronRight className="lucide-xs" />
         </div>
       </div>
@@ -118,8 +134,8 @@ function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
             <div style={{ fontSize: 12, color: "var(--fg-faint)", marginBottom: 4 }}>
               Today at a glance
             </div>
-            <div style={{ fontSize: 15, color: "var(--fg)", lineHeight: 1.6 }}>
-              {Data.briefing}
+            <div style={{ fontSize: 15, color: Data.briefing ? "var(--fg)" : "var(--fg-muted)", lineHeight: 1.6 }}>
+              {Data.briefing || "Your daily briefing will appear here once your calendar and inbox are connected."}
             </div>
           </div>
 
@@ -144,26 +160,26 @@ function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
               <button
                 className="chip text-left px-4 py-3"
                 style={{ fontSize: 14 }}
-                onClick={() => onOpenAssistant("marketing", "Pull 20 leads from the Zint batch")}
+                onClick={() => onOpenAssistant("marketing", "Pull leads from a batch")}
               >
                 <span style={{ color: "var(--fg-muted)", marginRight: 8, fontSize: 12 }}>Marketing</span>
-                Pull 20 leads from the Zint batch
+                Pull leads from a batch
               </button>
               <button
                 className="chip text-left px-4 py-3"
                 style={{ fontSize: 14 }}
-                onClick={() => onOpenAssistant("marketing", "Who's the MAN at Acme Manufacturing Ltd?")}
+                onClick={() => onOpenAssistant("marketing", "Find the MAN for a company")}
               >
                 <span style={{ color: "var(--fg-muted)", marginRight: 8, fontSize: 12 }}>Marketing</span>
-                Who's the MAN at Acme Manufacturing Ltd?
+                Find the MAN for a company
               </button>
               <button
                 className="chip text-left px-4 py-3"
                 style={{ fontSize: 14 }}
-                onClick={() => onOpenAssistant("personal", "Draft a quick note to Tom")}
+                onClick={() => onOpenAssistant("personal", "Draft a quick note")}
               >
                 <span style={{ color: "var(--fg-muted)", marginRight: 8, fontSize: 12 }}>Personal</span>
-                Draft a quick note to Tom
+                Draft a quick note
               </button>
             </div>
           </div>
@@ -177,4 +193,4 @@ function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
   );
 }
 
-window.Dashboard = Dashboard;
+export default Dashboard;
