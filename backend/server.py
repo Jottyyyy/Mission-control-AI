@@ -982,6 +982,24 @@ _INTEGRATIONS: dict[str, dict] = {
         "all_fields": ["api_key", "sub_account_id"],
         "oauth": False,
     },
+    "pomanda": {
+        "label": "Pomanda",
+        "required_fields": ["api_key"],
+        "all_fields": ["api_key"],
+        "oauth": False,
+    },
+    "cognism": {
+        "label": "Cognism",
+        "required_fields": ["api_key"],
+        "all_fields": ["api_key"],
+        "oauth": False,
+    },
+    "lusha": {
+        "label": "Lusha",
+        "required_fields": ["api_key"],
+        "all_fields": ["api_key"],
+        "oauth": False,
+    },
 }
 
 
@@ -1193,10 +1211,86 @@ def _test_google_workspace() -> dict:
     return {"success": False, "error": resp.get("error", {}).get("message") if isinstance(resp.get("error"), dict) else str(resp.get("error") or f"HTTP {status}")}
 
 
+def _test_pomanda() -> dict:
+    """Lightweight read-only probe.
+
+    API shape is best-guess pending real-credential verification. Pomanda's
+    public docs advertise an `x-api-key` header; we call a `companies` search
+    with `limit=1` so the probe costs nothing interesting. If Pomanda changes
+    the header name (e.g. `Authorization: Bearer`) once real keys are in hand,
+    update here."""
+    api_key = _kc_get("pomanda", "api_key")
+    if not api_key:
+        return {"success": False, "error": "No Pomanda API key stored."}
+    status, body = _http_json(
+        "GET",
+        "https://api.pomanda.com/v1/companies?query=test&limit=1",
+        headers={"x-api-key": api_key, "Accept": "application/json"},
+    )
+    if status == 200:
+        return {"success": True}
+    if status in (401, 403):
+        return {"success": False, "error": f"Pomanda rejected the key ({status}). Re-check the value, or confirm the plan tier includes API access."}
+    if status == 0:
+        return {"success": False, "error": "Couldn't reach Pomanda. The endpoint URL may need verifying against real credentials."}
+    return {"success": False, "error": body.get("message") or body.get("error") or f"HTTP {status}"}
+
+
+def _test_cognism() -> dict:
+    """Lightweight account probe.
+
+    Cognism's public API is gated and evolves; `/users/me` is the commonest
+    account-level endpoint that returns 200 on a valid key and 401 otherwise.
+    This test does not consume enrichment credits. Verify the path once real
+    keys are on hand — Cognism may expose a dedicated /account or /quota
+    endpoint that's a cleaner probe."""
+    api_key = _kc_get("cognism", "api_key")
+    if not api_key:
+        return {"success": False, "error": "No Cognism API key stored."}
+    status, body = _http_json(
+        "GET",
+        "https://app.cognism.com/api/users/me",
+        headers={"api_key": api_key, "Accept": "application/json"},
+    )
+    if status == 200:
+        return {"success": True}
+    if status in (401, 403):
+        return {"success": False, "error": f"Cognism rejected the key ({status}). Admin permission is required to mint API keys — re-check who generated it."}
+    if status == 0:
+        return {"success": False, "error": "Couldn't reach Cognism."}
+    return {"success": False, "error": body.get("message") or body.get("error") or f"HTTP {status}"}
+
+
+def _test_lusha() -> dict:
+    """Quota / credit-usage probe.
+
+    Lusha v2 exposes `/v2/credits`; the call reads current credit balance and
+    does not consume any. Lusha accepts the key in an `api_key` header. Verify
+    once a real Premium/Scale key is available."""
+    api_key = _kc_get("lusha", "api_key")
+    if not api_key:
+        return {"success": False, "error": "No Lusha API key stored."}
+    status, body = _http_json(
+        "GET",
+        "https://api.lusha.com/v2/credits",
+        headers={"api_key": api_key, "Accept": "application/json"},
+    )
+    if status == 200:
+        return {"success": True}
+    if status in (401, 403):
+        return {"success": False, "error": f"Lusha rejected the key ({status}). Premium or Scale plan is required for API access."}
+    if status == 0:
+        return {"success": False, "error": "Couldn't reach Lusha."}
+    return {"success": False, "error": body.get("message") or body.get("error") or f"HTTP {status}"}
+
+
 _TESTERS = {
     "hubspot": _test_hubspot,
     "ghl": _test_ghl,
     "google-workspace": _test_google_workspace,
+    "pomanda": _test_pomanda,
+    "cognism": _test_cognism,
+    "lusha": _test_lusha,
 }
 
 

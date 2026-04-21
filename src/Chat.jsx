@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import Data from './data.jsx';
 import Icon from './icons.jsx';
+import { renderMarkdown } from './markdown.jsx';
 
 const API_BASE = "http://127.0.0.1:8001";
 
@@ -372,9 +373,11 @@ function Chat({
                     paddingLeft: m.error ? 12 : 0,
                   }}
                 >
-                  {m.text.split("\n").map((line, j) =>
-                    line.trim() === "" ? <p key={j}>&nbsp;</p> : <p key={j}>{line}</p>
-                  )}
+                  {m.error
+                    ? m.text.split("\n").map((line, j) =>
+                        line.trim() === "" ? <p key={j}>&nbsp;</p> : <p key={j}>{line}</p>
+                      )
+                    : renderMarkdown(m.text, `m-${i}`)}
                 </div>
                 {!m.error && <BrainPill model={m.model_used} />}
               </div>

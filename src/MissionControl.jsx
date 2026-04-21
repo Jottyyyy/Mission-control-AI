@@ -9,11 +9,10 @@ import {
   WorkspaceSection,
   NewSkillModal,
 } from './SettingsEditor.jsx';
-import IntegrationGuide from './IntegrationGuide.jsx';
+import Connections from './Connections.jsx';
 
 function MissionControl({ onBack, onOpenChatPrefilled }) {
-  const [tab, setTab] = useState("apps"); // apps | skills | soul | rules | aboutyou | memory | workspace | activity | integrations
-  const [panelApp, setPanelApp] = useState(null);
+  const [tab, setTab] = useState("connections"); // connections | skills | soul | rules | aboutyou | memory | workspace | activity
 
   const Header = () => (
     <div
@@ -35,15 +34,14 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
 
   const TabRail = () => {
     const tabs = [
-      { id: "apps",      label: "Connected apps", icon: "Grid" },
-      { id: "skills",    label: "Skills",         icon: "Sparkles" },
-      { id: "soul",      label: "Soul",           icon: "Brain" },
-      { id: "rules",     label: "Rules",          icon: "FileText" },
-      { id: "aboutyou",  label: "About you",      icon: "Users" },
-      { id: "memory",    label: "Memory",         icon: "BookOpen" },
-      { id: "workspace", label: "Workspace",      icon: "Folder" },
-      { id: "activity",  label: "Activity log",   icon: "Activity" },
-      { id: "integrations", label: "Integration Guide", icon: "Plug" },
+      { id: "connections", label: "Connections",  icon: "Plug" },
+      { id: "skills",      label: "Skills",       icon: "Sparkles" },
+      { id: "soul",        label: "Soul",         icon: "Brain" },
+      { id: "rules",       label: "Rules",        icon: "FileText" },
+      { id: "aboutyou",    label: "About you",    icon: "Users" },
+      { id: "memory",      label: "Memory",       icon: "BookOpen" },
+      { id: "workspace",   label: "Workspace",    icon: "Folder" },
+      { id: "activity",    label: "Activity log", icon: "Activity" },
     ];
     return (
       <div
@@ -67,79 +65,6 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
       </div>
     );
   };
-
-  const Apps = () => (
-    <div className="px-4 sm:px-6 lg:px-8 py-8 overflow-y-auto flex-1">
-      <div className="mx-auto w-full" style={{ maxWidth: 1120 }}>
-      <div className="mb-8">
-        <h2 style={{ fontSize: 20, fontWeight: 500, marginBottom: 4 }}>Connected apps</h2>
-        <p style={{ color: "var(--fg-muted)", fontSize: 14 }}>
-          Your assistant can see and use what you've connected here. Nothing leaves this Mac Mini.
-        </p>
-      </div>
-
-      <div style={{ color: "var(--fg-faint)", fontSize: 12, marginBottom: 12 }}>Connected</div>
-      {Data.connectedApps.length > 0 ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-10">
-          {Data.connectedApps.map((a) => (
-            <div key={a.name} className="card p-4">
-              <div className="flex items-center gap-3">
-                <div className="logo-square" style={{ color: "var(--accent)" }}>
-                  {React.createElement(Icon[a.icon], { className: "lucide-sm" })}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div style={{ fontSize: 14, fontWeight: 500 }}>{a.name}</div>
-                  <div className="flex items-center gap-1.5 mt-0.5" style={{ fontSize: 12, color: "var(--fg-muted)" }}>
-                    <span className="green-dot" />
-                    <span>Connected</span>
-                  </div>
-                </div>
-              </div>
-              <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 10, lineHeight: 1.5 }}>
-                {a.desc}
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div
-          className="card px-5 py-6 mb-10"
-          style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.55 }}
-        >
-          Nothing connected yet. Connect tools below to unlock assistant capabilities.
-        </div>
-      )}
-
-      <div style={{ color: "var(--fg-faint)", fontSize: 12, marginBottom: 12 }}>Available to add</div>
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {Data.availableApps.map((a) => (
-          <button
-            key={a.name}
-            className="card p-4 text-left"
-            onClick={() => setPanelApp(a)}
-            style={{ cursor: "pointer" }}
-          >
-            <div className="flex items-center gap-3">
-              <div className="logo-square" style={{ color: "var(--fg-muted)" }}>
-                {React.createElement(Icon[a.icon], { className: "lucide-sm" })}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div style={{ fontSize: 14, fontWeight: 500 }}>{a.name}</div>
-                <div className="flex items-center gap-1.5 mt-0.5" style={{ fontSize: 12, color: "var(--fg-muted)" }}>
-                  <span className="gray-dot" />
-                  <span>Not connected</span>
-                </div>
-              </div>
-            </div>
-            <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 10, lineHeight: 1.5 }}>
-              {a.desc}
-            </div>
-          </button>
-        ))}
-      </div>
-      </div>
-    </div>
-  );
 
   const Skills = () => {
     const [skills, setSkills] = useState(Data.skills);
@@ -612,7 +537,7 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
       <div className="flex-1 flex min-h-0">
         <TabRail />
         <div className="flex-1 flex min-w-0">
-          {tab === "apps" && <Apps />}
+          {tab === "connections" && <Connections />}
           {tab === "skills" && <Skills />}
           {tab === "soul" && <SoulSection />}
           {tab === "rules" && <RulesSection />}
@@ -620,80 +545,8 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
           {tab === "memory" && <Memory />}
           {tab === "workspace" && <WorkspaceSection />}
           {tab === "activity" && <Activity />}
-          {tab === "integrations" && <IntegrationGuide />}
         </div>
       </div>
-
-      {/* Slide-in panel for app details */}
-      {panelApp && (
-        <>
-          <div
-            style={{
-              position: "fixed",
-              inset: 0,
-              background: "rgba(0,0,0,0.08)",
-              zIndex: 40,
-            }}
-            onClick={() => setPanelApp(null)}
-          />
-          <aside
-            className="slide-in-right"
-            style={{
-              position: "fixed",
-              top: 0, right: 0, bottom: 0,
-              width: 380,
-              background: "var(--bg)",
-              borderLeft: "1px solid var(--border)",
-              zIndex: 41,
-              display: "flex",
-              flexDirection: "column",
-            }}
-          >
-            <div
-              className="px-6 py-4 flex items-center justify-between"
-              style={{ borderBottom: "1px solid var(--border)" }}
-            >
-              <div className="flex items-center gap-3">
-                <div className="logo-square" style={{ color: "var(--fg-muted)" }}>
-                  {React.createElement(Icon[panelApp.icon], { className: "lucide-sm" })}
-                </div>
-                <div>
-                  <div style={{ fontSize: 15, fontWeight: 500 }}>{panelApp.name}</div>
-                  <div style={{ fontSize: 12, color: "var(--fg-muted)", marginTop: 2 }}>{panelApp.desc}</div>
-                </div>
-              </div>
-              <button className="btn-ghost p-1.5" onClick={() => setPanelApp(null)}>
-                <Icon.X className="lucide-sm" />
-              </button>
-            </div>
-            <div className="flex-1 px-6 py-6 overflow-y-auto">
-              <div style={{ fontSize: 14, color: "var(--fg)", lineHeight: 1.6, marginBottom: 20 }}>
-                Give the assistant access to your {panelApp.name.toLowerCase()}.
-              </div>
-              <ul className="flex flex-col gap-3 mb-6">
-                {panelApp.explain.map((p, i) => (
-                  <li key={i} className="flex items-start gap-3" style={{ fontSize: 14, color: "var(--fg-muted)", lineHeight: 1.55 }}>
-                    <span
-                      style={{
-                        width: 4, height: 4, borderRadius: 999,
-                        background: "var(--accent-line)",
-                        flexShrink: 0, marginTop: 10,
-                      }}
-                    />
-                    <span>{p}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div className="p-5" style={{ borderTop: "1px solid var(--border)" }}>
-              <button className="btn-primary w-full py-2.5">Connect {panelApp.name}</button>
-              <div className="text-center mt-3" style={{ fontSize: 12, color: "var(--fg-faint)" }}>
-                You can disconnect at any time.
-              </div>
-            </div>
-          </aside>
-        </>
-      )}
     </div>
   );
 }
