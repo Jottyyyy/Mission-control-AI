@@ -2,41 +2,83 @@ import React, { useState, useEffect, useRef } from 'react';
 import Data from './data.jsx';
 import Icon from './icons.jsx';
 
-function getGreetingTime() {
-  const h = new Date().getHours();
-  if (h < 12) return "morning";
-  if (h < 17) return "afternoon";
-  return "evening";
+const API_BASE = "http://127.0.0.1:8001";
+
+function BrainPill({ model }) {
+  if (model !== "sonnet" && model !== "opus") return null;
+  const fast = model === "sonnet";
+  const IconCmp = fast ? Icon.Zap : Icon.Brain;
+  return (
+    <div
+      className="flex items-center gap-1 mt-1.5"
+      style={{ fontSize: 11, color: "var(--fg-faint)" }}
+    >
+      {IconCmp ? <IconCmp className="lucide-xs" /> : null}
+      <span>{fast ? "Quick reply" : "Thought deeply"}</span>
+    </div>
+  );
 }
 
 function Chat({
-  assistantKey,    // "personal" | "marketing"
-  mode,            // "empty-first" | "empty-recurring" | "active"
+  assistantKey,                 // "personal" | "marketing"
+  mode,                         // "empty-first" | "empty-recurring" | "active"
   setMode,
   onTriggerPipeline,
   rightRailOpen,
   pipelineMinimized,
   onRestorePipeline,
-  prefill,         // optional string to prefill input
+  prefill,
+  activeConversationUuid,       // null for new, otherwise uuid
+  setActiveConversationUuid,    // (uuid | null) => void
 }) {
   const a = Data.assistants[assistantKey];
   const chips = a.chips;
-  const seed = Data.seedMessages[assistantKey] || [];
 
   const [input, setInput] = useState(prefill || "");
   const [confirmReset, setConfirmReset] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [thinking, setThinking] = useState(false);
-  const [messages, setMessages] = useState(() => seed.slice());
+  const [messages, setMessages] = useState([]);
+  const [loadError, setLoadError] = useState("");
   const inputRef = useRef(null);
   const scrollRef = useRef(null);
 
-  // Reset messages when assistant changes
+  // Reset messages + input when assistant changes.
   useEffect(() => {
-    setMessages(Data.seedMessages[assistantKey] ? Data.seedMessages[assistantKey].slice() : []);
+    setMessages([]);
+    setConfirmReset(false);
   }, [assistantKey]);
 
-  // Focus input on first-run + recurring
+  // Load conversation whenever the selected uuid changes.
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeConversationUuid) {
+      setMessages([]);
+      setLoadError("");
+      return () => { cancelled = true; };
+    }
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/conversations/${activeConversationUuid}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        const loaded = (data.messages || []).map((m) => ({
+          from: m.role === "assistant" ? "assistant" : "user",
+          text: m.content,
+          model_used: m.model_used,
+        }));
+        setMessages(loaded);
+        setLoadError("");
+        if (loaded.length > 0) setMode("active");
+      } catch (_) {
+        if (!cancelled) setLoadError("Couldn't load that conversation.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeConversationUuid, setMode]);
+
+  // Focus + prefill on first-run / recurring.
   useEffect(() => {
     if (mode !== "active" && inputRef.current) {
       inputRef.current.focus();
@@ -50,21 +92,28 @@ function Chat({
     }
   }, [mode, assistantKey, prefill]);
 
-  // Scroll to bottom when messages change (active mode)
+  // Scroll to bottom on message change.
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, thinking, mode]);
 
+  const updateUrl = (uuid) => {
+    try {
+      const url = new URL(window.location.href);
+      if (uuid) url.searchParams.set("conversation", uuid);
+      else url.searchParams.delete("conversation");
+      window.history.pushState({}, "", url.toString());
+    } catch (_) { /* ignore */ }
+  };
+
   const handleSend = async () => {
-    if (thinking) return;                // guard against parallel sends
+    if (thinking) return;
     const v = input.trim();
     if (!v) return;
     setInput("");
 
-    // Pipeline demo trigger (only for marketing) — still opens the side panel,
-    // but the assistant's words come from the backend.
     const lower = v.toLowerCase();
     const isPipeline =
       assistantKey === "marketing" && (
@@ -74,24 +123,26 @@ function Chat({
         lower === "demo"
       );
 
-    // Move out of empty into active
     if (mode !== "active") setMode("active");
 
     setMessages((m) => [...m, { from: "user", text: v }]);
     setThinking(true);
     if (isPipeline) onTriggerPipeline();
 
-    // Mode for the backend — matches the specialist ownership in AGENTS.md.
     const backendMode = assistantKey === "marketing" ? "marketing" : "personal";
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
     try {
-      const res = await fetch("http://127.0.0.1:8001/chat", {
+      const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: v, mode: backendMode }),
+        body: JSON.stringify({
+          message: v,
+          mode: backendMode,
+          conversation_id: activeConversationUuid || null,
+        }),
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -101,14 +152,18 @@ function Chat({
       const data = await res.json();
       setMessages((m) => [
         ...m,
-        { from: "assistant", text: data.reply ?? "" },
+        { from: "assistant", text: data.reply ?? "", model_used: data.model_used },
       ]);
+
+      if (data.conversation_id && data.conversation_id !== activeConversationUuid) {
+        setActiveConversationUuid(data.conversation_id);
+        updateUrl(data.conversation_id);
+      }
     } catch (err) {
       let text;
       if (err && err.name === "AbortError") {
         text = "That took longer than expected. Try asking again.";
       } else if (err instanceof TypeError) {
-        // Fetch throws TypeError on network / connection-refused failures.
         text = "I can't reach the local service. Make sure the app's backend is running.";
       } else {
         text = "Something went wrong. Check the app logs.";
@@ -131,7 +186,6 @@ function Chat({
     setInput(text);
     if (inputRef.current) {
       inputRef.current.focus();
-      // place cursor at end
       setTimeout(() => {
         const el = inputRef.current;
         if (el) el.selectionStart = el.selectionEnd = el.value.length;
@@ -148,9 +202,10 @@ function Chat({
     setMode("empty-recurring");
     setConfirmReset(false);
     setInput("");
+    setActiveConversationUuid(null);
+    updateUrl(null);
   };
 
-  // Top bar
   const TopBar = () => (
     <div
       className="flex items-center justify-between px-6 py-3"
@@ -201,7 +256,6 @@ function Chat({
     </div>
   );
 
-  // Empty first-run content
   const EmptyFirstRun = () => (
     <div className="flex-1 flex flex-col items-center justify-center px-6 fade-in">
       <div className="w-full" style={{ maxWidth: 640 }}>
@@ -235,7 +289,6 @@ function Chat({
     </div>
   );
 
-  // Empty recurring content
   const EmptyRecurring = () => (
     <div className="flex-1 flex flex-col items-center justify-center px-6 fade-in">
       <div className="w-full" style={{ maxWidth: 640 }}>
@@ -290,10 +343,14 @@ function Chat({
     </div>
   );
 
-  // Active conversation
   const ActiveConvo = () => (
     <div ref={scrollRef} className="flex-1 overflow-y-auto">
       <div className="mx-auto px-6 py-8" style={{ maxWidth: 720 }}>
+        {loadError && (
+          <div className="mb-6" style={{ fontSize: 13, color: "var(--fg-muted)" }}>
+            {loadError}
+          </div>
+        )}
         {messages.map((m, i) => (
           <div key={i} className={"mb-6 flex " + (m.from === "user" ? "justify-end" : "justify-start") + " fade-in"}>
             {m.from === "user" ? (
@@ -304,18 +361,22 @@ function Chat({
               </div>
             ) : (
               <div
-                className="msg-body"
-                style={{
-                  maxWidth: "100%",
-                  color: m.error ? "var(--fg-muted)" : "var(--fg)",
-                  lineHeight: 1.65,
-                  borderLeft: m.error ? "2px solid var(--border-strong)" : "none",
-                  paddingLeft: m.error ? 12 : 0,
-                }}
+                style={{ maxWidth: "100%", width: "100%" }}
               >
-                {m.text.split("\n").map((line, j) =>
-                  line.trim() === "" ? <p key={j}>&nbsp;</p> : <p key={j}>{line}</p>
-                )}
+                <div
+                  className="msg-body"
+                  style={{
+                    color: m.error ? "var(--fg-muted)" : "var(--fg)",
+                    lineHeight: 1.65,
+                    borderLeft: m.error ? "2px solid var(--border-strong)" : "none",
+                    paddingLeft: m.error ? 12 : 0,
+                  }}
+                >
+                  {m.text.split("\n").map((line, j) =>
+                    line.trim() === "" ? <p key={j}>&nbsp;</p> : <p key={j}>{line}</p>
+                  )}
+                </div>
+                {!m.error && <BrainPill model={m.model_used} />}
               </div>
             )}
           </div>
@@ -338,24 +399,16 @@ function Chat({
       {mode === "empty-recurring" && <EmptyRecurring />}
       {mode === "active" && <ActiveConvo />}
 
-      {/* Chat input */}
       <div className="px-6 pb-5 pt-2">
         <div className="mx-auto" style={{ maxWidth: 720 }}>
           <div className="chat-input-wrap px-4 py-2 flex items-end gap-2">
-            {/* Reset button */}
             {confirmReset ? (
               <div className="flex items-center gap-2 pr-1" style={{ fontSize: 13 }}>
                 <span style={{ color: "var(--fg-muted)" }}>Clear this conversation?</span>
-                <button
-                  onClick={handleReset}
-                  style={{ color: "var(--danger)", fontWeight: 500 }}
-                >
+                <button onClick={handleReset} style={{ color: "var(--danger)", fontWeight: 500 }}>
                   Clear
                 </button>
-                <button
-                  onClick={() => setConfirmReset(false)}
-                  style={{ color: "var(--fg-muted)" }}
-                >
+                <button onClick={() => setConfirmReset(false)} style={{ color: "var(--fg-muted)" }}>
                   Cancel
                 </button>
               </div>
@@ -411,7 +464,6 @@ function Chat({
         </div>
       </div>
 
-      {/* Minimized pipeline indicator */}
       {pipelineMinimized && !rightRailOpen && (
         <div className="bg-status-dot" onClick={onRestorePipeline} title="Show progress">
           <span className="green-dot pulse-dot" />

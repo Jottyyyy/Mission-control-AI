@@ -28,7 +28,15 @@ function App() {
   const [dashboardState, setDashboardState] = useState(() => {
     return localStorage.getItem("adam.dashState") || "empty-recurring";
   });
-  const [activeConvoId, setActiveConvoId] = useState(null);
+  // uuid of the selected conversation (null = new / empty)
+  const [activeConversationUuid, setActiveConversationUuid] = useState(() => {
+    try {
+      const url = new URL(window.location.href);
+      return url.searchParams.get("conversation") || null;
+    } catch (_) {
+      return null;
+    }
+  });
   const [prefill, setPrefill] = useState("");
   const [rightRailOpen, setRightRailOpen] = useState(false);
   const [pipelineState, setPipelineState] = useState(defaults.pipelineState || "starting");
@@ -83,23 +91,36 @@ function App() {
     return () => window.removeEventListener("message", onMsg);
   }, []);
 
+  const updateUrl = (uuid) => {
+    try {
+      const url = new URL(window.location.href);
+      if (uuid) url.searchParams.set("conversation", uuid);
+      else url.searchParams.delete("conversation");
+      window.history.pushState({}, "", url.toString());
+    } catch (_) { /* ignore */ }
+  };
+
   const handleNewConvo = () => {
     setDashboardState("empty-recurring");
-    setActiveConvoId(null);
+    setActiveConversationUuid(null);
+    updateUrl(null);
     setPrefill("");
+  };
+
+  const handleSelectConversation = (uuid) => {
+    setActiveConversationUuid(uuid);
+    updateUrl(uuid);
+    setPrefill("");
+    setDashboardState(uuid ? "active" : "empty-recurring");
   };
 
   const handleOpenAssistant = (key, maybePrefill) => {
     setAssistantKey(key);
     setScreen("assistant");
-    setActiveConvoId(null);
-    if (maybePrefill) {
-      setDashboardState("empty-recurring");
-      setPrefill(maybePrefill);
-    } else {
-      setDashboardState("empty-recurring");
-      setPrefill("");
-    }
+    setActiveConversationUuid(null);
+    updateUrl(null);
+    setDashboardState("empty-recurring");
+    setPrefill(maybePrefill || "");
   };
 
   const handleTriggerPipeline = () => {
@@ -161,8 +182,8 @@ function App() {
         <>
           <Sidebar
             assistantKey={assistantKey}
-            activeConvoId={activeConvoId}
-            setActiveConvoId={(id) => { setActiveConvoId(id); setDashboardState("active"); setPrefill(""); }}
+            activeConversationUuid={activeConversationUuid}
+            onSelectConversation={handleSelectConversation}
             onNewConvo={handleNewConvo}
             onOpenSettings={() => { setMissionReturn("assistant"); setScreen("mission"); }}
             onBackToDashboard={() => { setScreen("dashboard"); setRightRailOpen(false); setPipelineMinimized(false); }}
@@ -176,6 +197,11 @@ function App() {
             pipelineMinimized={pipelineMinimized}
             onRestorePipeline={handleRestorePipeline}
             prefill={prefill}
+            activeConversationUuid={activeConversationUuid}
+            setActiveConversationUuid={(uuid) => {
+              setActiveConversationUuid(uuid);
+              if (uuid) setDashboardState("active");
+            }}
           />
           {rightRailOpen && (
             <PipelinePanel

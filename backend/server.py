@@ -7,7 +7,11 @@ from typing import Optional, Literal
 import sqlite3
 import subprocess
 import json
+import os
 import re
+import uuid
+import urllib.request
+import urllib.error
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -65,16 +69,55 @@ CORE_SKILLS = [
 # App bootstrap (keep existing DB and CORS config)
 # ---------------------------------------------------------------------------
 
-conn = sqlite3.connect(DB_PATH)
-conn.executescript("""
+# DB bootstrap. The pre-Smart-Chat schema had a single `conversations` table
+# that stored individual messages (columns: id, role, content, created_at).
+# The new schema splits that into `conversations` (metadata) + `messages`.
+# If the old table shape is still on disk, rename it before creating the new one.
+_conn = sqlite3.connect(DB_PATH)
+_conn.row_factory = sqlite3.Row
+_cur = _conn.cursor()
+_existing = _cur.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'"
+).fetchone()
+if _existing:
+    _cols = [r["name"] for r in _cur.execute("PRAGMA table_info(conversations)").fetchall()]
+    if "uuid" not in _cols:
+        _cur.execute("ALTER TABLE conversations RENAME TO conversations_legacy")
+        _conn.commit()
+_conn.executescript("""
 CREATE TABLE IF NOT EXISTS conversations (
-  id INTEGER PRIMARY KEY,
-  role TEXT,
-  content TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uuid TEXT UNIQUE NOT NULL,
+  mode TEXT NOT NULL,
+  title TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  model_used TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_mode_updated
+  ON conversations(mode, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation
+  ON messages(conversation_id, created_at);
 """)
-conn.close()
+_conn.close()
+
+
+def _db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    # ON DELETE CASCADE requires FK enforcement per connection.
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 app = FastAPI(title="Sir Adam's Assistant Adapter")
 
@@ -251,11 +294,16 @@ def _discover_skills() -> list[dict]:
 class ChatRequest(BaseModel):
     message: str
     mode: Optional[Literal["personal", "marketing"]] = None
+    conversation_id: Optional[str] = None  # conversation uuid
 
 
 class SavePayload(BaseModel):
     path: str
     content: str
+
+
+class TitlePayload(BaseModel):
+    title: str
 
 
 class RestorePayload(BaseModel):
@@ -274,6 +322,100 @@ class CustomSkillPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Brain routing (fast / deep)
+# ---------------------------------------------------------------------------
+#
+# Philosophy (from the task spec): automatic routing, Jackson doesn't pick.
+#   FAST = anthropic/claude-sonnet-4-6  (default OpenClaw model)
+#   DEEP = anthropic/claude-opus-4-7
+#   ROUTER = anthropic/claude-haiku-4-5-20251001  (tiny classifier)
+#
+# Two-layered router so the feature still works without an API key in env:
+#   1. If ANTHROPIC_API_KEY is set in the backend environment, call Haiku
+#      with a strict classifier prompt (hard 2-second timeout).
+#   2. Otherwise, fall back to a deterministic keyword-plus-length heuristic.
+# In both cases we default to FAST on any error — deep should be the exception.
+
+ROUTER_PROMPT = (
+    "You are a classifier. Read this user message and decide if it needs "
+    "FAST or DEEP reasoning.\n\n"
+    "DEEP is for: strategic decisions, multi-step analysis, weighing options, "
+    "comparing complex alternatives, negotiations requiring judgment, "
+    "'help me think through X', multi-part questions where each part "
+    "requires reasoning.\n\n"
+    "FAST is for: factual lookups, simple drafts, summaries, "
+    "calendar/inbox/file queries, short replies, quick follow-ups, "
+    "anything that doesn't require hard thinking.\n\n"
+    "Respond with exactly one word: FAST or DEEP.\n\n"
+    "User message: {message}\n"
+    "Context mode: {mode}"
+)
+
+_DEEP_HINTS = (
+    "help me think", "think through", "weigh", "trade-off", "trade off",
+    "tradeoff", "pros and cons", "compare ", "strategy", "strategic",
+    "analyse", "analyze", "should we ", "should i ", "why would",
+    "negotiat", "decide between", "decide whether", "evaluate", "assessment",
+    "prioriti", "long-term", "roadmap",
+)
+
+
+def _heuristic_brain(message: str) -> str:
+    """Deterministic keyword + length classifier. Default FAST."""
+    m = message.lower()
+    if any(h in m for h in _DEEP_HINTS):
+        return "deep"
+    # Long, multi-clause questions with newlines are also DEEP candidates.
+    if len(message) > 320 and ("?" in message or "\n" in message):
+        return "deep"
+    return "fast"
+
+
+def _haiku_brain(api_key: str, message: str, mode: str) -> Optional[str]:
+    """Call Haiku to classify. Returns 'fast'/'deep', or None on any failure."""
+    body = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 4,
+        "messages": [{
+            "role": "user",
+            "content": ROUTER_PROMPT.format(message=message, mode=mode or "personal"),
+        }],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            word = (block.get("text") or "").strip().upper()
+            if "DEEP" in word:
+                return "deep"
+            if "FAST" in word:
+                return "fast"
+    return None
+
+
+def route_to_brain(message: str, mode: str) -> str:
+    """Returns 'fast' or 'deep'. Defaults to 'fast' on any failure."""
+    api_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if api_key:
+        decided = _haiku_brain(api_key, message, mode)
+        if decided in ("fast", "deep"):
+            return decided
+    return _heuristic_brain(message)
+
+
+# ---------------------------------------------------------------------------
 # Health & chat
 # ---------------------------------------------------------------------------
 
@@ -282,44 +424,206 @@ def health():
     return {"status": "ok", "local": True, "workspace": str(WORKSPACE)}
 
 
+def _invoke_openclaw(prefixed: str, brain: str, session_id: Optional[str]) -> subprocess.CompletedProcess:
+    """Run the main OpenClaw agent. Threads session_id through so each Mission
+    Control conversation maps to a dedicated OpenClaw session (fresh system
+    prompt on first turn, continuity across later turns in the same chat).
+
+    For the deep brain we pass --thinking high and set ANTHROPIC_MODEL in the
+    subprocess env so the gateway picks Opus if it honours the override. If
+    OpenClaw ignores both (model pinned in openclaw.json), the reply still
+    goes through — it just uses the configured primary."""
+    cmd = [OPENCLAW_BIN, "agent", "--agent", "main", "--message", prefixed]
+    if session_id:
+        cmd.extend(["--session-id", session_id])
+    env = os.environ.copy()
+    if brain == "deep":
+        cmd.extend(["--thinking", "high"])
+        env["ANTHROPIC_MODEL"] = "anthropic/claude-opus-4-7"
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+
+
 @app.post("/chat")
 def chat(req: ChatRequest):
-    # Mode-aware prefix so the main agent routes to the right specialist.
-    if req.mode == "personal":
-        prefixed = "[personal] " + req.message
-    elif req.mode == "marketing":
-        prefixed = "[marketing] " + req.message
+    effective_mode = req.mode or "personal"
+    message = req.message
+
+    # Find or create the conversation row.
+    conn = _db()
+    cur = conn.cursor()
+    if req.conversation_id:
+        row = cur.execute(
+            "SELECT id, mode FROM conversations WHERE uuid = ?",
+            (req.conversation_id,),
+        ).fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        conv_id = row["id"]
+        conv_uuid = req.conversation_id
     else:
-        prefixed = req.message
+        conv_uuid = str(uuid.uuid4())
+        title = (message.strip().splitlines()[0] if message.strip() else "Untitled")[:50] or "Untitled"
+        cur.execute(
+            "INSERT INTO conversations (uuid, mode, title) VALUES (?, ?, ?)",
+            (conv_uuid, effective_mode, title),
+        )
+        conv_id = cur.lastrowid
+
+    # Save user message before invoking OpenClaw so it's never lost on failure.
+    cur.execute(
+        "INSERT INTO messages (conversation_id, role, content, model_used) VALUES (?, ?, ?, NULL)",
+        (conv_id, "user", message),
+    )
+    conn.commit()
+
+    # Prefix for the main agent's routing.
+    if effective_mode == "marketing":
+        prefixed = "[marketing] " + message
+    else:
+        prefixed = "[personal] " + message
+
+    brain = route_to_brain(message, effective_mode)
+    model_used = "opus" if brain == "deep" else "sonnet"
 
     try:
-        result = subprocess.run(
-            [OPENCLAW_BIN, "agent", "--agent", "main", "--message", prefixed],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        result = _invoke_openclaw(prefixed, brain, conv_uuid)
+        if result.returncode != 0 and brain == "deep":
+            # Deep failed — one retry on fast before giving up.
+            brain = "fast"
+            model_used = "sonnet"
+            result = _invoke_openclaw(prefixed, brain, conv_uuid)
         if result.returncode != 0:
+            conn.close()
             raise HTTPException(
                 status_code=500,
                 detail=f"OpenClaw error: {(result.stderr or 'unknown').strip()}",
             )
         reply = result.stdout.strip()
 
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("INSERT INTO conversations (role, content) VALUES (?, ?)", ("user", req.message))
-        conn.execute("INSERT INTO conversations (role, content) VALUES (?, ?)", ("assistant", reply))
+        cur.execute(
+            "INSERT INTO messages (conversation_id, role, content, model_used) VALUES (?, ?, ?, ?)",
+            (conv_id, "assistant", reply, model_used),
+        )
+        cur.execute(
+            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (conv_id,),
+        )
         conn.commit()
         conn.close()
 
-        return {"reply": reply, "mode": req.mode or "personal"}
+        return {
+            "reply": reply,
+            "mode": effective_mode,
+            "conversation_id": conv_uuid,
+            "model_used": model_used,
+        }
 
     except subprocess.TimeoutExpired:
+        conn.close()
         raise HTTPException(status_code=504, detail="OpenClaw timed out.")
     except HTTPException:
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(status_code=500, detail=f"Chat failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Conversations
+# ---------------------------------------------------------------------------
+
+@app.get("/conversations")
+def conversations_list(mode: Optional[Literal["personal", "marketing"]] = Query(None)):
+    conn = _db()
+    if mode:
+        rows = conn.execute(
+            """
+            SELECT c.uuid, c.mode, c.title, c.created_at, c.updated_at,
+                   COUNT(m.id) AS message_count
+            FROM conversations c
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            WHERE c.mode = ?
+            GROUP BY c.id
+            ORDER BY c.updated_at DESC
+            """,
+            (mode,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT c.uuid, c.mode, c.title, c.created_at, c.updated_at,
+                   COUNT(m.id) AS message_count
+            FROM conversations c
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            GROUP BY c.id
+            ORDER BY c.updated_at DESC
+            """,
+        ).fetchall()
+    conn.close()
+    return {"conversations": [dict(r) for r in rows]}
+
+
+@app.get("/conversations/{conv_uuid}")
+def conversation_detail(conv_uuid: str):
+    conn = _db()
+    conv = conn.execute(
+        "SELECT id, uuid, mode, title, created_at, updated_at FROM conversations WHERE uuid = ?",
+        (conv_uuid,),
+    ).fetchone()
+    if not conv:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    msgs = conn.execute(
+        """
+        SELECT role, content, model_used, created_at
+        FROM messages
+        WHERE conversation_id = ?
+        ORDER BY id ASC
+        """,
+        (conv["id"],),
+    ).fetchall()
+    conn.close()
+    return {
+        "uuid": conv["uuid"],
+        "mode": conv["mode"],
+        "title": conv["title"],
+        "created_at": conv["created_at"],
+        "updated_at": conv["updated_at"],
+        "messages": [dict(m) for m in msgs],
+    }
+
+
+@app.delete("/conversations/{conv_uuid}")
+def conversation_delete(conv_uuid: str):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM conversations WHERE uuid = ?", (conv_uuid,))
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    conn.commit()
+    conn.close()
+    return {"ok": True, "uuid": conv_uuid}
+
+
+@app.patch("/conversations/{conv_uuid}")
+def conversation_rename(conv_uuid: str, payload: TitlePayload):
+    title = payload.title.strip()[:100]
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required.")
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE conversations SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE uuid = ?",
+        (title, conv_uuid),
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    conn.commit()
+    conn.close()
+    return {"ok": True, "uuid": conv_uuid, "title": title}
 
 
 # ---------------------------------------------------------------------------
