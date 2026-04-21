@@ -42,6 +42,7 @@ import {
   Sun,
   Loader,
   ExternalLink,
+  Plug,
 } from 'lucide-react';
 
 const Icon = {
@@ -88,6 +89,7 @@ const Icon = {
   Sun,
   Loader,
   ExternalLink,
+  Plug,
 };
 
 export default Icon;

@@ -9,9 +9,10 @@ import {
   WorkspaceSection,
   NewSkillModal,
 } from './SettingsEditor.jsx';
+import IntegrationGuide from './IntegrationGuide.jsx';
 
 function MissionControl({ onBack, onOpenChatPrefilled }) {
-  const [tab, setTab] = useState("apps"); // apps | skills | soul | rules | aboutyou | memory | workspace | activity
+  const [tab, setTab] = useState("apps"); // apps | skills | soul | rules | aboutyou | memory | workspace | activity | integrations
   const [panelApp, setPanelApp] = useState(null);
 
   const Header = () => (
@@ -42,6 +43,7 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
       { id: "memory",    label: "Memory",         icon: "BookOpen" },
       { id: "workspace", label: "Workspace",      icon: "Folder" },
       { id: "activity",  label: "Activity log",   icon: "Activity" },
+      { id: "integrations", label: "Integration Guide", icon: "Plug" },
     ];
     return (
       <div
@@ -618,6 +620,7 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
           {tab === "memory" && <Memory />}
           {tab === "workspace" && <WorkspaceSection />}
           {tab === "activity" && <Activity />}
+          {tab === "integrations" && <IntegrationGuide />}
         </div>
       </div>
 

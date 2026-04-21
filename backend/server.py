@@ -11,7 +11,12 @@ import os
 import re
 import uuid
 import urllib.request
+import urllib.parse
 import urllib.error
+
+# Keychain. Hard-fail import — the task requires Keychain-only storage.
+import keyring  # noqa: E402
+import keyring.errors  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -293,7 +298,7 @@ def _discover_skills() -> list[dict]:
 
 class ChatRequest(BaseModel):
     message: str
-    mode: Optional[Literal["personal", "marketing"]] = None
+    mode: Optional[Literal["personal", "marketing", "setup"]] = None
     conversation_id: Optional[str] = None  # conversation uuid
 
 
@@ -416,6 +421,46 @@ def route_to_brain(message: str, mode: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Credential scrubber (applied to every inbound chat message).
+# ---------------------------------------------------------------------------
+#
+# If Tom pastes a token into chat by mistake (we tell him not to, but pasting
+# happens) we MUST redact before: (a) logging the subprocess call, (b) saving
+# to SQLite, (c) sending to the OpenClaw gateway / Anthropic.
+#
+# Patterns are intentionally broad. False-positive redactions are fine; the
+# agent will just see "[redacted]" and ask Tom to use the form instead.
+
+_CRED_PATTERNS = [
+    # Google OAuth client secrets.
+    re.compile(r"GOCSPX-[A-Za-z0-9_\-]{16,}"),
+    # Google OAuth client IDs — 12-digit prefix + `-` + long hex + `.apps.gusercontent.com` suffix.
+    re.compile(r"\d{10,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com"),
+    # HubSpot Private App tokens (pat-) and legacy hapikey UUIDs.
+    re.compile(r"pat-[a-z0-9-]{20,}", re.IGNORECASE),
+    # Common API-key shapes seen from Anthropic/OpenAI/GHL/etc.
+    re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
+    # Bearer JWTs (ya29. access tokens, generic eyJ...). Capture conservatively.
+    re.compile(r"ya29\.[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+    # Generic bearer / API-key lines where the user literally typed the prefix.
+    re.compile(r"(?im)^\s*(?:bearer|authorization|api[_-]?key|token|secret)\s*[:=]\s*\S{12,}\s*$"),
+    # Fallback: very long opaque strings that look like secrets (40+ chars, no spaces).
+    re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),
+]
+
+
+def _scrub_credentials(text: str) -> str:
+    """Replace anything that looks like an API key / token with [redacted].
+
+    Applied to every inbound chat message before persistence or subprocess."""
+    out = text
+    for pat in _CRED_PATTERNS:
+        out = pat.sub("[redacted]", out)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Health & chat
 # ---------------------------------------------------------------------------
 
@@ -446,7 +491,11 @@ def _invoke_openclaw(prefixed: str, brain: str, session_id: Optional[str]) -> su
 @app.post("/chat")
 def chat(req: ChatRequest):
     effective_mode = req.mode or "personal"
-    message = req.message
+    # Credential scrub — if Tom accidentally pastes a token into the chat
+    # (e.g. while we're guiding him through HubSpot) we MUST not persist it
+    # to SQLite, ship it to Anthropic, or echo it back. Redact before we do
+    # anything else with the message.
+    message = _scrub_credentials(req.message)
 
     # Find or create the conversation row.
     conn = _db()
@@ -480,10 +529,17 @@ def chat(req: ChatRequest):
     # Prefix for the main agent's routing.
     if effective_mode == "marketing":
         prefixed = "[marketing] " + message
+    elif effective_mode == "setup":
+        prefixed = "[setup] " + message
     else:
         prefixed = "[personal] " + message
 
-    brain = route_to_brain(message, effective_mode)
+    # Setup mode is always FAST — credential walk-throughs don't benefit
+    # from deep reasoning and the latency matters for a step-by-step flow.
+    if effective_mode == "setup":
+        brain = "fast"
+    else:
+        brain = route_to_brain(message, effective_mode)
     model_used = "opus" if brain == "deep" else "sonnet"
 
     try:
@@ -886,3 +942,359 @@ def workspace_file(path: str = Query(...)):
         "mtime": _iso_mtime(abs_p),
         "size": size,
     }
+
+
+# ---------------------------------------------------------------------------
+# Integrations — Keychain-backed credential storage + test endpoints.
+# ---------------------------------------------------------------------------
+#
+# Storage model
+#   Service name: "mission-control-ai"
+#   Username:     "{tool_id}:{field_name}"  (e.g. "hubspot:token")
+#
+# The UI never gets credential values back — only the list of field names
+# that are present. OAuth access/refresh tokens for Google are stored under
+# the same service but with well-known field names (access_token / refresh_token).
+#
+# Security boundary:
+#   - Values NEVER hit SQLite, the workspace filesystem, or the subprocess env.
+#   - Values NEVER appear in /chat responses, /config responses, or logs.
+#   - All write paths go through _kc_set; all reads through _kc_get.
+
+KEYCHAIN_SERVICE = "mission-control-ai"
+
+_INTEGRATIONS: dict[str, dict] = {
+    "google-workspace": {
+        "label": "Google Workspace",
+        "required_fields": ["client_id", "client_secret"],
+        "all_fields": ["client_id", "client_secret", "access_token", "refresh_token", "token_expiry"],
+        "oauth": True,
+    },
+    "hubspot": {
+        "label": "HubSpot",
+        "required_fields": ["token"],
+        "all_fields": ["token"],
+        "oauth": False,
+    },
+    "ghl": {
+        "label": "GoHighLevel",
+        "required_fields": ["api_key"],
+        "all_fields": ["api_key", "sub_account_id"],
+        "oauth": False,
+    },
+}
+
+
+def _require_tool(tool_id: str) -> dict:
+    spec = _INTEGRATIONS.get(tool_id)
+    if not spec:
+        raise HTTPException(status_code=404, detail=f"Unknown integration '{tool_id}'.")
+    return spec
+
+
+def _kc_username(tool_id: str, field: str) -> str:
+    return f"{tool_id}:{field}"
+
+
+def _kc_set(tool_id: str, field: str, value: str) -> None:
+    keyring.set_password(KEYCHAIN_SERVICE, _kc_username(tool_id, field), value)
+
+
+def _kc_get(tool_id: str, field: str) -> Optional[str]:
+    try:
+        return keyring.get_password(KEYCHAIN_SERVICE, _kc_username(tool_id, field))
+    except keyring.errors.KeyringError:
+        return None
+
+
+def _kc_delete(tool_id: str, field: str) -> bool:
+    try:
+        keyring.delete_password(KEYCHAIN_SERVICE, _kc_username(tool_id, field))
+        return True
+    except keyring.errors.PasswordDeleteError:
+        return False  # already absent
+    except keyring.errors.KeyringError:
+        return False
+
+
+class CredentialsPayload(BaseModel):
+    credentials: dict
+
+
+@app.get("/integrations")
+def integrations_list():
+    """List integrations with public metadata (no values)."""
+    out = []
+    for tid, spec in _INTEGRATIONS.items():
+        stored = [f for f in spec["all_fields"] if _kc_get(tid, f)]
+        required_present = all(f in stored for f in spec["required_fields"])
+        out.append({
+            "id": tid,
+            "label": spec["label"],
+            "connected": required_present,
+            "fields_stored": stored,
+            "required_fields": spec["required_fields"],
+            "oauth": spec["oauth"],
+        })
+    return {"integrations": out}
+
+
+@app.get("/integrations/{tool_id}/status")
+def integration_status(tool_id: str):
+    spec = _require_tool(tool_id)
+    stored = [f for f in spec["all_fields"] if _kc_get(tool_id, f)]
+    return {
+        "id": tool_id,
+        "label": spec["label"],
+        "connected": all(f in stored for f in spec["required_fields"]),
+        "fields_stored": stored,
+        "required_fields": spec["required_fields"],
+        "oauth": spec["oauth"],
+    }
+
+
+@app.post("/integrations/{tool_id}/credentials")
+def integration_save(tool_id: str, payload: CredentialsPayload):
+    spec = _require_tool(tool_id)
+    allowed = set(spec["all_fields"])
+    saved_fields: list[str] = []
+    for field, value in (payload.credentials or {}).items():
+        if field not in allowed:
+            raise HTTPException(status_code=400, detail=f"Unknown field '{field}' for {tool_id}.")
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(status_code=400, detail=f"Field '{field}' must be a non-empty string.")
+        _kc_set(tool_id, field, value.strip())
+        saved_fields.append(field)
+    if not saved_fields:
+        raise HTTPException(status_code=400, detail="No credential fields supplied.")
+    # Never log values. Only field names.
+    return {"saved": True, "tool_id": tool_id, "fields_saved": saved_fields}
+
+
+@app.delete("/integrations/{tool_id}/credentials")
+def integration_delete(tool_id: str):
+    spec = _require_tool(tool_id)
+    for f in spec["all_fields"]:
+        _kc_delete(tool_id, f)
+    return {"deleted": True, "tool_id": tool_id}
+
+
+# -- Test endpoints ---------------------------------------------------------
+
+def _http_json(method: str, url: str, *, headers: dict, body: Optional[bytes] = None, timeout: float = 8.0) -> tuple[int, dict]:
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw) if raw else {"error": str(e)}
+        except ValueError:
+            return e.code, {"error": raw.decode("utf-8", errors="replace")[:300]}
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, {"error": str(e)}
+
+
+def _test_hubspot() -> dict:
+    token = _kc_get("hubspot", "token")
+    if not token:
+        return {"success": False, "error": "No HubSpot token stored."}
+    status, body = _http_json(
+        "GET",
+        "https://api.hubapi.com/crm/v3/objects/contacts?limit=1",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if status == 200:
+        return {"success": True}
+    if status == 401:
+        return {"success": False, "error": "Token rejected (401). Re-check the Private App token."}
+    if status == 403:
+        return {"success": False, "error": "Forbidden (403). Scopes missing on the Private App."}
+    return {"success": False, "error": body.get("message") or f"HTTP {status}"}
+
+
+def _test_ghl() -> dict:
+    api_key = _kc_get("ghl", "api_key")
+    if not api_key:
+        return {"success": False, "error": "No GHL API key stored."}
+    status, body = _http_json(
+        "GET",
+        "https://rest.gohighlevel.com/v1/locations/",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    if status == 200:
+        return {"success": True}
+    if status == 401:
+        return {"success": False, "error": "Key rejected (401). Re-check the generated API key."}
+    if status == 403:
+        return {"success": False, "error": "Forbidden (403). Key may not have access to this sub-account."}
+    return {"success": False, "error": body.get("msg") or body.get("error") or f"HTTP {status}"}
+
+
+def _google_refresh_access_token() -> Optional[str]:
+    """Return a fresh access_token if we have a stored refresh_token; else None.
+
+    Does not raise — callers translate None to a user-friendly error."""
+    client_id = _kc_get("google-workspace", "client_id")
+    client_secret = _kc_get("google-workspace", "client_secret")
+    refresh = _kc_get("google-workspace", "refresh_token")
+    if not (client_id and client_secret and refresh):
+        return None
+    form = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh,
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    status, body = _http_json(
+        "POST",
+        "https://oauth2.googleapis.com/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        body=form,
+    )
+    if status != 200:
+        return None
+    access = body.get("access_token")
+    if access:
+        _kc_set("google-workspace", "access_token", access)
+    return access
+
+
+def _test_google_workspace() -> dict:
+    client_id = _kc_get("google-workspace", "client_id")
+    client_secret = _kc_get("google-workspace", "client_secret")
+    if not (client_id and client_secret):
+        return {"success": False, "error": "Client ID / Secret not stored yet."}
+    access = _google_refresh_access_token() or _kc_get("google-workspace", "access_token")
+    if not access:
+        return {"success": False, "error": "Not authorized yet — run the Authorize step first."}
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    # freebusy needs a valid range; just ask for a 1-minute window.
+    body = json.dumps({
+        "timeMin": now_iso,
+        "timeMax": end_iso,
+        "items": [{"id": "primary"}],
+    }).encode("utf-8")
+    status, resp = _http_json(
+        "POST",
+        "https://www.googleapis.com/calendar/v3/freeBusy",
+        headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+        body=body,
+    )
+    if status == 200:
+        return {"success": True}
+    if status == 401:
+        return {"success": False, "error": "Access token rejected — re-authorize."}
+    if status == 403:
+        return {"success": False, "error": "Calendar API not enabled on the project, or scope missing."}
+    return {"success": False, "error": resp.get("error", {}).get("message") if isinstance(resp.get("error"), dict) else str(resp.get("error") or f"HTTP {status}")}
+
+
+_TESTERS = {
+    "hubspot": _test_hubspot,
+    "ghl": _test_ghl,
+    "google-workspace": _test_google_workspace,
+}
+
+
+@app.post("/integrations/{tool_id}/test")
+def integration_test(tool_id: str):
+    _require_tool(tool_id)
+    tester = _TESTERS.get(tool_id)
+    if not tester:
+        raise HTTPException(status_code=501, detail="No tester registered for this tool.")
+    return tester()
+
+
+# -- Google OAuth -----------------------------------------------------------
+#
+# Desktop-app OAuth: Google accepts `http://127.0.0.1:<port>/...` as the
+# redirect URI without registration. We use the backend itself
+# (http://127.0.0.1:8001/integrations/google-workspace/oauth-callback) which
+# must be added as an "Authorized redirect URI" on the OAuth client.
+#
+# Flow:
+#   1. POST /integrations/google-workspace/oauth-init
+#        Returns auth_url. Frontend opens it in a popup.
+#   2. User grants scopes → Google redirects to /oauth-callback?code=...
+#   3. Callback exchanges code → stores refresh_token + access_token.
+#      Returns a simple HTML "you can close this window" page.
+
+from fastapi.responses import HTMLResponse  # noqa: E402
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/contacts.readonly",
+]
+GOOGLE_REDIRECT_URI = "http://127.0.0.1:8001/integrations/google-workspace/oauth-callback"
+
+
+@app.post("/integrations/google-workspace/oauth-init")
+def google_oauth_init():
+    client_id = _kc_get("google-workspace", "client_id")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="Client ID not stored yet. Paste credentials first.")
+    params = urllib.parse.urlencode({
+        "client_id": client_id,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+    })
+    return {"auth_url": f"https://accounts.google.com/o/oauth2/v2/auth?{params}"}
+
+
+@app.get("/integrations/google-workspace/oauth-callback", response_class=HTMLResponse)
+def google_oauth_callback(code: Optional[str] = None, error: Optional[str] = None):
+    def _page(msg: str, ok: bool) -> str:
+        colour = "#16a34a" if ok else "#dc2626"
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Mission Control — Google OAuth</title>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:480px;margin:80px auto;padding:0 24px;color:#111}}h1{{font-size:18px;font-weight:500}}p{{font-size:14px;line-height:1.6;color:#555}}.badge{{display:inline-block;padding:2px 10px;border-radius:999px;background:{colour};color:#fff;font-size:12px}}</style>
+</head><body>
+<span class="badge">{'Connected' if ok else 'Error'}</span>
+<h1>{msg}</h1>
+<p>You can close this window and return to Mission Control.</p>
+</body></html>"""
+
+    if error:
+        return HTMLResponse(_page(f"Google returned: {error}", ok=False), status_code=400)
+    if not code:
+        return HTMLResponse(_page("Missing authorization code.", ok=False), status_code=400)
+
+    client_id = _kc_get("google-workspace", "client_id")
+    client_secret = _kc_get("google-workspace", "client_secret")
+    if not (client_id and client_secret):
+        return HTMLResponse(_page("Client ID / Secret not stored.", ok=False), status_code=400)
+
+    form = urllib.parse.urlencode({
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+    status, body = _http_json(
+        "POST",
+        "https://oauth2.googleapis.com/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        body=form,
+    )
+    if status != 200:
+        msg = (body.get("error_description") or body.get("error") or f"HTTP {status}")
+        return HTMLResponse(_page(f"Token exchange failed: {msg}", ok=False), status_code=400)
+
+    access = body.get("access_token")
+    refresh = body.get("refresh_token")
+    if not access:
+        return HTMLResponse(_page("No access_token in Google response.", ok=False), status_code=400)
+    _kc_set("google-workspace", "access_token", access)
+    if refresh:
+        _kc_set("google-workspace", "refresh_token", refresh)
+    return HTMLResponse(_page("Connected successfully.", ok=True))
