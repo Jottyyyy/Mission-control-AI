@@ -14,6 +14,44 @@ function friendlyTime(iso) {
   return d.toLocaleString(undefined, { hour: "numeric", minute: "2-digit" });
 }
 
+// Format a calendar event's start/end range for display. start and end are
+// ISO 8601 local datetimes (no tz offset); timezone is an optional IANA zone
+// used for rendering via Intl so the card matches what Google will save.
+// Same-day → "Thu, 24 Apr 2026 · 3:00 pm – 4:00 pm"
+// Multi-day → "Thu, 24 Apr 2026 3:00 pm – Fri, 25 Apr 2026 9:00 am"
+function formatEventRange(start, end, timezone) {
+  if (!start || !end) return "";
+  const s = new Date(start);
+  const e = new Date(end);
+  if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) {
+    return `${start} – ${end}`;
+  }
+  const opts = { timeZone: timezone || undefined };
+  const dateFmt = new Intl.DateTimeFormat(undefined, {
+    ...opts, weekday: "short", day: "numeric", month: "short", year: "numeric",
+  });
+  const timeFmt = new Intl.DateTimeFormat(undefined, {
+    ...opts, hour: "numeric", minute: "2-digit",
+  });
+  // Same calendar day in the target timezone? Compare formatted date string.
+  const sameDay = dateFmt.format(s) === dateFmt.format(e);
+  if (sameDay) {
+    return `${dateFmt.format(s)} · ${timeFmt.format(s)} – ${timeFmt.format(e)}`;
+  }
+  return `${dateFmt.format(s)} ${timeFmt.format(s)} – ${dateFmt.format(e)} ${timeFmt.format(e)}`;
+}
+
+function nameFromEmail(email) {
+  if (!email || typeof email !== "string") return "";
+  const local = email.split("@")[0] || "";
+  if (!local) return email;
+  return local
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
+}
+
 // --- Gmail card body ------------------------------------------------------
 function GmailBody({ data }) {
   return (
@@ -38,6 +76,91 @@ function GmailBody({ data }) {
           {data.body}
         </div>
       </div>
+    </div>
+  );
+}
+
+// --- Calendar event card body --------------------------------------------
+function CalendarBody({ data }) {
+  const [expanded, setExpanded] = useState(false);
+  const attendees = Array.isArray(data.attendees) ? data.attendees : [];
+  const shownAttendees = attendees.slice(0, 3);
+  const extraAttendees = Math.max(0, attendees.length - shownAttendees.length);
+  const desc = (data.description || "").trim();
+  const descIsLong = desc.split("\n").length > 3 || desc.length > 220;
+
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>
+        {data.summary || "Untitled event"}
+      </div>
+
+      <IconLine emoji="🕐" text={formatEventRange(data.start, data.end, data.timezone)} />
+
+      {data.location && <IconLine emoji="📍" text={data.location} />}
+
+      {attendees.length > 0 && (
+        <IconLine
+          emoji="👥"
+          text={
+            <span>
+              {shownAttendees.map((email, i) => (
+                <span key={email}>
+                  {i > 0 && ", "}
+                  {nameFromEmail(email)}{" "}
+                  <span style={{ color: "var(--fg-faint)" }}>({email})</span>
+                </span>
+              ))}
+              {extraAttendees > 0 && (
+                <span style={{ color: "var(--fg-muted)" }}> + {extraAttendees} more</span>
+              )}
+            </span>
+          }
+        />
+      )}
+
+      {desc && (
+        <div
+          style={{
+            fontStyle: "italic",
+            color: "var(--fg-muted)",
+            marginTop: 4,
+            lineHeight: 1.55,
+            whiteSpace: "pre-wrap",
+            display: "-webkit-box",
+            WebkitBoxOrient: "vertical",
+            WebkitLineClamp: expanded ? "unset" : 3,
+            overflow: expanded ? "visible" : "hidden",
+          }}
+        >
+          {desc}
+        </div>
+      )}
+      {desc && descIsLong && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="btn-ghost"
+          style={{ alignSelf: "flex-start", fontSize: 12, color: "var(--fg-muted)", padding: 0 }}
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+
+      {data.timezone && data.timezone !== "Europe/London" && (
+        <div style={{ fontSize: 11, color: "var(--fg-faint)", marginTop: 2 }}>
+          Timezone: {data.timezone}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function IconLine({ emoji, text }) {
+  return (
+    <div className="flex gap-2" style={{ alignItems: "baseline" }}>
+      <div style={{ width: 18, textAlign: "center", fontSize: 13, lineHeight: 1.4 }}>{emoji}</div>
+      <div style={{ flex: 1, lineHeight: 1.4 }}>{text}</div>
     </div>
   );
 }
@@ -67,9 +190,43 @@ const ACTION_META = {
     icon: Icon.Mail,
     label: "Email draft",
     confirmLabel: "Send it",
+    busyLabel: "Sending…",
+    editPlaceholder: "Tell Jackson what to change (tone, recipient, content)…",
     successPrefix: "Email sent to",
     successKey: (data) => data?.to,
     renderBody: (data) => <GmailBody data={data} />,
+  },
+  "calendar.create_event": {
+    icon: Icon.Calendar,
+    label: "Calendar event",
+    confirmLabel: "Create event",
+    busyLabel: "Creating…",
+    editPlaceholder: "Tell Jackson what to change (time, attendees, details)…",
+    renderBody: (data) => <CalendarBody data={data} />,
+    renderSuccess: (data, result) => {
+      const link = result && result.html_link;
+      return (
+        <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+          <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+          Event created
+          {link ? (
+            <>
+              {" — "}
+              <a
+                href={link}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--green)", textDecoration: "underline" }}
+              >
+                opens in Google Calendar
+              </a>
+            </>
+          ) : (
+            "."
+          )}
+        </div>
+      );
+    },
   },
 };
 
@@ -209,14 +366,18 @@ function ActionCard({ token, onEditRequest }) {
   if (terminal) {
     const { kind } = terminal;
     if (kind === "sent") {
-      const who = meta.successKey?.(data) || "";
       return (
         <div style={{ ...cardStyle, borderColor: "var(--border)" }}>
           <HeaderRow IconCmp={IconCmp} label={meta.label} muted />
-          <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
-            <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
-            {meta.successPrefix} {who}{terminal.at ? ` at ${friendlyTime(terminal.at)}` : ""}.
-          </div>
+          {meta.renderSuccess ? (
+            meta.renderSuccess(data, terminal.result)
+          ) : (
+            <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+              <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+              {meta.successPrefix} {meta.successKey?.(data) || ""}
+              {terminal.at ? ` at ${friendlyTime(terminal.at)}` : ""}.
+            </div>
+          )}
         </div>
       );
     }
@@ -283,7 +444,7 @@ function ActionCard({ token, onEditRequest }) {
             value={editText}
             onChange={(e) => setEditText(e.target.value)}
             rows={2}
-            placeholder={`Tell Jackson what to change (tone, recipient, content)…`}
+            placeholder={meta.editPlaceholder || "Tell Jackson what to change…"}
             style={{
               width: "100%",
               padding: "6px 8px",
@@ -325,7 +486,7 @@ function ActionCard({ token, onEditRequest }) {
           className="btn-primary px-3 py-1.5"
           style={{ fontSize: 13 }}
         >
-          {busy ? "Sending…" : meta.confirmLabel}
+          {busy ? (meta.busyLabel || "Working…") : meta.confirmLabel}
         </button>
         <button
           type="button"

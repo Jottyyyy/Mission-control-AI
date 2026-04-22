@@ -1489,8 +1489,60 @@ def _validate_gmail_send(data: dict) -> tuple[Optional[dict], Optional[str]]:
     return {"to": to, "subject": subject, "body": body}, None
 
 
+# Accept ISO 8601 local datetime (no offset): YYYY-MM-DDTHH:MM:SS with optional
+# fractional seconds. Explicitly reject trailing Z or ±HH:MM — Google Calendar
+# needs dateTime paired with a timeZone string, not an already-offset datetime.
+_ISO_LOCAL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$")
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _validate_calendar_create_event(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    summary = (data.get("summary") or "").strip()
+    start = (data.get("start") or "").strip()
+    end = (data.get("end") or "").strip()
+    if not summary:
+        return None, "Missing 'summary'."
+    if not start or not _ISO_LOCAL_RE.match(start):
+        return None, "Missing or malformed 'start' (expect YYYY-MM-DDTHH:MM:SS local time)."
+    if not end or not _ISO_LOCAL_RE.match(end):
+        return None, "Missing or malformed 'end' (expect YYYY-MM-DDTHH:MM:SS local time)."
+    # Parse to catch nonsense like end < start.
+    try:
+        start_dt = datetime.fromisoformat(start)
+        end_dt = datetime.fromisoformat(end)
+    except ValueError:
+        return None, "Unparseable datetime."
+    if end_dt <= start_dt:
+        return None, "'end' must be after 'start'."
+
+    normalised: dict = {"summary": summary, "start": start, "end": end}
+
+    tz = (data.get("timezone") or "").strip()
+    normalised["timezone"] = tz or "Europe/London"
+
+    description = data.get("description")
+    if isinstance(description, str) and description.strip():
+        normalised["description"] = description.strip()
+
+    location = data.get("location")
+    if isinstance(location, str) and location.strip():
+        normalised["location"] = location.strip()
+
+    attendees = data.get("attendees")
+    if isinstance(attendees, list):
+        cleaned: list[str] = []
+        for item in attendees:
+            if isinstance(item, str) and _EMAIL_RE.match(item.strip()):
+                cleaned.append(item.strip())
+        if cleaned:
+            normalised["attendees"] = cleaned
+
+    return normalised, None
+
+
 _ACTION_VALIDATORS = {
     "gmail.send": _validate_gmail_send,
+    "calendar.create_event": _validate_calendar_create_event,
 }
 
 
@@ -1595,8 +1647,69 @@ def _execute_gmail_send(action_data: dict) -> tuple[bool, dict]:
     return False, {"error": msg}
 
 
+def _execute_calendar_create_event(action_data: dict) -> tuple[bool, dict]:
+    """Create a single event on Adam's primary Google Calendar.
+
+    Event body mirrors Google Calendar API v3: `start.dateTime` + `start.timeZone`
+    (same for end). Optional description/location/attendees forwarded as-is.
+    Refresh-once on 401 to match the Gmail executor's shape."""
+    access = _kc_get("google-workspace", "access_token")
+    if not access:
+        access = _google_refresh_access_token()
+    if not access:
+        return False, {"error": "Google Workspace not connected — no access token."}
+
+    tz = action_data.get("timezone") or "Europe/London"
+    event: dict = {
+        "summary": action_data["summary"],
+        "start": {"dateTime": action_data["start"], "timeZone": tz},
+        "end": {"dateTime": action_data["end"], "timeZone": tz},
+    }
+    if action_data.get("description"):
+        event["description"] = action_data["description"]
+    if action_data.get("location"):
+        event["location"] = action_data["location"]
+    if action_data.get("attendees"):
+        event["attendees"] = [{"email": e} for e in action_data["attendees"]]
+
+    body = json.dumps(event).encode("utf-8")
+
+    def _post(tok: str) -> tuple[int, dict]:
+        return _http_json(
+            "POST",
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Content-Type": "application/json",
+            },
+            body=body,
+            timeout=15.0,
+        )
+
+    status, resp = _post(access)
+    if status == 401:
+        refreshed = _google_refresh_access_token()
+        if refreshed:
+            status, resp = _post(refreshed)
+
+    if status in (200, 201) and isinstance(resp, dict) and resp.get("id"):
+        return True, {
+            "event_id": resp["id"],
+            "html_link": resp.get("htmlLink"),
+            "summary": resp.get("summary") or action_data["summary"],
+        }
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if isinstance(err, dict):
+        msg = err.get("message") or f"HTTP {status}"
+    else:
+        msg = resp.get("error") if isinstance(resp, dict) else None
+        msg = msg or f"HTTP {status}"
+    return False, {"error": msg}
+
+
 _EXECUTORS = {
     "gmail.send": _execute_gmail_send,
+    "calendar.create_event": _execute_calendar_create_event,
 }
 
 
