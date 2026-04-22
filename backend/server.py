@@ -1540,9 +1540,66 @@ def _validate_calendar_create_event(data: dict) -> tuple[Optional[dict], Optiona
     return normalised, None
 
 
+# Allowed Drive MIME types — Phase 3 only supports two shapes: Google Doc
+# (rendered from plain/HTML content) and plain text. Anything else is
+# rejected so we don't silently upload binaries.
+_ALLOWED_DRIVE_MIME = {
+    "application/vnd.google-apps.document",
+    "text/plain",
+}
+
+
+def _validate_drive_create_doc(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None, "Missing 'name'."
+    content = data.get("content")
+    if not isinstance(content, str):
+        return None, "'content' must be a string."
+
+    normalised: dict = {"name": name.strip(), "content": content}
+
+    mime = data.get("mime_type")
+    if mime is None or mime == "":
+        normalised["mime_type"] = "application/vnd.google-apps.document"
+    elif isinstance(mime, str) and mime in _ALLOWED_DRIVE_MIME:
+        normalised["mime_type"] = mime
+    else:
+        return None, f"Unsupported 'mime_type' (allowed: {sorted(_ALLOWED_DRIVE_MIME)})."
+
+    folder = data.get("folder_id")
+    if isinstance(folder, str) and folder.strip():
+        normalised["folder_id"] = folder.strip()
+
+    return normalised, None
+
+
+def _validate_contacts_create(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None, "Missing 'name'."
+
+    normalised: dict = {"name": name.strip()}
+
+    email = data.get("email")
+    if email not in (None, ""):
+        if not isinstance(email, str) or not _EMAIL_RE.match(email.strip()):
+            return None, f"Invalid email: {email!r}."
+        normalised["email"] = email.strip()
+
+    for field in ("phone", "company", "notes"):
+        v = data.get(field)
+        if isinstance(v, str) and v.strip():
+            normalised[field] = v.strip()
+
+    return normalised, None
+
+
 _ACTION_VALIDATORS = {
     "gmail.send": _validate_gmail_send,
     "calendar.create_event": _validate_calendar_create_event,
+    "drive.create_doc": _validate_drive_create_doc,
+    "contacts.create": _validate_contacts_create,
 }
 
 
@@ -1707,9 +1764,152 @@ def _execute_calendar_create_event(action_data: dict) -> tuple[bool, dict]:
     return False, {"error": msg}
 
 
+def _execute_drive_create_doc(action_data: dict) -> tuple[bool, dict]:
+    """Create a Google Doc (or plain text file) on Adam's Drive.
+
+    Uses Drive v3 multipart upload — one request that carries both metadata
+    and content. For a Google Doc target, the content part is sent as HTML
+    so Drive's converter lays it out; for text/plain, the file stays raw.
+    Refresh-once on 401 to match Gmail/Calendar shape."""
+    access = _kc_get("google-workspace", "access_token")
+    if not access:
+        access = _google_refresh_access_token()
+    if not access:
+        return False, {"error": "Google Workspace not connected — no access token."}
+
+    name = action_data["name"]
+    content = action_data.get("content") or ""
+    mime = action_data.get("mime_type") or "application/vnd.google-apps.document"
+
+    metadata: dict = {"name": name, "mimeType": mime}
+    if action_data.get("folder_id"):
+        metadata["parents"] = [action_data["folder_id"]]
+
+    boundary = "mission_control_boundary_" + uuid.uuid4().hex
+    content_type = "text/plain; charset=UTF-8" if mime == "text/plain" else "text/html; charset=UTF-8"
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        f"{json.dumps(metadata)}\r\n"
+        f"--{boundary}\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
+        f"{content}\r\n"
+        f"--{boundary}--"
+    ).encode("utf-8")
+
+    def _post(tok: str) -> tuple[int, dict]:
+        return _http_json(
+            "POST",
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Content-Type": f"multipart/related; boundary={boundary}",
+            },
+            body=body,
+            timeout=20.0,
+        )
+
+    status, resp = _post(access)
+    if status == 401:
+        refreshed = _google_refresh_access_token()
+        if refreshed:
+            status, resp = _post(refreshed)
+
+    if status in (200, 201) and isinstance(resp, dict) and resp.get("id"):
+        file_id = resp["id"]
+        if mime == "application/vnd.google-apps.document":
+            web_link = f"https://docs.google.com/document/d/{file_id}/edit"
+        else:
+            web_link = f"https://drive.google.com/file/d/{file_id}/view"
+        return True, {
+            "file_id": file_id,
+            "web_link": web_link,
+            "name": resp.get("name") or name,
+            "mime_type": mime,
+        }
+
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if isinstance(err, dict):
+        msg = err.get("message") or f"HTTP {status}"
+    else:
+        msg = (resp.get("error") if isinstance(resp, dict) else None) or f"HTTP {status}"
+    return False, {"error": msg}
+
+
+def _execute_contacts_create(action_data: dict) -> tuple[bool, dict]:
+    """Create a Google Contact via People API v1.
+
+    Splits the display name on the first space into given/family. Any missing
+    optional field is simply not included in the payload."""
+    access = _kc_get("google-workspace", "access_token")
+    if not access:
+        access = _google_refresh_access_token()
+    if not access:
+        return False, {"error": "Google Workspace not connected — no access token."}
+
+    full_name = action_data["name"].strip()
+    parts = full_name.split(" ", 1)
+    given = parts[0]
+    family = parts[1] if len(parts) > 1 else ""
+
+    person: dict = {
+        "names": [{
+            "givenName": given,
+            "familyName": family,
+            "displayName": full_name,
+        }]
+    }
+    if action_data.get("email"):
+        person["emailAddresses"] = [{"value": action_data["email"]}]
+    if action_data.get("phone"):
+        person["phoneNumbers"] = [{"value": action_data["phone"]}]
+    if action_data.get("company"):
+        person["organizations"] = [{"name": action_data["company"]}]
+    if action_data.get("notes"):
+        person["biographies"] = [{
+            "value": action_data["notes"],
+            "contentType": "TEXT_PLAIN",
+        }]
+
+    body = json.dumps(person).encode("utf-8")
+
+    def _post(tok: str) -> tuple[int, dict]:
+        return _http_json(
+            "POST",
+            "https://people.googleapis.com/v1/people:createContact",
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Content-Type": "application/json",
+            },
+            body=body,
+            timeout=15.0,
+        )
+
+    status, resp = _post(access)
+    if status == 401:
+        refreshed = _google_refresh_access_token()
+        if refreshed:
+            status, resp = _post(refreshed)
+
+    if status in (200, 201) and isinstance(resp, dict) and resp.get("resourceName"):
+        return True, {
+            "resource_name": resp["resourceName"],
+            "name": full_name,
+        }
+
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if isinstance(err, dict):
+        msg = err.get("message") or f"HTTP {status}"
+    else:
+        msg = (resp.get("error") if isinstance(resp, dict) else None) or f"HTTP {status}"
+    return False, {"error": msg}
+
+
 _EXECUTORS = {
     "gmail.send": _execute_gmail_send,
     "calendar.create_event": _execute_calendar_create_event,
+    "drive.create_doc": _execute_drive_create_doc,
+    "contacts.create": _execute_contacts_create,
 }
 
 

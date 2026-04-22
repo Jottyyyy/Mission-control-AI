@@ -184,6 +184,109 @@ function Row({ label, value }) {
   );
 }
 
+// --- Drive doc card body -------------------------------------------------
+const DRIVE_PREVIEW_LINES = 6;
+
+function driveTypeLabel(mime) {
+  if (!mime || mime === "application/vnd.google-apps.document") return "Google Doc";
+  if (mime === "text/plain") return "Plain text file";
+  return mime;
+}
+
+function DriveBody({ data }) {
+  const [expanded, setExpanded] = useState(false);
+  const content = data.content || "";
+  const lines = content.split("\n");
+  const isLong = lines.length > DRIVE_PREVIEW_LINES;
+  const preview = expanded || !isLong
+    ? content
+    : lines.slice(0, DRIVE_PREVIEW_LINES).join("\n") + "\n…";
+
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>
+        {data.name || "Untitled document"}
+      </div>
+
+      <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+        Type: {driveTypeLabel(data.mime_type)}
+        {data.folder_id && <span> · in folder {data.folder_id}</span>}
+      </div>
+
+      <div>
+        <div style={{ fontSize: 11, color: "var(--fg-faint)", marginBottom: 4, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          Preview
+        </div>
+        {content.trim() ? (
+          <pre
+            style={{
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              background: "var(--bg)",
+              border: "1px solid var(--border)",
+              borderRadius: 6,
+              padding: "8px 10px",
+              lineHeight: 1.55,
+              margin: 0,
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              fontSize: 12,
+            }}
+          >
+            {preview}
+          </pre>
+        ) : (
+          <div style={{ fontSize: 12, color: "var(--fg-faint)", fontStyle: "italic" }}>
+            (empty document — Adam can fill it in after it's created)
+          </div>
+        )}
+        {isLong && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="btn-ghost"
+            style={{ marginTop: 6, fontSize: 12, color: "var(--fg-muted)", padding: 0 }}
+          >
+            {expanded ? "Show less" : `Show all ${lines.length} lines`}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// --- Contacts card body --------------------------------------------------
+function ContactsBody({ data }) {
+  const notes = (data.notes || "").trim();
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>
+        {data.name || "Unnamed contact"}
+      </div>
+      {data.email   && <IconLine emoji="📧" text={data.email} />}
+      {data.phone   && <IconLine emoji="📱" text={data.phone} />}
+      {data.company && <IconLine emoji="🏢" text={data.company} />}
+      {notes && (
+        <div
+          style={{
+            fontStyle: "italic",
+            color: "var(--fg-muted)",
+            marginTop: 4,
+            lineHeight: 1.55,
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {notes}
+        </div>
+      )}
+      {!data.email && !data.phone && !data.company && !notes && (
+        <div style={{ fontSize: 12, color: "var(--fg-faint)", fontStyle: "italic" }}>
+          Name only — Adam can add details after the contact is created.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // --- Action registry — small so adding new types later is a 1-line change --
 const ACTION_META = {
   "gmail.send": {
@@ -227,6 +330,55 @@ const ACTION_META = {
         </div>
       );
     },
+  },
+  "drive.create_doc": {
+    icon: Icon.FileText,
+    label: "Document draft",
+    confirmLabel: "Create document",
+    busyLabel: "Creating…",
+    editPlaceholder: "Tell Jackson what to change (title, content, structure)…",
+    renderBody: (data) => <DriveBody data={data} />,
+    renderSuccess: (data, result) => {
+      const link = result && result.web_link;
+      const isDoc = (result && result.mime_type) === "application/vnd.google-apps.document"
+        || (data && (data.mime_type || "application/vnd.google-apps.document") === "application/vnd.google-apps.document");
+      const label = isDoc ? "opens in Google Docs" : "opens in Google Drive";
+      return (
+        <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+          <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+          Document created
+          {link ? (
+            <>
+              {" — "}
+              <a
+                href={link}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--green)", textDecoration: "underline" }}
+              >
+                {label}
+              </a>
+            </>
+          ) : (
+            "."
+          )}
+        </div>
+      );
+    },
+  },
+  "contacts.create": {
+    icon: Icon.Users,
+    label: "New contact",
+    confirmLabel: "Add contact",
+    busyLabel: "Adding…",
+    editPlaceholder: "Tell Jackson what to change (name, email, phone, company)…",
+    renderBody: (data) => <ContactsBody data={data} />,
+    renderSuccess: (data) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        {data?.name ? `${data.name} added to your Google Contacts.` : "Contact added to your Google Contacts."}
+      </div>
+    ),
   },
 };
 
