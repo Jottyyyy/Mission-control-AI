@@ -1,0 +1,395 @@
+import React, { useState, useEffect, useRef } from 'react';
+import Icon from './icons.jsx';
+import { API_BASE } from './SettingsEditor.jsx';
+
+// Marker Jackson's reply carries after /chat post-processing.
+// Anchored so a stray `[[action-card:anything]]` deeper in prose still matches,
+// but the token shape is strict (uuid-like: hex + dashes).
+export const ACTION_CARD_MARKER_RE = /\[\[action-card:([0-9a-fA-F-]{10,})\]\]/g;
+
+function friendlyTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z");
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+// --- Gmail card body ------------------------------------------------------
+function GmailBody({ data }) {
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13 }}>
+      <Row label="To"      value={data.to} />
+      <Row label="Subject" value={data.subject} />
+      <div>
+        <div style={{ fontSize: 11, color: "var(--fg-faint)", marginBottom: 4, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          Body
+        </div>
+        <div
+          style={{
+            whiteSpace: "pre-wrap",
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "8px 10px",
+            lineHeight: 1.55,
+            color: "var(--fg)",
+          }}
+        >
+          {data.body}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Row({ label, value }) {
+  return (
+    <div className="flex gap-3" style={{ alignItems: "baseline" }}>
+      <div
+        style={{
+          width: 62,
+          fontSize: 11,
+          color: "var(--fg-faint)",
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </div>
+      <div style={{ flex: 1, color: "var(--fg)", wordBreak: "break-word" }}>{value}</div>
+    </div>
+  );
+}
+
+// --- Action registry — small so adding new types later is a 1-line change --
+const ACTION_META = {
+  "gmail.send": {
+    icon: Icon.Mail,
+    label: "Email draft",
+    confirmLabel: "Send it",
+    successPrefix: "Email sent to",
+    successKey: (data) => data?.to,
+    renderBody: (data) => <GmailBody data={data} />,
+  },
+};
+
+// --- Main card ------------------------------------------------------------
+function ActionCard({ token, onEditRequest }) {
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [pending, setPending] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [terminal, setTerminal] = useState(null); // { kind: 'sent' | 'cancelled' | 'error' | 'already', ...}
+  const [editOpen, setEditOpen] = useState(false);
+  const [editText, setEditText] = useState("");
+  const editRef = useRef(null);
+
+  // Load pending row once per token.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError("");
+    setPending(null);
+    setTerminal(null);
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/tools/pending/${encodeURIComponent(token)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        setPending(data);
+        // If the backend already marked this as executed/cancelled/expired,
+        // move straight into the terminal state so the card can't be re-fired.
+        if (data.status === "executed") {
+          setTerminal({ kind: "already", at: data.executed_at });
+        } else if (data.status === "cancelled") {
+          setTerminal({ kind: "cancelled" });
+        } else if (data.status === "expired") {
+          setTerminal({ kind: "expired" });
+        }
+      } catch (err) {
+        if (!cancelled) setLoadError(err?.message || "Could not load action.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [token]);
+
+  useEffect(() => {
+    if (editOpen && editRef.current) editRef.current.focus();
+  }, [editOpen]);
+
+  const confirm = async () => {
+    if (busy || terminal) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`${API_BASE}/tools/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmation_token: token }),
+      });
+      const data = await res.json().catch(() => ({ success: false, error: `HTTP ${res.status}` }));
+      if (!res.ok && res.status === 409) {
+        setTerminal({ kind: "already" });
+      } else if (data?.success) {
+        setTerminal({ kind: "sent", at: new Date().toISOString(), result: data.result });
+      } else {
+        setTerminal({ kind: "error", error: data?.error || `HTTP ${res.status}` });
+      }
+    } catch (err) {
+      setTerminal({ kind: "error", error: err?.message || "Network error." });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (busy || terminal) return;
+    setBusy(true);
+    try {
+      await fetch(`${API_BASE}/tools/cancel/${encodeURIComponent(token)}`, { method: "POST" });
+      setTerminal({ kind: "cancelled" });
+    } catch {
+      setTerminal({ kind: "error", error: "Could not cancel." });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retry = () => {
+    // Only valid on error — backend left the row as 'pending', so another
+    // /tools/execute hits the same token. Clear terminal to re-arm the card.
+    setTerminal(null);
+  };
+
+  const submitEdit = () => {
+    const v = editText.trim();
+    if (!v) return;
+    onEditRequest?.(`Revise that draft: ${v}`);
+    // Cancel this draft so Adam doesn't also have a stale card around.
+    cancel();
+    setEditText("");
+    setEditOpen(false);
+  };
+
+  // --- Render cases -------------------------------------------------------
+
+  if (loading) {
+    return (
+      <div style={cardStyle}>
+        <div style={{ fontSize: 13, color: "var(--fg-faint)" }}>Loading action…</div>
+      </div>
+    );
+  }
+  if (loadError || !pending) {
+    return (
+      <div style={{ ...cardStyle, borderColor: "var(--border-strong)" }}>
+        <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
+          {loadError || "Action not found. It may have expired."}
+        </div>
+      </div>
+    );
+  }
+
+  const meta = ACTION_META[pending.action_type];
+  if (!meta) {
+    return (
+      <div style={cardStyle}>
+        <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
+          Unknown action type: {pending.action_type}
+        </div>
+      </div>
+    );
+  }
+  const IconCmp = meta.icon;
+  const data = pending.action_data || {};
+
+  // --- Terminal states -------------------------------------------------
+  if (terminal) {
+    const { kind } = terminal;
+    if (kind === "sent") {
+      const who = meta.successKey?.(data) || "";
+      return (
+        <div style={{ ...cardStyle, borderColor: "var(--border)" }}>
+          <HeaderRow IconCmp={IconCmp} label={meta.label} muted />
+          <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+            <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+            {meta.successPrefix} {who}{terminal.at ? ` at ${friendlyTime(terminal.at)}` : ""}.
+          </div>
+        </div>
+      );
+    }
+    if (kind === "already") {
+      return (
+        <div style={{ ...cardStyle, opacity: 0.75 }}>
+          <HeaderRow IconCmp={IconCmp} label={meta.label} muted />
+          <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 8 }}>
+            Already executed.
+          </div>
+        </div>
+      );
+    }
+    if (kind === "cancelled") {
+      return (
+        <div style={{ ...cardStyle, opacity: 0.6 }}>
+          <HeaderRow IconCmp={IconCmp} label={meta.label} muted cancelled />
+          {meta.renderBody(data)}
+          <div style={{ fontSize: 12, color: "var(--fg-faint)", marginTop: 10 }}>Cancelled.</div>
+        </div>
+      );
+    }
+    if (kind === "expired") {
+      return (
+        <div style={{ ...cardStyle, opacity: 0.6 }}>
+          <HeaderRow IconCmp={IconCmp} label={meta.label} muted />
+          <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 8 }}>
+            This draft expired (over an hour old). Ask Jackson for a fresh one.
+          </div>
+        </div>
+      );
+    }
+    if (kind === "error") {
+      return (
+        <div style={cardStyle}>
+          <HeaderRow IconCmp={IconCmp} label={meta.label} />
+          {meta.renderBody(data)}
+          <div style={{ fontSize: 12, color: "var(--danger)", marginTop: 10 }}>
+            {terminal.error || "Something went wrong."}
+          </div>
+          <div className="flex gap-2 flex-wrap" style={{ marginTop: 10 }}>
+            <button onClick={retry} className="btn-primary px-3 py-1.5" style={{ fontSize: 13 }}>
+              Retry
+            </button>
+            <button onClick={cancel} className="btn-secondary px-3 py-1.5" style={{ fontSize: 13 }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      );
+    }
+  }
+
+  // --- Active (pre-confirmation) ---------------------------------------
+  return (
+    <div style={cardStyle}>
+      <HeaderRow IconCmp={IconCmp} label={meta.label} />
+      {meta.renderBody(data)}
+
+      {editOpen && (
+        <div style={{ marginTop: 10 }}>
+          <textarea
+            ref={editRef}
+            value={editText}
+            onChange={(e) => setEditText(e.target.value)}
+            rows={2}
+            placeholder={`Tell Jackson what to change (tone, recipient, content)…`}
+            style={{
+              width: "100%",
+              padding: "6px 8px",
+              fontSize: 13,
+              border: "1px solid var(--border-strong)",
+              borderRadius: 6,
+              background: "var(--bg)",
+              color: "var(--fg)",
+              resize: "vertical",
+            }}
+          />
+          <div className="flex gap-2" style={{ marginTop: 6 }}>
+            <button
+              type="button"
+              onClick={submitEdit}
+              className="btn-primary px-3 py-1"
+              disabled={!editText.trim()}
+              style={{ fontSize: 12 }}
+            >
+              Send revision request
+            </button>
+            <button
+              type="button"
+              onClick={() => { setEditOpen(false); setEditText(""); }}
+              className="btn-secondary px-3 py-1"
+              style={{ fontSize: 12 }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex gap-2 flex-wrap" style={{ marginTop: 12 }}>
+        <button
+          type="button"
+          onClick={confirm}
+          disabled={busy}
+          className="btn-primary px-3 py-1.5"
+          style={{ fontSize: 13 }}
+        >
+          {busy ? "Sending…" : meta.confirmLabel}
+        </button>
+        <button
+          type="button"
+          onClick={() => setEditOpen((o) => !o)}
+          disabled={busy}
+          className="btn-secondary px-3 py-1.5"
+          style={{ fontSize: 13 }}
+        >
+          Edit
+        </button>
+        <button
+          type="button"
+          onClick={cancel}
+          disabled={busy}
+          className="btn-ghost px-3 py-1.5"
+          style={{ fontSize: 13, color: "var(--fg-muted)" }}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function HeaderRow({ IconCmp, label, muted, cancelled }) {
+  return (
+    <div className="flex items-center gap-2" style={{ marginBottom: 10 }}>
+      {IconCmp && (
+        <IconCmp
+          className="lucide-sm"
+          style={{ color: cancelled ? "var(--fg-faint)" : muted ? "var(--fg-muted)" : "var(--accent)" }}
+        />
+      )}
+      <div style={{ fontSize: 13, fontWeight: 500, color: muted ? "var(--fg-muted)" : "var(--fg)" }}>
+        {label}
+      </div>
+    </div>
+  );
+}
+
+const cardStyle = {
+  border: "1px solid var(--border)",
+  borderRadius: 10,
+  padding: 14,
+  background: "var(--bg-elev)",
+  margin: "8px 0",
+};
+
+// --- Splitter used by Chat to interleave markdown and cards ---------------
+// Returns an array of { kind: 'text' | 'card', ... } pieces. Chat renders
+// text parts with renderMarkdown and card parts with <ActionCard />.
+export function splitByActionCards(text) {
+  if (!text) return [];
+  const re = new RegExp(ACTION_CARD_MARKER_RE.source, "g");
+  const pieces = [];
+  let last = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) pieces.push({ kind: "text", text: text.slice(last, m.index) });
+    pieces.push({ kind: "card", token: m[1] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) pieces.push({ kind: "text", text: text.slice(last) });
+  return pieces;
+}
+
+export default ActionCard;

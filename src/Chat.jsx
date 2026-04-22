@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import Data from './data.jsx';
 import Icon from './icons.jsx';
 import { renderMarkdown } from './markdown.jsx';
+import ActionCard, { splitByActionCards } from './ActionCard.jsx';
 
 const API_BASE = "http://127.0.0.1:8001";
 
@@ -109,11 +110,12 @@ function Chat({
     } catch (_) { /* ignore */ }
   };
 
-  const handleSend = async () => {
+  const handleSend = async (override) => {
     if (thinking) return;
-    const v = input.trim();
+    const raw = typeof override === "string" ? override : input;
+    const v = raw.trim();
     if (!v) return;
-    setInput("");
+    if (typeof override !== "string") setInput("");
 
     const lower = v.toLowerCase();
     const isPipeline =
@@ -377,7 +379,19 @@ function Chat({
                     ? m.text.split("\n").map((line, j) =>
                         line.trim() === "" ? <p key={j}>&nbsp;</p> : <p key={j}>{line}</p>
                       )
-                    : renderMarkdown(m.text, `m-${i}`)}
+                    : splitByActionCards(m.text).map((piece, j) =>
+                        piece.kind === "card" ? (
+                          <ActionCard
+                            key={`m-${i}-c-${j}-${piece.token}`}
+                            token={piece.token}
+                            onEditRequest={(text) => handleSend(text)}
+                          />
+                        ) : (
+                          <React.Fragment key={`m-${i}-t-${j}`}>
+                            {renderMarkdown(piece.text, `m-${i}-t-${j}`)}
+                          </React.Fragment>
+                        )
+                      )}
                 </div>
                 {!m.error && <BrainPill model={m.model_used} />}
               </div>

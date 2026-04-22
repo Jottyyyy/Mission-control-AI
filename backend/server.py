@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Literal
 import sqlite3
 import subprocess
@@ -10,9 +10,11 @@ import json
 import os
 import re
 import uuid
+import base64
 import urllib.request
 import urllib.parse
 import urllib.error
+from email.mime.text import MIMEText
 
 # Keychain. Hard-fail import — the task requires Keychain-only storage.
 import keyring  # noqa: E402
@@ -113,6 +115,39 @@ CREATE INDEX IF NOT EXISTS idx_conversations_mode_updated
   ON conversations(mode, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
   ON messages(conversation_id, created_at);
+
+-- Tool-calling infrastructure (Phase 1).
+-- pending_actions holds draft actions the agent has proposed. Rows are created
+-- when /chat detects an ```action:<type>``` marker; they transition to
+-- 'executed' | 'cancelled' | 'expired'. The `id` IS the confirmation token —
+-- the UI passes it back to POST /tools/execute.
+CREATE TABLE IF NOT EXISTS pending_actions (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT,
+  action_type TEXT NOT NULL,
+  action_data_json TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  executed_at TIMESTAMP,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+
+-- audit_log is immutable history of every action that actually fired (or
+-- failed to fire after confirmation). Single-user deploy, so `user` defaults
+-- to 'adam'.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id TEXT PRIMARY KEY,
+  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  action_type TEXT NOT NULL,
+  action_data_json TEXT NOT NULL,
+  result_json TEXT,
+  success INTEGER NOT NULL,
+  user TEXT NOT NULL DEFAULT 'adam'
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_actions_status
+  ON pending_actions(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
+  ON audit_log(timestamp DESC);
 """)
 _conn.close()
 
@@ -556,6 +591,11 @@ def chat(req: ChatRequest):
                 detail=f"OpenClaw error: {(result.stderr or 'unknown').strip()}",
             )
         reply = result.stdout.strip()
+
+        # Action-marker post-processing. Setup mode never emits actions —
+        # it's a credential walk-through, nothing to execute on Adam's behalf.
+        if effective_mode != "setup":
+            reply = _extract_and_register_actions(reply, conv_uuid, cur)
 
         cur.execute(
             "INSERT INTO messages (conversation_id, role, content, model_used) VALUES (?, ?, ?, ?)",
@@ -1319,11 +1359,19 @@ def integration_test(tool_id: str):
 
 from fastapi.responses import HTMLResponse  # noqa: E402
 
+# Read scopes + the write scopes Jackson needs for confirm-to-execute actions.
+# Every action still requires Adam's explicit click on a confirmation card —
+# see the action-marker parser in /chat and POST /tools/execute.
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/contacts",
 ]
 GOOGLE_REDIRECT_URI = "http://127.0.0.1:8001/integrations/google-workspace/oauth-callback"
 
@@ -1392,3 +1440,318 @@ def google_oauth_callback(code: Optional[str] = None, error: Optional[str] = Non
     if refresh:
         _kc_set("google-workspace", "refresh_token", refresh)
     return HTMLResponse(_page("Connected successfully.", ok=True))
+
+
+# ---------------------------------------------------------------------------
+# Tool-calling — Phase 1: confirmation-first actions.
+# ---------------------------------------------------------------------------
+#
+# The golden rule, encoded in the code path:
+#   Jackson never executes. He PROPOSES.
+#
+# Flow:
+#   1. Jackson's reply contains ```action:<type>\n{json}\n```
+#   2. /chat parses the marker, creates a pending_actions row, replaces
+#      the marker with [[action-card:<token>]] in the persisted/returned text.
+#   3. The frontend renders an action card with a Confirm button.
+#   4. Only when Adam clicks Confirm does POST /tools/execute fire.
+#   5. Execution result is written to audit_log regardless of outcome.
+#
+# A hallucinated marker with invalid JSON is left as-is in the text — no row
+# gets created, so no confirmation is possible.
+#
+# Action types allowlist — only these can become pending rows. Adding a new
+# type later means registering it here + adding an executor below.
+
+PENDING_ACTION_TTL_SECONDS = 3600  # 1 hour; mirrors the UI's expectation.
+
+_ACTION_MARKER_RE = re.compile(
+    r"```action:([a-z][a-z0-9_.]{1,40})\s*\n(.*?)\n```",
+    re.DOTALL,
+)
+
+# Per-type validation rules. Each validator returns (normalised_data, None)
+# on success or (None, error_message) — the error is discarded at parse time
+# (we don't want to surface raw parse errors to Adam) and the marker is left
+# in the text so Jackson can be corrected in the next turn if needed.
+def _validate_gmail_send(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    to = (data.get("to") or "").strip()
+    subject = (data.get("subject") or "").strip()
+    body = (data.get("body") or "").strip()
+    if not to:
+        return None, "Missing 'to'."
+    if "@" not in to or " " in to:
+        return None, "Invalid recipient address."
+    if not subject:
+        return None, "Missing 'subject'."
+    if not body:
+        return None, "Missing 'body'."
+    return {"to": to, "subject": subject, "body": body}, None
+
+
+_ACTION_VALIDATORS = {
+    "gmail.send": _validate_gmail_send,
+}
+
+
+def _expire_old_pending_actions(cur: sqlite3.Cursor) -> None:
+    """Flip any pending rows older than the TTL to 'expired'. Cheap — runs
+    once per /chat call, indexed on (status, created_at)."""
+    cutoff = (datetime.utcnow() - timedelta(seconds=PENDING_ACTION_TTL_SECONDS)).isoformat(sep=" ", timespec="seconds")
+    cur.execute(
+        "UPDATE pending_actions SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
+        (cutoff,),
+    )
+
+
+def _extract_and_register_actions(reply: str, conv_uuid: Optional[str], cur: sqlite3.Cursor) -> str:
+    """Walk Jackson's reply, turn each valid ```action:<type>``` block into
+    a pending_actions row, and replace it with [[action-card:<token>]].
+
+    Invalid JSON or unknown type → marker stays in place (no row created).
+    This keeps hallucinations harmless: without a row, the UI can't render
+    a card and Adam can't confirm a ghost action."""
+    if not reply or "```action:" not in reply:
+        return reply
+
+    _expire_old_pending_actions(cur)
+
+    def replace(match: re.Match) -> str:
+        action_type = match.group(1).strip()
+        raw_json = match.group(2).strip()
+        validator = _ACTION_VALIDATORS.get(action_type)
+        if not validator:
+            return match.group(0)  # leave untouched — unknown action type
+        try:
+            data = json.loads(raw_json)
+        except (ValueError, TypeError):
+            return match.group(0)
+        if not isinstance(data, dict):
+            return match.group(0)
+        normalised, err = validator(data)
+        if err or normalised is None:
+            return match.group(0)
+        token = str(uuid.uuid4())
+        cur.execute(
+            """
+            INSERT INTO pending_actions
+              (id, conversation_id, action_type, action_data_json, status)
+            VALUES (?, ?, ?, ?, 'pending')
+            """,
+            (token, conv_uuid, action_type, json.dumps(normalised)),
+        )
+        return f"[[action-card:{token}]]"
+
+    return _ACTION_MARKER_RE.sub(replace, reply)
+
+
+# -- Executors --------------------------------------------------------------
+#
+# Each executor returns (success: bool, result_or_error: dict). Executors
+# never touch the pending_actions table — that's orchestrated by the endpoint.
+# They also never touch Keychain writes except when refreshing an access token
+# via the existing _google_refresh_access_token helper.
+
+def _execute_gmail_send(action_data: dict) -> tuple[bool, dict]:
+    access = _kc_get("google-workspace", "access_token")
+    if not access:
+        access = _google_refresh_access_token()
+    if not access:
+        return False, {"error": "Google Workspace not connected — no access token."}
+
+    def _send(tok: str) -> tuple[int, dict]:
+        msg = MIMEText(action_data["body"], _charset="utf-8")
+        msg["to"] = action_data["to"]
+        msg["subject"] = action_data["subject"]
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+        body = json.dumps({"raw": raw}).encode("utf-8")
+        return _http_json(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Content-Type": "application/json",
+            },
+            body=body,
+            timeout=15.0,
+        )
+
+    status, resp = _send(access)
+    # Refresh-once on 401 (stale access token).
+    if status == 401:
+        refreshed = _google_refresh_access_token()
+        if refreshed:
+            status, resp = _send(refreshed)
+
+    if status == 200 and isinstance(resp, dict) and resp.get("id"):
+        return True, {"message_id": resp["id"], "thread_id": resp.get("threadId")}
+    # Normalise Google's error shape to something UI-friendly.
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if isinstance(err, dict):
+        msg = err.get("message") or f"HTTP {status}"
+    else:
+        msg = resp.get("error") if isinstance(resp, dict) else None
+        msg = msg or f"HTTP {status}"
+    return False, {"error": msg}
+
+
+_EXECUTORS = {
+    "gmail.send": _execute_gmail_send,
+}
+
+
+# -- Models -----------------------------------------------------------------
+
+class ExecutePayload(BaseModel):
+    confirmation_token: str
+
+
+# -- Endpoints --------------------------------------------------------------
+
+def _row_to_pending(row: sqlite3.Row) -> dict:
+    try:
+        data = json.loads(row["action_data_json"])
+    except (ValueError, TypeError):
+        data = {}
+    created = row["created_at"]
+    # created_at is stored as naive UTC ISO ("YYYY-MM-DD HH:MM:SS").
+    try:
+        created_dt = datetime.fromisoformat(created.replace(" ", "T"))
+        expires_dt = created_dt + timedelta(seconds=PENDING_ACTION_TTL_SECONDS)
+        expires_at = expires_dt.isoformat(sep=" ", timespec="seconds")
+    except (ValueError, AttributeError):
+        expires_at = None
+    return {
+        "confirmation_token": row["id"],
+        "conversation_id": row["conversation_id"],
+        "action_type": row["action_type"],
+        "action_data": data,
+        "status": row["status"],
+        "created_at": created,
+        "executed_at": row["executed_at"],
+        "expires_at": expires_at,
+    }
+
+
+@app.get("/tools/pending/{token}")
+def tools_pending_get(token: str):
+    conn = _db()
+    row = conn.execute(
+        "SELECT id, conversation_id, action_type, action_data_json, status, created_at, executed_at FROM pending_actions WHERE id = ?",
+        (token,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="No pending action with that token.")
+    return _row_to_pending(row)
+
+
+@app.post("/tools/execute")
+def tools_execute(payload: ExecutePayload):
+    token = (payload.confirmation_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="confirmation_token is required.")
+    conn = _db()
+    cur = conn.cursor()
+    _expire_old_pending_actions(cur)
+    row = cur.execute(
+        "SELECT id, conversation_id, action_type, action_data_json, status FROM pending_actions WHERE id = ?",
+        (token,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No pending action with that token.")
+    if row["status"] != "pending":
+        conn.close()
+        raise HTTPException(status_code=409, detail=f"Action is {row['status']}, not pending.")
+
+    executor = _EXECUTORS.get(row["action_type"])
+    if not executor:
+        conn.close()
+        raise HTTPException(status_code=501, detail=f"No executor for '{row['action_type']}'.")
+
+    try:
+        data = json.loads(row["action_data_json"])
+    except (ValueError, TypeError):
+        data = {}
+
+    success, result = executor(data)
+
+    # Record to audit_log regardless of outcome.
+    audit_id = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO audit_log (id, action_type, action_data_json, result_json, success, user)
+        VALUES (?, ?, ?, ?, ?, 'adam')
+        """,
+        (audit_id, row["action_type"], row["action_data_json"], json.dumps(result), 1 if success else 0),
+    )
+
+    if success:
+        cur.execute(
+            "UPDATE pending_actions SET status = 'executed', executed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (token,),
+        )
+    # On failure we leave the row as 'pending' so Adam can retry from the same
+    # card — audit_log captures the failed attempt.
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": success,
+        "result": result if success else None,
+        "error": result.get("error") if not success else None,
+        "audit_id": audit_id,
+    }
+
+
+@app.post("/tools/cancel/{token}")
+def tools_cancel(token: str):
+    conn = _db()
+    cur = conn.cursor()
+    row = cur.execute("SELECT status FROM pending_actions WHERE id = ?", (token,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No pending action with that token.")
+    if row["status"] != "pending":
+        conn.close()
+        return {"cancelled": False, "status": row["status"]}
+    cur.execute("UPDATE pending_actions SET status = 'cancelled' WHERE id = ?", (token,))
+    conn.commit()
+    conn.close()
+    return {"cancelled": True}
+
+
+@app.get("/tools/audit")
+def tools_audit(limit: int = Query(50, ge=1, le=500)):
+    conn = _db()
+    rows = conn.execute(
+        """
+        SELECT id, timestamp, action_type, action_data_json, result_json, success, user
+        FROM audit_log
+        ORDER BY timestamp DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            data = json.loads(r["action_data_json"])
+        except (ValueError, TypeError):
+            data = {}
+        try:
+            result = json.loads(r["result_json"]) if r["result_json"] else None
+        except (ValueError, TypeError):
+            result = None
+        out.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "action_type": r["action_type"],
+            "action_data": data,
+            "result": result,
+            "success": bool(r["success"]),
+            "user": r["user"],
+        })
+    return {"audit": out}
