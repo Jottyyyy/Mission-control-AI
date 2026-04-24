@@ -10,9 +10,10 @@ import {
   NewSkillModal,
 } from './SettingsEditor.jsx';
 import Connections from './Connections.jsx';
+import Workflows from './Workflows.jsx';
 
 function MissionControl({ onBack, onOpenChatPrefilled }) {
-  const [tab, setTab] = useState("connections"); // connections | skills | soul | rules | aboutyou | memory | workspace | activity
+  const [tab, setTab] = useState("connections"); // connections | workflows | skills | soul | rules | aboutyou | memory | workspace | activity
 
   const Header = () => (
     <div
@@ -35,6 +36,7 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
   const TabRail = () => {
     const tabs = [
       { id: "connections", label: "Connections",  icon: "Plug" },
+      { id: "workflows",   label: "Workflows",    icon: "Layers" },
       { id: "skills",      label: "Skills",       icon: "Sparkles" },
       { id: "soul",        label: "Soul",         icon: "Brain" },
       { id: "rules",       label: "Rules",        icon: "FileText" },
@@ -538,6 +540,7 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
         <TabRail />
         <div className="flex-1 flex min-w-0">
           {tab === "connections" && <Connections />}
+          {tab === "workflows" && <Workflows />}
           {tab === "skills" && <Skills />}
           {tab === "soul" && <SoulSection />}
           {tab === "rules" && <RulesSection />}

@@ -43,6 +43,9 @@ import {
   Loader,
   ExternalLink,
   Plug,
+  Upload,
+  AlertTriangle,
+  CheckCircle2,
 } from 'lucide-react';
 
 const Icon = {
@@ -90,6 +93,9 @@ const Icon = {
   Loader,
   ExternalLink,
   Plug,
+  Upload,
+  AlertTriangle,
+  CheckCircle2,
 };
 
 export default Icon;

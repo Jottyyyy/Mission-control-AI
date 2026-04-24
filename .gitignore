@@ -16,3 +16,7 @@ workspace-template/.openclaw/
 # in MissionControl-AdamBuild/ which is already ignored above, but list it
 # explicitly so it can't sneak into the repo from a different path.
 workspace-template.tgz
+
+# Local test fixtures — lead data is never committed (contains PII).
+test-leads.csv
+test-leads*.csv

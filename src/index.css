@@ -93,6 +93,12 @@ body {
 }
 .flash-green { animation: flashGreen 900ms ease-out; }
 
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.spin { animation: spin 1s linear infinite; }
+
 .chip {
   border: 1px solid var(--border);
   background: var(--bg-elev);
