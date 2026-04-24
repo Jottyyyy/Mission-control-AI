@@ -46,6 +46,7 @@ import {
   Upload,
   AlertTriangle,
   CheckCircle2,
+  Paperclip,
 } from 'lucide-react';
 
 const Icon = {
@@ -96,6 +97,7 @@ const Icon = {
   Upload,
   AlertTriangle,
   CheckCircle2,
+  Paperclip,
 };
 
 export default Icon;

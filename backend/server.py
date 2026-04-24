@@ -407,9 +407,33 @@ class CustomSkillPayload(BaseModel):
 
 
 class ManLeadPayload(BaseModel):
+    # Core identifier (required).
     name: str
+    # Companies House number (preferred for Pomanda lookup).
     number: Optional[str] = None
+    # Web / identifier fields (Zint provides domain, older callers used "website").
     website: Optional[str] = None
+    domain: Optional[str] = None
+    # Zint-provided candidate MAN + contact. When present we verify rather than
+    # identify from scratch.
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    job_title: Optional[str] = None
+    linkedin: Optional[str] = None
+    email: Optional[str] = None
+    mobile: Optional[str] = None
+    # Contextual fields preserved for output, not used in enrichment logic.
+    revenue: Optional[str] = None
+    industry: Optional[str] = None
+    hubspot_crm: Optional[str] = None
+    pipeline_priority: Optional[str] = None
+    headcount: Optional[str] = None
+    ubo: Optional[str] = None
+    # Full original row so the frontend can round-trip every Zint column on export.
+    original_row: Optional[dict] = None
+
+    class Config:
+        extra = "allow"
 
 
 class ManBatchPayload(BaseModel):
@@ -2476,11 +2500,40 @@ def _first_present(keys: list[str], candidates: list[str]) -> Optional[str]:
     for c in candidates:
         if c in direct:
             return direct[c]
-    lower = {k.lower(): k for k in keys}
+    lower = {k.strip().lower(): k for k in keys}
     for c in candidates:
-        if c.lower() in lower:
-            return lower[c.lower()]
+        if c.strip().lower() in lower:
+            return lower[c.strip().lower()]
     return None
+
+
+# Zint's export and older 3-column formats both parse through this synonyms table.
+# Adding a synonym here automatically wires it into _detect_zint_columns below.
+_ZINT_COLUMN_SYNONYMS = {
+    "name":              ["company name", "company_name", "company", "name"],
+    "number":            ["company number", "company_number", "crn", "companies house number"],
+    "domain":            ["domain", "website", "url"],
+    "first_name":        ["first name", "first_name", "firstname"],
+    "last_name":         ["last name", "last_name", "lastname", "surname"],
+    "job_title":         ["job title", "job_title", "title", "role"],
+    "linkedin":          ["linkedin", "linkedin url", "linkedin_url"],
+    "email":             ["email", "email address", "e-mail"],
+    "mobile":            ["whatsapp mobile number", "mobile", "phone", "phone number", "mobile number"],
+    "revenue":           ["revenue", "annual revenue"],
+    "industry":          ["primary industry", "industry"],
+    "hubspot_crm":       ["hubspot crm", "hubspot_crm", "crm"],
+    "pipeline_priority": ["pipeline priority", "pipeline_priority", "priority"],
+    "headcount":         ["headcount", "employees"],
+    "ubo":               ["ultimate beneficial owners", "ubo", "beneficial owners"],
+}
+
+
+def _detect_zint_columns(header: list[str]) -> dict:
+    """Map schema keys -> the actual header string from the CSV (or None)."""
+    mapping: dict[str, Optional[str]] = {}
+    for schema_key, candidates in _ZINT_COLUMN_SYNONYMS.items():
+        mapping[schema_key] = _first_present(header, candidates)
+    return mapping
 
 
 @app.get("/workflow/man/status")
@@ -2554,29 +2607,66 @@ def man_upload_spreadsheet(payload: ManSpreadsheetPayload):
         raise HTTPException(status_code=400, detail="CSV content is empty.")
 
     reader = csv.DictReader(io.StringIO(text))
-    detected = list(reader.fieldnames or [])
-    name_key = _first_present(detected, ["name", "company", "company_name", "Company Name"])
-    num_key = _first_present(detected, ["number", "company_number", "crn", "Company Number"])
-    web_key = _first_present(detected, ["website", "url", "domain", "Website"])
+    header = list(reader.fieldnames or [])
+    col_map = _detect_zint_columns(header)
+    mapped_headers = {v for v in col_map.values() if v}
+    extra_columns = [h for h in header if h not in mapped_headers]
 
-    if not name_key:
+    if not col_map.get("name"):
         raise HTTPException(
             status_code=400,
-            detail="CSV must contain a column named 'name', 'company', or 'company_name'.",
+            detail=(
+                "CSV must contain a 'Company Name' column (or 'company', 'company_name', 'name'). "
+                f"Columns found: {', '.join(header) or '(none)'}"
+            ),
         )
+
+    # Warn (not block) when there's no candidate MAN info in the file — the
+    # workflow will fall through to Pomanda-based identification, which is fine
+    # for older 3-column batches (name, number, website) as long as Pomanda is
+    # configured. Surfaced as a warning in the response for the UI.
+    has_candidate = bool(col_map.get("email") or (col_map.get("first_name") and col_map.get("last_name")))
 
     leads: list[dict] = []
     for row in reader:
-        n = (row.get(name_key) or "").strip()
-        if not n:
+        # Normalise: strip every value, collapse empty→None, preserve the full original row.
+        clean_row = {(k or "").strip(): (v or "").strip() for k, v in row.items() if k is not None}
+        name = clean_row.get(col_map["name"], "") if col_map.get("name") else ""
+        if not name:
             continue
+
+        def pick(key: str) -> Optional[str]:
+            h = col_map.get(key)
+            if not h:
+                return None
+            v = clean_row.get(h, "")
+            return v or None
+
         leads.append({
-            "name": n,
-            "number": (row.get(num_key) or "").strip() or None if num_key else None,
-            "website": (row.get(web_key) or "").strip() or None if web_key else None,
+            "name": name,
+            "number": pick("number"),
+            "domain": pick("domain"),
+            "website": pick("domain"),  # back-compat alias
+            "first_name": pick("first_name"),
+            "last_name": pick("last_name"),
+            "job_title": pick("job_title"),
+            "linkedin": pick("linkedin"),
+            "email": pick("email"),
+            "mobile": pick("mobile"),
+            "revenue": pick("revenue"),
+            "industry": pick("industry"),
+            "hubspot_crm": pick("hubspot_crm"),
+            "pipeline_priority": pick("pipeline_priority"),
+            "headcount": pick("headcount"),
+            "ubo": pick("ubo"),
+            "original_row": clean_row,
         })
+
     return {
         "leads": leads,
-        "detected_columns": detected,
+        "detected_columns": header,
+        "column_mapping": {k: v for k, v in col_map.items() if v},
+        "extra_columns": extra_columns,
         "count": len(leads),
+        "has_zint_candidate": has_candidate,
     }

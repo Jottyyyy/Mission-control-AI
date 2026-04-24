@@ -20,3 +20,5 @@ workspace-template.tgz
 # Local test fixtures — lead data is never committed (contains PII).
 test-leads.csv
 test-leads*.csv
+test-zint-sample.csv
+test-zint*.csv

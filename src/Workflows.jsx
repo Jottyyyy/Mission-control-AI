@@ -5,55 +5,51 @@ import { API_BASE } from './SettingsEditor.jsx';
 // ---------------------------------------------------------------------------
 // MAN workflow UI — Sir Adam's primary daily flow.
 //
-// Contract with the backend (built in v1.12):
+// v1.14 — Zint-aware. A Zint row carries a *candidate* MAN + contact, so the
+// UI emphasises verification status (verified / upgraded / as-is) and shows
+// per-field source attribution (zint / pomanda / cognism / lusha) rather than
+// presenting enrichment as the sole work product.
+//
+// Contract with the backend:
 //   GET  /workflow/man/status                    → readiness check
 //   POST /workflow/man/upload-spreadsheet        → parse CSV preview
-//   POST /workflow/man/process-batch             → run identification + enrich
-//
-// Design decisions:
-//   • Single component. Sections are render-in-order; the state machine is
-//     implicit in the presence of {leads, results}.
-//   • No streaming in v1 — we POST the batch and show a rotating "what I'm
-//     doing now" message while the backend works. 5-minute AbortController.
-//   • Spreadsheet upload is JSON-wrapped (FileReader.readAsText then POST
-//     {filename, csv_content}) to avoid pulling python-multipart server-side.
+//   POST /workflow/man/process-batch             → run verify + enrich
 // ---------------------------------------------------------------------------
 
 const MAX_LEADS = 200;
 const PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
 
 const PROGRESS_MESSAGES = [
-  "Looking up shareholders on Pomanda…",
+  "Verifying MANs against Pomanda…",
   "Applying JSP priority rules…",
-  "Enriching contacts with Cognism…",
-  "Checking Lusha for missing mobiles…",
+  "Enriching missing contacts via Cognism…",
+  "Falling back to Lusha where needed…",
   "Reconciling results…",
 ];
 
-// ---------------------------------------------------------------------------
-// Top-level component
-// ---------------------------------------------------------------------------
-
-export default function Workflows() {
-  const [status, setStatus] = useState(null);  // { ready, pomanda_configured, ... } or null
+export default function Workflows({ initialLeads, initialUploadMeta }) {
+  const [status, setStatus] = useState(null);
   const [statusError, setStatusError] = useState("");
 
-  const [leads, setLeads] = useState([]);           // [{name, number, website}]
-  const [detectedColumns, setDetectedColumns] = useState([]);
-  const [selectedIdx, setSelectedIdx] = useState(new Set());
+  const [leads, setLeads] = useState(initialLeads || []);
+  const [detectedColumns, setDetectedColumns] = useState(initialUploadMeta?.detected_columns || []);
+  const [columnMapping, setColumnMapping] = useState(initialUploadMeta?.column_mapping || {});
+  const [extraColumns, setExtraColumns] = useState(initialUploadMeta?.extra_columns || []);
+  const [selectedIdx, setSelectedIdx] = useState(
+    new Set((initialLeads || []).map((_, i) => i))
+  );
   const [uploadError, setUploadError] = useState("");
   const [uploading, setUploading] = useState(false);
-  const [uploadedFilename, setUploadedFilename] = useState("");
+  const [uploadedFilename, setUploadedFilename] = useState(initialUploadMeta?.filename || "");
   const [uploadWarning, setUploadWarning] = useState("");
 
   const [processing, setProcessing] = useState(false);
   const [processError, setProcessError] = useState("");
-  const [results, setResults] = useState(null);     // full batch response
+  const [results, setResults] = useState(null);
   const [progressIdx, setProgressIdx] = useState(0);
 
   const processAbort = useRef(null);
 
-  // Load credential readiness on mount.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -73,7 +69,6 @@ export default function Workflows() {
     return () => { cancelled = true; };
   }, []);
 
-  // Rotate progress messages while processing.
   useEffect(() => {
     if (!processing) return;
     const id = setInterval(() => {
@@ -82,7 +77,7 @@ export default function Workflows() {
     return () => clearInterval(id);
   }, [processing]);
 
-  // ---------- Upload handlers ----------
+  // ---------- Upload ----------
 
   const handleFile = async (file) => {
     setUploadError("");
@@ -113,6 +108,8 @@ export default function Workflows() {
       if (!res.ok) {
         setLeads([]);
         setDetectedColumns([]);
+        setColumnMapping({});
+        setExtraColumns([]);
         setSelectedIdx(new Set());
         setUploadError(data?.detail || `Upload failed (HTTP ${res.status}).`);
         return;
@@ -124,6 +121,8 @@ export default function Workflows() {
       }
       setLeads(parsed);
       setDetectedColumns(data.detected_columns || []);
+      setColumnMapping(data.column_mapping || {});
+      setExtraColumns(data.extra_columns || []);
       setSelectedIdx(new Set(parsed.map((_, i) => i)));
     } catch (err) {
       setUploadError(
@@ -139,6 +138,8 @@ export default function Workflows() {
   const resetBatch = () => {
     setLeads([]);
     setDetectedColumns([]);
+    setColumnMapping({});
+    setExtraColumns([]);
     setSelectedIdx(new Set());
     setResults(null);
     setUploadError("");
@@ -147,7 +148,7 @@ export default function Workflows() {
     setProcessError("");
   };
 
-  // ---------- Process handlers ----------
+  // ---------- Process ----------
 
   const selectedLeads = useMemo(
     () => leads.filter((_, i) => selectedIdx.has(i)),
@@ -207,11 +208,12 @@ export default function Workflows() {
           uploadedFilename={uploadedFilename}
           hasLeads={leads.length > 0}
           onReset={resetBatch}
+          columnMapping={columnMapping}
+          extraColumns={extraColumns}
         />
         {leads.length > 0 && (
           <LeadsTable
             leads={leads}
-            detectedColumns={detectedColumns}
             selectedIdx={selectedIdx}
             setSelectedIdx={setSelectedIdx}
             results={results}
@@ -231,6 +233,7 @@ export default function Workflows() {
           <SummaryBar
             results={results}
             leads={leads}
+            detectedColumns={detectedColumns}
             onReset={resetBatch}
           />
         )}
@@ -251,8 +254,8 @@ function PageHeader() {
         <h2 style={{ fontSize: 20, fontWeight: 500, margin: 0 }}>MAN identification</h2>
       </div>
       <p style={{ color: "var(--fg-muted)", fontSize: 14, margin: 0 }}>
-        Upload a Zint lead batch. For each company we find the Money / Authority / Need
-        person and enrich them with a direct email + mobile.
+        Upload a Zint batch. We verify each candidate MAN against Pomanda's shareholders,
+        then fill in any missing email or mobile via Cognism (then Lusha).
       </p>
     </div>
   );
@@ -263,41 +266,29 @@ function PageHeader() {
 // ---------------------------------------------------------------------------
 
 function StatusBanner({ status, error }) {
-  if (error) {
-    return (
-      <Banner tone="danger" icon={Icon.AlertTriangle}>
-        {error}
-      </Banner>
-    );
-  }
-  if (!status) {
-    return (
-      <Banner tone="muted" icon={Icon.Loader}>
-        Checking integrations…
-      </Banner>
-    );
-  }
+  if (error) return <Banner tone="danger" icon={Icon.AlertTriangle}>{error}</Banner>;
+  if (!status) return <Banner tone="muted" icon={Icon.Loader}>Checking integrations…</Banner>;
+
   const { ready, missing = [], pomanda_configured, cognism_configured, lusha_configured } = status;
   if (ready) {
     return (
       <Banner tone="success" icon={Icon.CheckCircle2}>
-        MAN workflow is ready — Pomanda, Cognism, and Lusha are all configured.
+        Ready — Pomanda, Cognism, and Lusha are all configured. Full verify + enrich available.
       </Banner>
     );
   }
   const configuredCount = [pomanda_configured, cognism_configured, lusha_configured].filter(Boolean).length;
   const tone = configuredCount === 0 ? "info" : "warning";
   const headline = configuredCount === 0
-    ? "No credentials configured yet."
+    ? "No credentials configured. You can still upload — results will show Zint data as-is."
     : `${configuredCount} of 3 tools configured. Missing: ${missing.join(", ")}.`;
   return (
     <Banner tone={tone} icon={Icon.AlertTriangle}>
       <div>
         <div style={{ fontWeight: 500 }}>{headline}</div>
         <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 4 }}>
-          Add keys for {missing.join(", ")} in the Connections tab. You can still process
-          leads to see where things stand — rows without credentials will surface a clear
-          "not configured" error.
+          Add keys in the Connections tab. Without them, Zint-provided MAN + contact are preserved
+          and flagged "As-Is" (unverified) in results.
         </div>
       </div>
     </Banner>
@@ -316,18 +307,11 @@ function Banner({ tone, icon: IconCmp, children }) {
   return (
     <div
       className="flex items-start gap-3 mb-6"
-      style={{
-        border: `1px solid ${t.border}`,
-        background: t.bg,
-        borderRadius: 10,
-        padding: "12px 14px",
-      }}
+      style={{ border: `1px solid ${t.border}`, background: t.bg, borderRadius: 10, padding: "12px 14px" }}
       role="status"
     >
       {IconCmp && <IconCmp className="lucide-sm" style={{ color: t.fg, marginTop: 2, flexShrink: 0 }} />}
-      <div style={{ fontSize: 14, color: "var(--fg)", lineHeight: 1.5, flex: 1 }}>
-        {children}
-      </div>
+      <div style={{ fontSize: 14, color: "var(--fg)", lineHeight: 1.5, flex: 1 }}>{children}</div>
     </div>
   );
 }
@@ -336,7 +320,10 @@ function Banner({ tone, icon: IconCmp, children }) {
 // Upload zone
 // ---------------------------------------------------------------------------
 
-function UploadSection({ onFile, uploading, uploadError, uploadWarning, uploadedFilename, hasLeads, onReset }) {
+function UploadSection({
+  onFile, uploading, uploadError, uploadWarning, uploadedFilename,
+  hasLeads, onReset, columnMapping, extraColumns,
+}) {
   const [dragActive, setDragActive] = useState(false);
   const inputRef = useRef(null);
 
@@ -346,11 +333,10 @@ function UploadSection({ onFile, uploading, uploadError, uploadWarning, uploaded
     const f = e.dataTransfer?.files?.[0];
     if (f) onFile(f);
   };
-
   const onPick = (e) => {
     const f = e.target.files?.[0];
     if (f) onFile(f);
-    e.target.value = "";  // allow re-upload of the same file
+    e.target.value = "";
   };
 
   return (
@@ -375,7 +361,7 @@ function UploadSection({ onFile, uploading, uploadError, uploadWarning, uploaded
           <div className="flex items-center justify-between" style={{ gap: 12 }}>
             <div className="flex items-center gap-3" style={{ minWidth: 0 }}>
               <Icon.FileText className="lucide-sm" style={{ color: "var(--fg-muted)", flexShrink: 0 }} />
-              <div style={{ minWidth: 0 }}>
+              <div style={{ minWidth: 0, textAlign: "left" }}>
                 <div style={{ fontSize: 13, fontWeight: 500, color: "var(--fg)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {uploadedFilename || "Uploaded CSV"}
                 </div>
@@ -384,18 +370,20 @@ function UploadSection({ onFile, uploading, uploadError, uploadWarning, uploaded
                 </div>
               </div>
             </div>
-            <button className="btn-secondary px-3 py-1.5" style={{ fontSize: 13 }} onClick={() => inputRef.current?.click()}>
-              Choose different file
-            </button>
-            <button className="btn-ghost px-3 py-1.5" style={{ fontSize: 13, color: "var(--fg-muted)" }} onClick={onReset}>
-              Clear
-            </button>
+            <div className="flex items-center gap-2">
+              <button className="btn-secondary px-3 py-1.5" style={{ fontSize: 13 }} onClick={() => inputRef.current?.click()}>
+                Choose different file
+              </button>
+              <button className="btn-ghost px-3 py-1.5" style={{ fontSize: 13, color: "var(--fg-muted)" }} onClick={onReset}>
+                Clear
+              </button>
+            </div>
           </div>
         ) : (
           <div className="flex flex-col items-center" style={{ gap: 10 }}>
             <Icon.Upload className="lucide" style={{ color: dragActive ? "var(--accent)" : "var(--fg-muted)", width: 32, height: 32 }} />
             <div style={{ fontSize: 15, fontWeight: 500, color: "var(--fg)" }}>
-              {uploading ? "Parsing…" : "Drop a CSV here"}
+              {uploading ? "Parsing…" : "Drop a Zint CSV here"}
             </div>
             <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
               or{" "}
@@ -420,17 +408,36 @@ function UploadSection({ onFile, uploading, uploadError, uploadWarning, uploaded
           aria-label="Upload CSV file"
         />
       </div>
-      {uploadError && (
-        <div className="mt-3" style={{ fontSize: 13, color: "var(--danger)" }}>
-          {uploadError}
-        </div>
-      )}
-      {uploadWarning && (
-        <div className="mt-3" style={{ fontSize: 13, color: "var(--fg-muted)" }}>
-          {uploadWarning}
-        </div>
+      {uploadError && <div className="mt-3" style={{ fontSize: 13, color: "var(--danger)" }}>{uploadError}</div>}
+      {uploadWarning && <div className="mt-3" style={{ fontSize: 13, color: "var(--fg-muted)" }}>{uploadWarning}</div>}
+      {hasLeads && Object.keys(columnMapping || {}).length > 0 && (
+        <ColumnMappingPreview mapping={columnMapping} extraColumns={extraColumns} />
       )}
     </section>
+  );
+}
+
+function ColumnMappingPreview({ mapping, extraColumns }) {
+  const mapped = Object.entries(mapping);
+  if (!mapped.length) return null;
+  return (
+    <div className="mt-3" style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+      <span style={{ fontWeight: 500, color: "var(--fg-muted)" }}>Detected columns: </span>
+      {mapped.map(([schema, header], i) => (
+        <span key={schema}>
+          <span style={{ fontFamily: "Menlo, Courier, monospace", color: "var(--fg)" }}>{header}</span>
+          <span style={{ color: "var(--fg-faint)" }}>→</span>
+          <span style={{ color: "var(--accent)" }}>{schema}</span>
+          {i < mapped.length - 1 ? ", " : ""}
+        </span>
+      ))}
+      {extraColumns?.length ? (
+        <span>
+          {" · "}
+          <span style={{ color: "var(--fg-faint)" }}>{extraColumns.length} extra column{extraColumns.length === 1 ? "" : "s"} preserved for export</span>
+        </span>
+      ) : null}
+    </div>
   );
 }
 
@@ -438,7 +445,7 @@ function UploadSection({ onFile, uploading, uploadError, uploadWarning, uploaded
 // Leads preview + results table
 // ---------------------------------------------------------------------------
 
-function LeadsTable({ leads, detectedColumns, selectedIdx, setSelectedIdx, results, processing }) {
+function LeadsTable({ leads, selectedIdx, setSelectedIdx, results, processing }) {
   const [expanded, setExpanded] = useState(new Set());
 
   const toggleAll = () => {
@@ -460,13 +467,12 @@ function LeadsTable({ leads, detectedColumns, selectedIdx, setSelectedIdx, resul
     });
   };
 
-  const resultByCompany = useMemo(() => {
+  // Match results to leads by position (backend preserves order).
+  const resultByIdx = useMemo(() => {
     if (!results?.results) return {};
-    const map = {};
-    for (const r of results.results) {
-      map[r.company_name] = r;
-    }
-    return map;
+    const m = {};
+    results.results.forEach((r, i) => { m[i] = r; });
+    return m;
   }, [results]);
 
   const allSelected = selectedIdx.size === leads.length && leads.length > 0;
@@ -475,9 +481,7 @@ function LeadsTable({ leads, detectedColumns, selectedIdx, setSelectedIdx, resul
   return (
     <section className="mb-6">
       <div className="flex items-center justify-between" style={{ marginBottom: 10 }}>
-        <SectionLabel>
-          Leads ({leads.length}){detectedColumns.length ? ` · columns: ${detectedColumns.join(", ")}` : ""}
-        </SectionLabel>
+        <SectionLabel>Leads ({leads.length})</SectionLabel>
         <div className="flex items-center gap-3" style={{ fontSize: 13 }}>
           <span style={{ color: "var(--fg-muted)" }}>{selectedIdx.size} selected</span>
           <button
@@ -491,18 +495,11 @@ function LeadsTable({ leads, detectedColumns, selectedIdx, setSelectedIdx, resul
         </div>
       </div>
 
-      <div
-        style={{
-          border: "1px solid var(--border)",
-          borderRadius: 12,
-          background: "var(--bg-elev)",
-          overflow: "hidden",
-        }}
-      >
+      <div style={{ border: "1px solid var(--border)", borderRadius: 12, background: "var(--bg-elev)", overflow: "hidden" }}>
         <div
           className="grid items-center"
           style={{
-            gridTemplateColumns: "36px minmax(200px, 2fr) 140px 1fr 180px 24px",
+            gridTemplateColumns: "36px minmax(180px, 1.6fr) minmax(140px, 1fr) minmax(180px, 1.4fr) minmax(140px, 1fr) 160px 24px",
             padding: "10px 14px",
             borderBottom: "1px solid var(--border)",
             fontSize: 11,
@@ -522,43 +519,51 @@ function LeadsTable({ leads, detectedColumns, selectedIdx, setSelectedIdx, resul
             />
           </div>
           <div>Company</div>
-          <div style={{ fontFamily: "Menlo, Courier, monospace", fontSize: 10 }}>Number</div>
-          <div>Website</div>
+          <div>MAN</div>
+          <div>Email</div>
+          <div>Mobile</div>
           <div>Status</div>
           <div />
         </div>
 
-        {leads.map((lead, i) => {
-          const result = resultByCompany[lead.name];
-          const isExpanded = expanded.has(i);
-          return (
-            <LeadRow
-              key={`${lead.name}-${i}`}
-              lead={lead}
-              index={i}
-              checked={selectedIdx.has(i)}
-              onToggle={() => toggleOne(i)}
-              disabled={processing}
-              result={result}
-              isLast={i === leads.length - 1}
-              isExpanded={isExpanded}
-              onExpand={() => toggleExpand(i)}
-            />
-          );
-        })}
+        {leads.map((lead, i) => (
+          <LeadRow
+            key={i}
+            lead={lead}
+            checked={selectedIdx.has(i)}
+            onToggle={() => toggleOne(i)}
+            disabled={processing}
+            result={resultByIdx[i]}
+            isLast={i === leads.length - 1}
+            isExpanded={expanded.has(i)}
+            onExpand={() => toggleExpand(i)}
+          />
+        ))}
       </div>
     </section>
   );
 }
 
-function LeadRow({ lead, index, checked, onToggle, disabled, result, isLast, isExpanded, onExpand }) {
+function _fullName(lead) {
+  const parts = [(lead?.first_name || "").trim(), (lead?.last_name || "").trim()].filter(Boolean);
+  return parts.join(" ");
+}
+
+function LeadRow({ lead, checked, onToggle, disabled, result, isLast, isExpanded, onExpand }) {
   const hasResult = Boolean(result);
+  const rowMan = result?.man || null;
+  // Show result MAN when available, else show Zint's candidate from the preview.
+  const displayName = rowMan?.name || _fullName(lead) || "—";
+  const displayTitle = rowMan?.job_title || rowMan?.role || lead?.job_title || "";
+  const displayEmail = rowMan?.email || lead?.email || "";
+  const displayMobile = rowMan?.mobile || lead?.mobile || "";
+
   return (
     <div style={{ borderBottom: isLast ? "none" : "1px solid var(--border)" }}>
       <div
         className="grid items-center"
         style={{
-          gridTemplateColumns: "36px minmax(200px, 2fr) 140px 1fr 180px 24px",
+          gridTemplateColumns: "36px minmax(180px, 1.6fr) minmax(140px, 1fr) minmax(180px, 1.4fr) minmax(140px, 1fr) 160px 24px",
           padding: "10px 14px",
           fontSize: 13,
           cursor: hasResult ? "pointer" : "default",
@@ -578,16 +583,29 @@ function LeadRow({ lead, index, checked, onToggle, disabled, result, isLast, isE
           />
         </div>
         <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {lead.name}
+          <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{lead.name}</div>
+          {lead.domain && (
+            <div style={{ fontSize: 11, color: "var(--fg-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {lead.domain}
+            </div>
+          )}
         </div>
-        <div style={{ fontFamily: "Menlo, Courier, monospace", fontSize: 12, color: "var(--fg-muted)" }}>
-          {lead.number || "—"}
+        <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <div style={{ color: displayName === "—" ? "var(--fg-faint)" : "var(--fg)" }}>{displayName}</div>
+          {displayTitle && (
+            <div style={{ fontSize: 11, color: "var(--fg-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {displayTitle}
+            </div>
+          )}
         </div>
-        <div style={{ color: "var(--fg-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {lead.website || "—"}
+        <div style={{ fontFamily: "Menlo, Courier, monospace", fontSize: 12, color: displayEmail ? "var(--fg-muted)" : "var(--fg-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {displayEmail || "—"}
+        </div>
+        <div style={{ fontFamily: "Menlo, Courier, monospace", fontSize: 12, color: displayMobile ? "var(--fg-muted)" : "var(--fg-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {displayMobile || "—"}
         </div>
         <div>
-          <StatusBadge status={result?.status} />
+          <StatusBadge result={result} />
         </div>
         <div style={{ color: "var(--fg-faint)" }}>
           {hasResult && (isExpanded ? <Icon.ChevronDown className="lucide-xs" /> : <Icon.ChevronRight className="lucide-xs" />)}
@@ -596,115 +614,126 @@ function LeadRow({ lead, index, checked, onToggle, disabled, result, isLast, isE
       {hasResult && isExpanded && (
         <div
           className="slide-in-top"
-          style={{
-            padding: "10px 14px 14px 50px",
-            borderTop: "1px solid var(--border)",
-            background: "var(--bg)",
-          }}
+          style={{ padding: "10px 14px 14px 50px", borderTop: "1px solid var(--border)", background: "var(--bg)" }}
         >
-          <LeadResultDetail result={result} />
+          <LeadResultDetail result={result} lead={lead} />
         </div>
       )}
     </div>
   );
 }
 
-function StatusBadge({ status }) {
-  if (!status) {
-    return <span style={{ fontSize: 12, color: "var(--fg-faint)" }}>—</span>;
-  }
-  const map = {
-    success: { label: "Success", bg: "var(--green-soft)", fg: "var(--green)" },
-    partial: { label: "Partial", bg: "rgba(180,67,44,0.06)", fg: "var(--danger)" },
-    not_found: { label: "Not found", bg: "var(--bg-soft)", fg: "var(--fg-muted)" },
-    needs_review: { label: "Needs review", bg: "var(--accent-soft)", fg: "var(--accent)" },
-    error: { label: "Error", bg: "rgba(180,67,44,0.08)", fg: "var(--danger)" },
-  };
-  const m = map[status] || map.error;
+// Map backend (status, enrichment_status) into the UI badge.
+function _resolveBadge(result) {
+  if (!result) return null;
+  if (result.status === "error") return { key: "error", label: "Error", bg: "rgba(180,67,44,0.08)", fg: "var(--danger)" };
+  if (result.status === "needs_review") return { key: "needs_review", label: "Needs review", bg: "var(--accent-soft)", fg: "var(--accent)" };
+  if (result.status === "partial") return { key: "partial", label: "Partial", bg: "rgba(180,67,44,0.06)", fg: "var(--danger)" };
+
+  // status === "success" — disambiguate by enrichment/contact status.
+  const es = result.enrichment_status;
+  const cs = result.contact_status;
+  if (es === "man_upgraded") return { key: "upgraded", label: "Upgraded", bg: "var(--accent-soft)", fg: "var(--accent)" };
+  if (es === "man_from_zint_unverified" && cs === "contact_from_zint") return { key: "as_is", label: "As-Is", bg: "var(--bg-soft)", fg: "var(--fg-muted)" };
+  if (cs === "contact_enriched_cognism" || cs === "contact_enriched_lusha") return { key: "enriched", label: "Enriched", bg: "var(--green-soft)", fg: "var(--green)" };
+  if (es === "man_verified") return { key: "verified", label: "Verified", bg: "var(--green-soft)", fg: "var(--green)" };
+  return { key: "success", label: "Success", bg: "var(--green-soft)", fg: "var(--green)" };
+}
+
+function StatusBadge({ result }) {
+  const b = _resolveBadge(result);
+  if (!b) return <span style={{ fontSize: 12, color: "var(--fg-faint)" }}>—</span>;
   return (
     <span
       style={{
-        display: "inline-block",
-        padding: "2px 10px",
-        borderRadius: 999,
-        fontSize: 11,
-        fontWeight: 500,
-        background: m.bg,
-        color: m.fg,
-        letterSpacing: "0.02em",
+        display: "inline-block", padding: "2px 10px", borderRadius: 999,
+        fontSize: 11, fontWeight: 500, background: b.bg, color: b.fg, letterSpacing: "0.02em",
       }}
+      aria-label={b.label}
     >
-      {m.label}
+      {b.label}
     </span>
   );
 }
 
-function LeadResultDetail({ result }) {
+function SourceTag({ source }) {
+  if (!source) return null;
+  const map = {
+    zint: { label: "Zint", fg: "var(--fg-muted)" },
+    pomanda: { label: "verified by Pomanda", fg: "var(--green)" },
+    upgraded: { label: "upgraded via Pomanda", fg: "var(--accent)" },
+    cognism: { label: "Cognism", fg: "var(--accent)" },
+    lusha: { label: "Lusha", fg: "var(--accent)" },
+  };
+  const m = map[source] || { label: source, fg: "var(--fg-muted)" };
+  return (
+    <span style={{ fontSize: 11, color: m.fg, fontWeight: 500, letterSpacing: "0.02em", marginLeft: 8 }}>
+      [{m.label}]
+    </span>
+  );
+}
+
+function LeadResultDetail({ result, lead }) {
   const status = result?.status;
-  const man = result?.man;
-  if (status === "success" && man) {
-    return (
-      <div className="flex flex-col gap-2">
-        <DetailRow label="MAN" value={`${man.name}${man.role ? ` · ${man.role}` : ""}`} />
-        <DetailRow label="Email" value={man.email} mono />
-        <DetailRow label="Mobile" value={man.mobile} mono />
-        <DetailRow
-          label="Source"
-          value={man.source ? man.source[0].toUpperCase() + man.source.slice(1) : null}
-        />
-      </div>
-    );
-  }
-  if (status === "partial") {
-    return (
-      <div className="flex flex-col gap-2">
-        {man && <DetailRow label="MAN" value={`${man.name || "—"}${man.role ? ` · ${man.role}` : ""}`} />}
-        <DetailRow label="Email" value={man?.email} mono emptyLabel="—" />
-        <DetailRow label="Mobile" value={man?.mobile} mono emptyLabel="—" />
-        <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
-          {result.error || "Name found but no complete contact details — try running Lusha manually."}
-        </div>
-      </div>
-    );
-  }
+  const man = result?.man || {};
+  const sources = result?.sources || {};
+
   if (status === "needs_review") {
     return (
       <div className="flex flex-col gap-2">
-        <DetailRow label="Parent" value={man?.parent_company || "—"} />
+        <DetailRow label="Parent" value={man.parent_company || "—"} />
         <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
-          Rule 2 of the JSP priority hit — {man?.parent_company || "the parent company"} is the
-          majority shareholder. Look up the largest private shareholder of that parent manually
-          to find the real MAN.
+          Rule 2 hit — {man.parent_company || "the parent company"} is the majority shareholder.
+          Look up its largest private shareholder manually.
         </div>
       </div>
     );
   }
-  if (status === "not_found") {
-    return (
-      <div style={{ fontSize: 13, color: "var(--fg-muted)" }}>
-        {result.error || "No MAN identifiable from Pomanda data."}
-      </div>
-    );
+  if (status === "error") {
+    return <div style={{ fontSize: 13, color: "var(--danger)" }}>{result?.error || "Unknown error."}</div>;
   }
-  // error
+
   return (
-    <div style={{ fontSize: 13, color: "var(--danger)" }}>
-      {result?.error || "Unknown error."}
+    <div className="flex flex-col gap-2">
+      <DetailRow
+        label="MAN"
+        value={man.name || _fullName(lead) || "—"}
+        suffix={<>
+          {(man.job_title || man.role) && (
+            <span style={{ color: "var(--fg-muted)" }}> · {man.job_title || man.role}</span>
+          )}
+          {typeof man.shareholder_pct === "number" && (
+            <span style={{ color: "var(--fg-muted)" }}> · {man.shareholder_pct}%</span>
+          )}
+          <SourceTag source={sources.man} />
+        </>}
+      />
+      <DetailRow label="Email" value={man.email} mono suffix={<SourceTag source={sources.email} />} />
+      <DetailRow label="Mobile" value={man.mobile} mono suffix={<SourceTag source={sources.mobile} />} />
+      {(man.linkedin || lead.linkedin) && (
+        <DetailRow label="LinkedIn" value={man.linkedin || lead.linkedin} mono />
+      )}
+      {status === "partial" && (
+        <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 4 }}>
+          {result?.error || "Contact is incomplete — neither Cognism nor Lusha could complete it."}
+        </div>
+      )}
+      {result?.enrichment_status === "man_from_zint_unverified" && (
+        <div style={{ fontSize: 12, color: "var(--fg-faint)", marginTop: 2 }}>
+          Pomanda not configured — MAN taken from Zint as-is, not verified against Companies House.
+        </div>
+      )}
     </div>
   );
 }
 
-function DetailRow({ label, value, mono, emptyLabel }) {
+function DetailRow({ label, value, mono, emptyLabel, suffix }) {
   return (
     <div className="flex items-baseline" style={{ gap: 12 }}>
       <div
         style={{
-          fontSize: 11,
-          color: "var(--fg-faint)",
-          letterSpacing: "0.04em",
-          textTransform: "uppercase",
-          width: 72,
-          flexShrink: 0,
+          fontSize: 11, color: "var(--fg-faint)", letterSpacing: "0.04em",
+          textTransform: "uppercase", width: 72, flexShrink: 0,
         }}
       >
         {label}
@@ -714,16 +743,18 @@ function DetailRow({ label, value, mono, emptyLabel }) {
           fontFamily: mono ? "Menlo, Courier, monospace" : undefined,
           fontSize: mono ? 12.5 : 13,
           color: value ? "var(--fg)" : "var(--fg-faint)",
+          flex: 1,
         }}
       >
         {value || emptyLabel || "—"}
+        {suffix}
       </div>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Process bar (button + progress spinner)
+// Process bar
 // ---------------------------------------------------------------------------
 
 function ProcessBar({ selectedCount, processing, onProcess, processError, progressMessage }) {
@@ -731,13 +762,7 @@ function ProcessBar({ selectedCount, processing, onProcess, processError, progre
     <section className="mb-6">
       <div
         className="flex items-center justify-between"
-        style={{
-          border: "1px solid var(--border)",
-          borderRadius: 12,
-          background: "var(--bg-elev)",
-          padding: "14px 16px",
-          gap: 16,
-        }}
+        style={{ border: "1px solid var(--border)", borderRadius: 12, background: "var(--bg-elev)", padding: "14px 16px", gap: 16 }}
       >
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 14, fontWeight: 500, color: "var(--fg)" }}>
@@ -748,7 +773,7 @@ function ProcessBar({ selectedCount, processing, onProcess, processError, progre
               ? progressMessage
               : selectedCount === 0
                 ? "Select at least one lead to process."
-                : "Runs the Pomanda → Cognism → Lusha cascade for each selected lead."}
+                : "Verify MAN via Pomanda, then fill any missing contact via Cognism → Lusha."}
           </div>
         </div>
         <button
@@ -757,59 +782,70 @@ function ProcessBar({ selectedCount, processing, onProcess, processError, progre
           onClick={onProcess}
           disabled={processing || selectedCount === 0}
         >
-          {processing ? (
-            <>
-              <Icon.Loader className="lucide-sm spin" />
-              Working
-            </>
-          ) : (
-            <>
-              <Icon.Zap className="lucide-sm" />
-              Run workflow
-            </>
-          )}
+          {processing ? (<><Icon.Loader className="lucide-sm spin" />Working</>) : (<><Icon.Zap className="lucide-sm" />Run workflow</>)}
         </button>
       </div>
-      {processError && (
-        <div className="mt-3" style={{ fontSize: 13, color: "var(--danger)" }}>
-          {processError}
-        </div>
-      )}
+      {processError && <div className="mt-3" style={{ fontSize: 13, color: "var(--danger)" }}>{processError}</div>}
     </section>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Summary bar (post-process)
+// Summary bar + CSV export (preserves all original Zint columns)
 // ---------------------------------------------------------------------------
 
-function SummaryBar({ results, leads, onReset }) {
+function SummaryBar({ results, leads, detectedColumns, onReset }) {
   const summary = results.summary || {};
   const credits = results.credits_used || {};
 
-  const downloadCsv = () => {
-    const lines = [
-      ["company_name", "company_number", "website", "man_name", "man_role", "email", "mobile", "source", "status", "notes"].join(","),
-    ];
-    const byName = new Map();
+  // Derive counts by badge type rather than raw status, so the UI stays consistent
+  // with what LeadRow shows.
+  const counts = useMemo(() => {
+    const c = { verified: 0, upgraded: 0, enriched: 0, as_is: 0, partial: 0, error: 0, needs_review: 0 };
     for (const r of results.results || []) {
-      byName.set(r.company_name, r);
+      const b = _resolveBadge(r);
+      if (b && c[b.key] !== undefined) c[b.key] += 1;
     }
-    for (const lead of leads) {
-      const r = byName.get(lead.name);
-      const m = r?.man || {};
-      lines.push([
-        csvEscape(lead.name),
-        csvEscape(lead.number || r?.company_number || ""),
-        csvEscape(lead.website || ""),
-        csvEscape(m.name || ""),
-        csvEscape(m.role || ""),
-        csvEscape(m.email || ""),
-        csvEscape(m.mobile || ""),
-        csvEscape(m.source || ""),
+    return c;
+  }, [results]);
+
+  const downloadCsv = () => {
+    // Preserve original Zint columns first, then append enrichment columns.
+    const originalCols = detectedColumns || [];
+    const enrichmentCols = [
+      "verified_man_name", "verified_man_title", "verified_email", "verified_mobile",
+      "man_source", "email_source", "mobile_source",
+      "enrichment_status", "contact_status", "status",
+      "credits_cognism_used", "credits_lusha_used",
+      "notes",
+    ];
+
+    const lines = [[...originalCols, ...enrichmentCols].map(csvEscape).join(",")];
+    for (let i = 0; i < leads.length; i++) {
+      const lead = leads[i];
+      const r = (results.results || [])[i];
+      const original = lead.original_row || {};
+      const man = r?.man || {};
+      const sources = r?.sources || {};
+      const cu = r?.credits_used || {};
+
+      const originalValues = originalCols.map((col) => csvEscape(original[col] ?? ""));
+      const enrichmentValues = [
+        csvEscape(man.name || ""),
+        csvEscape(man.job_title || man.role || ""),
+        csvEscape(man.email || ""),
+        csvEscape(man.mobile || ""),
+        csvEscape(sources.man || ""),
+        csvEscape(sources.email || ""),
+        csvEscape(sources.mobile || ""),
+        csvEscape(r?.enrichment_status || ""),
+        csvEscape(r?.contact_status || ""),
         csvEscape(r?.status || "missing"),
+        csvEscape(cu.cognism || 0),
+        csvEscape(cu.lusha || 0),
         csvEscape(r?.error || ""),
-      ].join(","));
+      ];
+      lines.push([...originalValues, ...enrichmentValues].join(","));
     }
     const blob = new Blob([lines.join("\n") + "\n"], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -825,21 +861,16 @@ function SummaryBar({ results, leads, onReset }) {
 
   return (
     <section className="mb-6">
-      <div
-        style={{
-          border: "1px solid var(--border)",
-          borderRadius: 12,
-          background: "var(--bg-elev)",
-          padding: "14px 16px",
-        }}
-      >
+      <div style={{ border: "1px solid var(--border)", borderRadius: 12, background: "var(--bg-elev)", padding: "14px 16px" }}>
         <div className="flex items-center justify-between flex-wrap" style={{ gap: 16 }}>
           <div className="flex items-center flex-wrap" style={{ gap: 16 }}>
-            <SummaryChip label="Success" value={summary.success || 0} tone="success" />
-            <SummaryChip label="Partial" value={summary.partial || 0} tone="warning" />
-            <SummaryChip label="Not found" value={summary.not_found || 0} tone="muted" />
-            <SummaryChip label="Needs review" value={summary.needs_review || 0} tone="info" />
-            <SummaryChip label="Errors" value={summary.error || 0} tone="danger" />
+            <SummaryChip label="Verified" value={counts.verified} tone="success" />
+            <SummaryChip label="Upgraded" value={counts.upgraded} tone="info" />
+            <SummaryChip label="Enriched" value={counts.enriched} tone="success" />
+            <SummaryChip label="As-Is" value={counts.as_is} tone="muted" />
+            <SummaryChip label="Partial" value={counts.partial} tone="warning" />
+            <SummaryChip label="Errors" value={counts.error} tone="danger" />
+            {counts.needs_review > 0 && <SummaryChip label="Needs review" value={counts.needs_review} tone="info" />}
           </div>
           <div className="flex items-center" style={{ gap: 8 }}>
             <button
@@ -860,7 +891,7 @@ function SummaryBar({ results, leads, onReset }) {
           </div>
         </div>
         <div
-          className="mt-3 flex items-center"
+          className="mt-3 flex items-center flex-wrap"
           style={{ gap: 16, fontSize: 12, color: "var(--fg-muted)", paddingTop: 12, borderTop: "1px solid var(--border)" }}
         >
           <span>Credits used</span>
@@ -897,18 +928,15 @@ function SummaryChip({ label, value, tone }) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared bits
+// Shared
 // ---------------------------------------------------------------------------
 
 function SectionLabel({ children }) {
   return (
     <div
       style={{
-        fontSize: 11,
-        color: "var(--fg-faint)",
-        letterSpacing: "0.04em",
-        textTransform: "uppercase",
-        fontWeight: 500,
+        fontSize: 11, color: "var(--fg-faint)", letterSpacing: "0.04em",
+        textTransform: "uppercase", fontWeight: 500,
       }}
     >
       {children}
@@ -918,8 +946,6 @@ function SectionLabel({ children }) {
 
 function csvEscape(value) {
   const s = String(value ?? "");
-  if (/[",\n\r]/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }

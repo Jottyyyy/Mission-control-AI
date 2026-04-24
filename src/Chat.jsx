@@ -6,6 +6,41 @@ import ActionCard, { splitByActionCards } from './ActionCard.jsx';
 
 const API_BASE = "http://127.0.0.1:8001";
 
+// Summarise a batch result into a Marketing-agent reply body (markdown).
+function _summaryText(batch, card) {
+  if (!batch?.results) return "Finished, but the backend returned an unexpected response.";
+  const counts = { verified: 0, upgraded: 0, enriched: 0, as_is: 0, partial: 0, error: 0, needs_review: 0 };
+  for (const r of batch.results) {
+    if (r.status === "error") counts.error++;
+    else if (r.status === "needs_review") counts.needs_review++;
+    else if (r.status === "partial") counts.partial++;
+    else if (r.enrichment_status === "man_upgraded") counts.upgraded++;
+    else if (r.enrichment_status === "man_from_zint_unverified" && r.contact_status === "contact_from_zint") counts.as_is++;
+    else if (r.contact_status === "contact_enriched_cognism" || r.contact_status === "contact_enriched_lusha") counts.enriched++;
+    else if (r.enrichment_status === "man_verified") counts.verified++;
+    else counts.verified++;  // default bucket for status === success
+  }
+  const cu = batch.credits_used || {};
+  const total = batch.total || 0;
+  const filename = card?.filename || "your batch";
+  const lines = [
+    `Done. Processed **${total} lead${total === 1 ? "" : "s"}** from ${filename}:`,
+    "",
+    counts.verified ? `✓ ${counts.verified} verified (MAN confirmed, contact from Zint)` : null,
+    counts.upgraded ? `⬆ ${counts.upgraded} MAN upgraded via Pomanda` : null,
+    counts.enriched ? `⚡ ${counts.enriched} enriched (contact filled by Cognism/Lusha)` : null,
+    counts.as_is ? `📋 ${counts.as_is} as-is (Pomanda not configured — Zint data unverified)` : null,
+    counts.partial ? `⚠ ${counts.partial} partial (MAN found but contact incomplete)` : null,
+    counts.needs_review ? `↗ ${counts.needs_review} needs manual review (parent-company case)` : null,
+    counts.error ? `✗ ${counts.error} errors` : null,
+    "",
+    `Credits used: Cognism ${cu.cognism || 0} · Lusha ${cu.lusha || 0}`,
+    "",
+    "Use the **Download CSV** button on the card above to export everything with the original Zint columns preserved.",
+  ].filter((l) => l !== null);
+  return lines.join("\n");
+}
+
 function BrainPill({ model }) {
   if (model !== "sonnet" && model !== "opus") return null;
   const fast = model === "sonnet";
@@ -17,6 +52,71 @@ function BrainPill({ model }) {
     >
       {IconCmp ? <IconCmp className="lucide-xs" /> : null}
       <span>{fast ? "Quick reply" : "Thought deeply"}</span>
+    </div>
+  );
+}
+
+function FileCard({ card, onProcess, onDownload }) {
+  const { filename, state, leads, error, results } = card;
+  const leadCount = (leads || []).length;
+
+  let statusLine = "Parsing…";
+  if (state === "loaded") statusLine = `${leadCount} lead${leadCount === 1 ? "" : "s"} extracted`;
+  if (state === "processing") statusLine = `Processing ${leadCount} lead${leadCount === 1 ? "" : "s"}…`;
+  if (state === "done" && results) {
+    const s = results.summary || {};
+    statusLine = `Done — ${s.success || 0} success, ${s.partial || 0} partial, ${s.error || 0} error`;
+  }
+  if (state === "error") statusLine = error || "Upload failed";
+
+  return (
+    <div
+      style={{
+        border: "1px solid var(--border)",
+        borderRadius: 12,
+        background: "var(--bg-elev)",
+        padding: 14,
+        maxWidth: 560,
+        marginBottom: 8,
+      }}
+    >
+      <div className="flex items-center gap-3" style={{ marginBottom: state === "error" ? 0 : 12 }}>
+        <Icon.FileText className="lucide-sm" style={{ color: "var(--fg-muted)", flexShrink: 0 }} />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: 14, fontWeight: 500, color: "var(--fg)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {filename}
+          </div>
+          <div style={{ fontSize: 12, color: state === "error" ? "var(--danger)" : "var(--fg-muted)", marginTop: 2 }}>
+            {statusLine}
+          </div>
+        </div>
+        {state === "processing" && <Icon.Loader className="lucide-sm spin" style={{ color: "var(--fg-muted)" }} />}
+      </div>
+
+      {state === "loaded" && (
+        <div className="flex items-center gap-2" style={{ marginTop: 2 }}>
+          <button
+            className="btn-primary px-3 py-1.5"
+            style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}
+            onClick={() => onProcess(card.id)}
+          >
+            <Icon.Zap className="lucide-xs" />
+            Process all
+          </button>
+        </div>
+      )}
+      {state === "done" && (
+        <div className="flex items-center gap-2" style={{ marginTop: 2 }}>
+          <button
+            className="btn-secondary px-3 py-1.5"
+            style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}
+            onClick={() => onDownload(card)}
+          >
+            <Icon.Download className="lucide-xs" />
+            Download CSV
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -44,6 +144,13 @@ function Chat({
   const [loadError, setLoadError] = useState("");
   const inputRef = useRef(null);
   const scrollRef = useRef(null);
+
+  // File-upload state (Marketing chat only). The uploaded batch lives on a
+  // per-chat-session basis — we intentionally do not persist it to the
+  // conversation DB for v1.14, so a reload clears the card.
+  const fileInputRef = useRef(null);
+  const [dragActive, setDragActive] = useState(false);
+  const isMarketing = assistantKey === "marketing";
 
   // Reset messages + input when assistant changes.
   useEffect(() => {
@@ -209,6 +316,171 @@ function Chat({
     updateUrl(null);
   };
 
+  // --------------------------------------------------------------------------
+  // File upload — Marketing chat only. Uploads a Zint CSV to the workflow
+  // backend, inserts a file-card message, and posts an auto-reply from the
+  // assistant with a Process button that runs the batch inline.
+  // --------------------------------------------------------------------------
+
+  const handleFilePick = async (file) => {
+    if (!file) return;
+    const name = (file.name || "").toLowerCase();
+    if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+      setMessages((m) => [...m, {
+        from: "assistant",
+        text: "Excel files aren't supported yet — please export as CSV (File → Save As → CSV UTF-8) and drop it back in.",
+        error: true,
+      }]);
+      if (mode !== "active") setMode("active");
+      return;
+    }
+    if (!name.endsWith(".csv") && file.type !== "text/csv") {
+      setMessages((m) => [...m, {
+        from: "assistant",
+        text: "Only .csv files are supported for lead batches.",
+        error: true,
+      }]);
+      if (mode !== "active") setMode("active");
+      return;
+    }
+
+    // Placeholder card while parsing.
+    const cardId = `fc-${Date.now()}`;
+    setMessages((m) => [...m, { from: "file-card", id: cardId, filename: file.name, state: "parsing" }]);
+    if (mode !== "active") setMode("active");
+
+    try {
+      const text = await file.text();
+      const res = await fetch(`${API_BASE}/workflow/man/upload-spreadsheet`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, csv_content: text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMessages((m) => m.map((msg) => msg.id === cardId
+          ? { ...msg, state: "error", error: data?.detail || `Upload failed (HTTP ${res.status}).` }
+          : msg
+        ));
+        return;
+      }
+      setMessages((m) => m.map((msg) => msg.id === cardId
+        ? { ...msg, state: "loaded", leads: data.leads || [], column_mapping: data.column_mapping || {}, detected_columns: data.detected_columns || [], extra_columns: data.extra_columns || [] }
+        : msg
+      ));
+      // Auto-reply from the assistant.
+      const n = (data.leads || []).length;
+      const reply = [
+        `I found **${n} lead${n === 1 ? "" : "s"}** in that Zint batch.`,
+        "",
+        "For each one I can verify the MAN against Pomanda's shareholders, then fill in any missing email or mobile via Cognism (then Lusha as a fallback). Rows where Zint already has a complete contact will pass through untouched.",
+        "",
+        "Click **Process all** above when you're ready.",
+      ].join("\n");
+      setMessages((m) => [...m, { from: "assistant", text: reply }]);
+    } catch (err) {
+      const msg = err instanceof TypeError
+        ? "Can't reach the local backend. Is it running?"
+        : (err?.message || "Upload failed.");
+      setMessages((m) => m.map((mm) => mm.id === cardId ? { ...mm, state: "error", error: msg } : mm));
+    }
+  };
+
+  const processFileCard = async (cardId) => {
+    const card = messages.find((m) => m.id === cardId);
+    if (!card || !card.leads?.length) return;
+
+    setMessages((m) => m.map((msg) => msg.id === cardId ? { ...msg, state: "processing" } : msg));
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+    try {
+      const res = await fetch(`${API_BASE}/workflow/man/process-batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ leads: card.leads }),
+        signal: controller.signal,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMessages((m) => m.map((msg) => msg.id === cardId
+          ? { ...msg, state: "error", error: data?.detail || `Batch failed (HTTP ${res.status}).` }
+          : msg
+        ));
+        return;
+      }
+      setMessages((m) => m.map((msg) => msg.id === cardId
+        ? { ...msg, state: "done", results: data }
+        : msg
+      ));
+      setMessages((m) => [...m, { from: "assistant", text: _summaryText(data, card) }]);
+    } catch (err) {
+      const msg = err?.name === "AbortError"
+        ? "That took longer than 5 minutes. The backend may still be working — try a smaller batch."
+        : err instanceof TypeError
+          ? "Can't reach the local backend. Is it running?"
+          : (err?.message || "Batch failed.");
+      setMessages((m) => m.map((mm) => mm.id === cardId ? { ...mm, state: "error", error: msg } : mm));
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
+  const downloadBatchCsv = (card) => {
+    if (!card?.results) return;
+    const originalCols = card.detected_columns || [];
+    const enrichmentCols = [
+      "verified_man_name", "verified_man_title", "verified_email", "verified_mobile",
+      "man_source", "email_source", "mobile_source",
+      "enrichment_status", "contact_status", "status",
+      "credits_cognism_used", "credits_lusha_used", "notes",
+    ];
+    const esc = (v) => {
+      const s = String(v ?? "");
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines = [[...originalCols, ...enrichmentCols].map(esc).join(",")];
+    (card.leads || []).forEach((lead, i) => {
+      const r = (card.results.results || [])[i];
+      const orig = lead.original_row || {};
+      const m = r?.man || {};
+      const s = r?.sources || {};
+      const cu = r?.credits_used || {};
+      const row = [
+        ...originalCols.map((c) => esc(orig[c] ?? "")),
+        esc(m.name || ""), esc(m.job_title || m.role || ""),
+        esc(m.email || ""), esc(m.mobile || ""),
+        esc(s.man || ""), esc(s.email || ""), esc(s.mobile || ""),
+        esc(r?.enrichment_status || ""), esc(r?.contact_status || ""), esc(r?.status || "missing"),
+        esc(cu.cognism || 0), esc(cu.lusha || 0),
+        esc(r?.error || ""),
+      ];
+      lines.push(row.join(","));
+    });
+    const blob = new Blob([lines.join("\n") + "\n"], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `man-results-${new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleChatDragOver = (e) => {
+    if (!isMarketing) return;
+    if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+    e.preventDefault();
+    setDragActive(true);
+  };
+  const handleChatDrop = (e) => {
+    if (!isMarketing) return;
+    e.preventDefault();
+    setDragActive(false);
+    const f = e.dataTransfer?.files?.[0];
+    if (f) handleFilePick(f);
+  };
+
   const TopBar = () => (
     <div
       className="flex items-center justify-between px-6 py-3"
@@ -356,7 +628,9 @@ function Chat({
         )}
         {messages.map((m, i) => (
           <div key={i} className={"mb-6 flex " + (m.from === "user" ? "justify-end" : "justify-start") + " fade-in"}>
-            {m.from === "user" ? (
+            {m.from === "file-card" ? (
+              <FileCard card={m} onProcess={processFileCard} onDownload={downloadBatchCsv} />
+            ) : m.from === "user" ? (
               <div className="user-msg msg-body" style={{ maxWidth: "85%", color: "var(--fg)" }}>
                 {m.text.split("\n").map((line, j) => (
                   <p key={j}>{line}</p>
@@ -409,12 +683,35 @@ function Chat({
   );
 
   return (
-    <div className="flex-1 flex flex-col min-w-0" style={{ background: "var(--bg)" }}>
+    <div
+      className="flex-1 flex flex-col min-w-0"
+      style={{ background: "var(--bg)", position: "relative" }}
+      onDragOver={handleChatDragOver}
+      onDragLeave={() => setDragActive(false)}
+      onDrop={handleChatDrop}
+    >
       <TopBar />
 
       {mode === "empty-first" && <EmptyFirstRun />}
       {mode === "empty-recurring" && <EmptyRecurring />}
       {mode === "active" && <ActiveConvo />}
+      {isMarketing && dragActive && (
+        <div
+          style={{
+            position: "absolute", inset: 0, zIndex: 10,
+            background: "var(--accent-soft)",
+            border: "2px dashed var(--accent)",
+            borderRadius: 0,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            pointerEvents: "none",
+          }}
+        >
+          <div className="flex items-center gap-3" style={{ fontSize: 15, fontWeight: 500, color: "var(--accent)" }}>
+            <Icon.Upload className="lucide" />
+            Drop CSV to upload
+          </div>
+        </div>
+      )}
 
       <div className="px-6 pb-5 pt-2">
         <div className="mx-auto" style={{ maxWidth: 720 }}>
@@ -459,6 +756,33 @@ function Chat({
                 cursor: thinking ? "not-allowed" : "text",
               }}
             />
+            {isMarketing && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,text/csv"
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) handleFilePick(f);
+                    e.target.value = "";
+                  }}
+                  aria-label="Upload CSV lead batch"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="btn-ghost p-1.5"
+                  disabled={thinking}
+                  style={{ color: "var(--fg-muted)", cursor: thinking ? "not-allowed" : "pointer" }}
+                  title="Attach a Zint CSV lead batch"
+                  aria-label="Attach CSV"
+                >
+                  <Icon.Paperclip className="lucide-sm" />
+                </button>
+              </>
+            )}
             <button
               onClick={handleSend}
               className="btn-ghost p-1.5"
