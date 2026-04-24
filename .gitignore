@@ -4,3 +4,15 @@ dist-electron/
 MissionControl-AdamBuild/
 .DS_Store
 .env
+
+# Workspace template: never commit per-user artefacts that creep in if
+# someone mirrors their real ~/.openclaw/workspace/ into this folder.
+workspace-template/.backups/
+workspace-template/memory/*.md
+workspace-template/state/
+workspace-template/.openclaw/
+
+# Generated at build time by `npm run build:workspace-template`; shipped
+# in MissionControl-AdamBuild/ which is already ignored above, but list it
+# explicitly so it can't sneak into the repo from a different path.
+workspace-template.tgz
