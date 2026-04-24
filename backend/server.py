@@ -11,6 +11,8 @@ import os
 import re
 import uuid
 import base64
+import csv
+import io
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -19,6 +21,10 @@ from email.mime.text import MIMEText
 # Keychain. Hard-fail import — the task requires Keychain-only storage.
 import keyring  # noqa: E402
 import keyring.errors  # noqa: E402
+
+# MAN workflow clients (read Keychain via the same service/username convention).
+from integrations import pomanda, cognism, lusha  # noqa: E402
+from workflows import man_workflow  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -398,6 +404,25 @@ class CustomSkillPayload(BaseModel):
     purpose: str
     inputs: str
     outputs: str
+
+
+class ManLeadPayload(BaseModel):
+    name: str
+    number: Optional[str] = None
+    website: Optional[str] = None
+
+
+class ManBatchPayload(BaseModel):
+    leads: list[ManLeadPayload]
+    max: Optional[int] = None
+
+
+class ManSpreadsheetPayload(BaseModel):
+    # JSON upload (not multipart) to avoid the python-multipart dep.
+    # Frontend reads the file client-side with FileReader.readAsText()
+    # and posts the resulting string here.
+    filename: Optional[str] = None
+    csv_content: str
 
 
 # ---------------------------------------------------------------------------
@@ -2402,3 +2427,156 @@ def onboarding_configure(payload: OnboardingPayload):
     _kill_gateway_on_port(GATEWAY_PORT)
 
     return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# MAN identification workflow
+# ---------------------------------------------------------------------------
+#
+# Four endpoints the UI calls to run JSP's Money/Authority/Need flow:
+#   GET  /workflow/man/status              — readiness check (all 3 creds set?)
+#   POST /workflow/man/process-lead        — single company → MAN + contact
+#   POST /workflow/man/process-batch       — up to 200 companies at once
+#   POST /workflow/man/upload-spreadsheet  — CSV → parsed lead rows (preview)
+#
+# All mutating endpoints write a row to audit_log for traceability.
+
+
+def _audit_log_write(
+    action_type: str,
+    action_data: dict,
+    result: dict,
+    success: bool,
+) -> str:
+    """Write a single audit_log row. Mirrors the inline INSERT in /tools/execute."""
+    conn = _db()
+    cur = conn.cursor()
+    audit_id = str(uuid.uuid4())
+    cur.execute(
+        "INSERT INTO audit_log (id, action_type, action_data_json, result_json, success, user) "
+        "VALUES (?, ?, ?, ?, ?, 'adam')",
+        (
+            audit_id,
+            action_type,
+            json.dumps(action_data, default=str),
+            json.dumps(result, default=str),
+            1 if success else 0,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return audit_id
+
+
+def _first_present(keys: list[str], candidates: list[str]) -> Optional[str]:
+    """Pick the first candidate header that appears in `keys` (case-insensitive)."""
+    if not keys:
+        return None
+    direct = {k: k for k in keys}
+    for c in candidates:
+        if c in direct:
+            return direct[c]
+    lower = {k.lower(): k for k in keys}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    return None
+
+
+@app.get("/workflow/man/status")
+def man_status():
+    pomanda_ok = bool(_kc_get("pomanda", "api_key"))
+    cognism_ok = bool(_kc_get("cognism", "api_key"))
+    lusha_ok = bool(_kc_get("lusha", "api_key"))
+    missing = [
+        tid for tid, ok in (
+            ("pomanda", pomanda_ok),
+            ("cognism", cognism_ok),
+            ("lusha", lusha_ok),
+        ) if not ok
+    ]
+    return {
+        "ready": not missing,
+        "pomanda_configured": pomanda_ok,
+        "cognism_configured": cognism_ok,
+        "lusha_configured": lusha_ok,
+        "missing": missing,
+    }
+
+
+@app.post("/workflow/man/process-lead")
+def man_process_lead(payload: ManLeadPayload):
+    company = payload.dict(exclude_none=True)
+    result = man_workflow.process_lead(company)
+    _audit_log_write(
+        "man_process_lead",
+        company,
+        result,
+        success=(result.get("status") == "success"),
+    )
+    return result
+
+
+@app.post("/workflow/man/process-batch")
+def man_process_batch(payload: ManBatchPayload):
+    leads = [l.dict(exclude_none=True) for l in payload.leads]
+    result = man_workflow.process_batch(leads, max_leads=payload.max or 200)
+    _audit_log_write(
+        "man_process_batch",
+        {"count": len(leads), "max": payload.max or 200},
+        {
+            "total": result.get("total"),
+            "truncated": result.get("truncated"),
+            "summary": result.get("summary"),
+            "credits_used": result.get("credits_used"),
+        },
+        success=True,
+    )
+    return result
+
+
+@app.post("/workflow/man/upload-spreadsheet")
+def man_upload_spreadsheet(payload: ManSpreadsheetPayload):
+    """Parse a client-provided CSV string. The UI does the file read with
+    FileReader.readAsText() and posts the raw text here — sidestepping the
+    python-multipart dependency that FastAPI's UploadFile requires."""
+    filename = (payload.filename or "").lower()
+    if filename.endswith(".xlsx") or filename.endswith(".xls"):
+        raise HTTPException(
+            status_code=400,
+            detail="Excel upload is not supported in v1 — please export as CSV.",
+        )
+    text = payload.csv_content or ""
+    # Tolerate a UTF-8 BOM the frontend's FileReader may preserve.
+    if text.startswith("﻿"):
+        text = text.lstrip("﻿")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="CSV content is empty.")
+
+    reader = csv.DictReader(io.StringIO(text))
+    detected = list(reader.fieldnames or [])
+    name_key = _first_present(detected, ["name", "company", "company_name", "Company Name"])
+    num_key = _first_present(detected, ["number", "company_number", "crn", "Company Number"])
+    web_key = _first_present(detected, ["website", "url", "domain", "Website"])
+
+    if not name_key:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV must contain a column named 'name', 'company', or 'company_name'.",
+        )
+
+    leads: list[dict] = []
+    for row in reader:
+        n = (row.get(name_key) or "").strip()
+        if not n:
+            continue
+        leads.append({
+            "name": n,
+            "number": (row.get(num_key) or "").strip() or None if num_key else None,
+            "website": (row.get(web_key) or "").strip() or None if web_key else None,
+        })
+    return {
+        "leads": leads,
+        "detected_columns": detected,
+        "count": len(leads),
+    }
