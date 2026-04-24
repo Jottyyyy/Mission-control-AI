@@ -151,12 +151,20 @@ function startBackend({ onUnexpectedExit } = {}) {
 
   unexpectedExitHandler = onUnexpectedExit || null;
 
+  // MC_PACKAGED tells the backend it's running out of a .app bundle so it can
+  // redirect writable paths (SQLite, etc.) to ~/Library/Application Support.
+  // Without this, Path(__file__).parent.parent resolves inside Resources/app/
+  // which macOS refuses to let us write to.
+  const backendEnv = app.isPackaged
+    ? { ...process.env, PYTHONUNBUFFERED: '1', MC_PACKAGED: '1' }
+    : { ...process.env, PYTHONUNBUFFERED: '1' };
+
   child = spawn(
     python,
     ['-m', 'uvicorn', 'server:app', '--host', BACKEND_HOST, '--port', String(BACKEND_PORT)],
     {
       cwd,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      env: backendEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     }
   );

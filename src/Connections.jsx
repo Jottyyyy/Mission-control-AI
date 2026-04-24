@@ -3,6 +3,10 @@ import Icon from './icons.jsx';
 import { API_BASE } from './SettingsEditor.jsx';
 import { renderMarkdown } from './markdown.jsx';
 
+// Event name duplicated from App.jsx (can't import — would create a cycle
+// through MissionControl). If this string ever changes, update both sides.
+const REOPEN_ONBOARDING_EVENT = "mc:reopen-onboarding";
+
 // --- Catalogue ------------------------------------------------------------
 // Single source of truth for every tool shown in this tab. "ready" tools have
 // a backend /integrations/<id>/* flow and a SKILL.md behind the Manual panel;
@@ -608,6 +612,101 @@ function Welcome({ connectedCount, readyCount, comingSoonCount }) {
   );
 }
 
+// --- AI Provider card -----------------------------------------------------
+// Lives at the top of the left rail so Adam can always see what brain is
+// wired up. Reconfigure re-opens the onboarding flow without a terminal.
+
+function AiProviderCard() {
+  const [status, setStatus] = useState(null); // null = loading
+  const [error, setError] = useState("");
+
+  const load = async () => {
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/onboarding/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setStatus(data);
+    } catch (err) {
+      setError(err?.message || "Couldn't read AI provider status.");
+      setStatus({ configured_provider: null, has_api_key: false, has_gateway_config: false });
+    }
+  };
+
+  useEffect(() => {
+    load();
+    // Refresh when Adam returns from the onboarding flow.
+    const handler = () => load();
+    window.addEventListener(REOPEN_ONBOARDING_EVENT, handler);
+    return () => window.removeEventListener(REOPEN_ONBOARDING_EVENT, handler);
+  }, []);
+
+  const providerLabel =
+    status?.configured_provider === "anthropic"
+      ? "Anthropic"
+      : status?.configured_provider === "openai"
+      ? "OpenAI"
+      : status?.configured_provider === "other"
+      ? "Other"
+      : "Not configured";
+
+  const connected = !!(status?.has_api_key && status?.configured_provider === "anthropic");
+  const model = connected ? "claude-sonnet-4-6" : "—";
+
+  const reconfigure = () => {
+    window.dispatchEvent(new CustomEvent(REOPEN_ONBOARDING_EVENT));
+  };
+
+  return (
+    <div className="px-3 pt-3">
+      <div
+        style={{
+          padding: 12,
+          border: "1px solid var(--border)",
+          borderRadius: 10,
+          background: "var(--bg-elev)",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 11,
+            color: "var(--fg-faint)",
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            marginBottom: 8,
+          }}
+        >
+          AI provider
+        </div>
+        <div className="flex items-center gap-2" style={{ marginBottom: 2 }}>
+          <Icon.Brain className="lucide-sm" style={{ color: connected ? "var(--green)" : "var(--fg-faint)" }} />
+          <span style={{ fontSize: 14, fontWeight: 500, color: "var(--fg)" }}>{providerLabel}</span>
+          {connected && <span className="green-dot" style={{ marginLeft: "auto" }} />}
+        </div>
+        <div style={{ fontSize: 12, color: "var(--fg-muted)", marginBottom: 10 }}>
+          Model: <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{model}</span>
+        </div>
+        {error && (
+          <div style={{ fontSize: 12, color: "var(--danger)", marginBottom: 8 }}>{error}</div>
+        )}
+        <button
+          type="button"
+          onClick={reconfigure}
+          className="btn-secondary"
+          style={{
+            width: "100%",
+            padding: "6px 10px",
+            fontSize: 13,
+            cursor: "pointer",
+          }}
+        >
+          {connected ? "Reconfigure" : "Set up"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // --- Left rail (grouped) --------------------------------------------------
 function ToolRail({ tools, connectedIds, activeId, onSelect, loading }) {
   const connected = tools.filter((t) => connectedIds.has(t.id));
@@ -660,6 +759,7 @@ function ToolRail({ tools, connectedIds, activeId, onSelect, loading }) {
       style={{ width: 240, borderRight: "1px solid var(--border)", background: "var(--bg)" }}
     >
       <div className="flex-1 overflow-y-auto pb-3 flex flex-col">
+        <AiProviderCard />
         {connected.length > 0 && (
           <>
             <Section label="Connected" count={connected.length} />

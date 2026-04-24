@@ -30,11 +30,50 @@ BACKUPS_DIR = WORKSPACE / ".backups"
 STATE_DIR = WORKSPACE / "state"
 STATE_FILE = STATE_DIR / "skills-state.json"
 
-BASE = Path(__file__).parent.parent
-DB_PATH = BASE / "data" / "assistant.db"
-DB_PATH.parent.mkdir(exist_ok=True)
+
+def _resolve_data_dir() -> Path:
+    """Writable data dir. Packaged: ~/Library/Application Support/Mission Control/data.
+    Dev: <repo>/data. Override via MC_DATA_DIR env var.
+
+    Without this, Path(__file__).parent.parent inside a .app bundle points at
+    Resources/app/ which is read-only under macOS Gatekeeper — SQLite writes
+    are silently rejected. See the handoff notes for the bug we're fixing."""
+    override = os.environ.get("MC_DATA_DIR")
+    if override:
+        d = Path(override).expanduser()
+    else:
+        server_dir = Path(__file__).resolve().parent
+        is_packaged = (
+            "Resources/app/backend" in str(server_dir)
+            or os.environ.get("MC_PACKAGED") == "1"
+        )
+        if is_packaged:
+            d = Path.home() / "Library" / "Application Support" / "Mission Control" / "data"
+        else:
+            d = server_dir.parent / "data"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+DATA_DIR = _resolve_data_dir()
+DB_PATH = DATA_DIR / "assistant.db"
 
 OPENCLAW_BIN = "/opt/homebrew/bin/openclaw"
+OPENCLAW_CONFIG_PATH = HOME / ".openclaw" / "openclaw.json"
+GATEWAY_PORT = 18789
+
+# Hydrate ANTHROPIC_API_KEY from the Keychain early so the router (Haiku) and
+# every openclaw subprocess inherits it. The onboarding flow writes the key
+# under service="mission-control-ai", account="anthropic:api_key" (the same
+# {tool_id}:{field} convention the rest of the integrations use). Setting
+# os.environ at import time means the live backend picks up an existing key
+# on every restart.
+try:
+    _kc_anthropic = keyring.get_password("mission-control-ai", "anthropic:api_key")
+    if _kc_anthropic and not os.environ.get("ANTHROPIC_API_KEY"):
+        os.environ["ANTHROPIC_API_KEY"] = _kc_anthropic
+except keyring.errors.KeyringError:
+    pass
 
 # Files the UI is allowed to read AND write via /config/file.
 ALLOWED_CONFIG_PATHS = {
@@ -2068,3 +2107,298 @@ def tools_audit(limit: int = Query(50, ge=1, le=500)):
             "user": r["user"],
         })
     return {"audit": out}
+
+
+# ---------------------------------------------------------------------------
+# Onboarding — first-run gateway configuration.
+# ---------------------------------------------------------------------------
+#
+# The packaged .app lands with no Anthropic key set; chat therefore fails at
+# the OpenClaw gateway. Onboarding is the UI-driven replacement for Adam
+# having to open Terminal and run `openclaw configure --section gateway`.
+#
+# Flow:
+#   1. App boot → GET /onboarding/status
+#   2. If needs_onboarding, UI shows the welcome screen.
+#   3. Adam pastes his key → POST /onboarding/configure
+#      - Store the key in the macOS Keychain (service "mission-control-ai",
+#        account "anthropic:api_key").
+#      - Merge the required fields into ~/.openclaw/openclaw.json atomically
+#        (tempfile + os.replace). Existing unrelated fields are preserved.
+#      - Set os.environ["ANTHROPIC_API_KEY"] so the live backend (and every
+#        openclaw subprocess it spawns) picks up the new key instantly.
+#      - Best-effort: kill any stale gateway on :18789 so the next /chat spins
+#        up a fresh one against the new config.
+#      - Verify by calling the Anthropic /v1/messages endpoint with
+#        max_tokens=1.
+#
+# The key NEVER enters SQLite, logs, or any response body.
+
+# Keychain coordinates for Adam's Anthropic key. Matches the _kc_* helpers'
+# "{tool_id}:{field}" username convention so the key sits alongside the other
+# integration credentials without a separate service name.
+ONBOARDING_TOOL_ID = "anthropic"
+ONBOARDING_FIELD = "api_key"
+ONBOARDING_KEYCHAIN_ACCOUNT = f"{ONBOARDING_TOOL_ID}:{ONBOARDING_FIELD}"
+ANTHROPIC_KEY_RE = re.compile(r"^sk-ant-[A-Za-z0-9_\-]{20,}$")
+DEFAULT_FAST_MODEL = "anthropic/claude-sonnet-4-6"
+
+
+def _read_openclaw_config() -> Optional[dict]:
+    """Return parsed openclaw.json or None if missing/unreadable.
+
+    Never raises — callers treat None as 'not configured' for the purposes of
+    the onboarding check."""
+    if not OPENCLAW_CONFIG_PATH.exists():
+        return None
+    try:
+        return json.loads(OPENCLAW_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _detect_provider_from_config(cfg: Optional[dict]) -> Optional[str]:
+    """Pull the configured provider prefix off agents.defaults.model.primary.
+    Returns 'anthropic' | 'openai' | 'other' | None."""
+    if not cfg:
+        return None
+    try:
+        primary = cfg["agents"]["defaults"]["model"]["primary"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(primary, str) or "/" not in primary:
+        return None
+    prefix = primary.split("/", 1)[0].strip().lower()
+    if prefix == "anthropic":
+        return "anthropic"
+    if prefix == "openai":
+        return "openai"
+    return "other" if prefix else None
+
+
+def _has_gateway_config(cfg: Optional[dict]) -> bool:
+    """Gateway is 'configured' if the section exists with a port + bind."""
+    if not cfg:
+        return False
+    gw = cfg.get("gateway")
+    if not isinstance(gw, dict):
+        return False
+    return bool(gw.get("port")) and bool(gw.get("bind"))
+
+
+@app.get("/onboarding/status")
+def onboarding_status():
+    has_openclaw = os.path.exists(OPENCLAW_BIN)
+    cfg = _read_openclaw_config()
+    has_gateway = _has_gateway_config(cfg)
+    provider = _detect_provider_from_config(cfg)
+    has_key = bool(_kc_get(ONBOARDING_TOOL_ID, ONBOARDING_FIELD))
+
+    needs = (
+        not has_openclaw
+        or not has_gateway
+        or provider != "anthropic"
+        or not has_key
+    )
+    return {
+        "needs_onboarding": needs,
+        "has_openclaw": has_openclaw,
+        "has_gateway_config": has_gateway,
+        "configured_provider": provider,
+        "has_api_key": has_key,
+    }
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON to `path` atomically (tempfile + os.replace, same dir).
+
+    os.replace on macOS/Linux is atomic within a filesystem, so a crash halfway
+    through leaves either the old content or the new — never a truncated blob."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _merge_gateway_config(existing: Optional[dict]) -> dict:
+    """Return a merged openclaw.json with the fields onboarding requires.
+
+    Policy: preserve everything we don't explicitly own; overwrite only the
+    gateway section scaffolding, the model primary, and the anthropic auth
+    profile flag. OpenClaw's wizard/meta sections are left untouched.
+
+    Note on the API key: OpenClaw resolves the Anthropic key via the standard
+    ANTHROPIC_API_KEY env var (confirmed by the existing _invoke_openclaw path
+    which propagates the backend env to the subprocess). We therefore do NOT
+    embed the key inside openclaw.json — the key lives in the Keychain and is
+    pushed into os.environ at backend startup and onboarding time. This keeps
+    openclaw.json git/ops-safe (no secrets on disk)."""
+    cfg: dict = dict(existing) if isinstance(existing, dict) else {}
+
+    # agents.defaults.model.primary → anthropic/claude-sonnet-4-6 (fast brain).
+    agents = cfg.get("agents") if isinstance(cfg.get("agents"), dict) else {}
+    defaults = agents.get("defaults") if isinstance(agents.get("defaults"), dict) else {}
+    model = defaults.get("model") if isinstance(defaults.get("model"), dict) else {}
+    model["primary"] = DEFAULT_FAST_MODEL
+    if "fallbacks" not in model or not isinstance(model["fallbacks"], list):
+        model["fallbacks"] = []
+    defaults["model"] = model
+    agents["defaults"] = defaults
+    cfg["agents"] = agents
+
+    # gateway: local + loopback + token auth on :18789.
+    gw = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
+    gw["mode"] = gw.get("mode") or "local"
+    gw["port"] = GATEWAY_PORT
+    gw["bind"] = "loopback"
+    auth = gw.get("auth") if isinstance(gw.get("auth"), dict) else {}
+    auth["mode"] = "token"
+    if not auth.get("token"):
+        # Fresh install: mint a loopback-only token so OpenClaw's control UI
+        # has something to authenticate internal calls with. Hex-encoded, 48
+        # bytes = 96 hex chars; plenty of entropy.
+        import secrets as _secrets
+        auth["token"] = _secrets.token_hex(24)
+    gw["auth"] = auth
+    cfg["gateway"] = gw
+
+    # auth.profiles.anthropic:default — declare we use api_key auth for
+    # Anthropic. Resolution happens via ANTHROPIC_API_KEY env var at runtime.
+    root_auth = cfg.get("auth") if isinstance(cfg.get("auth"), dict) else {}
+    profiles = root_auth.get("profiles") if isinstance(root_auth.get("profiles"), dict) else {}
+    anth = profiles.get("anthropic:default") if isinstance(profiles.get("anthropic:default"), dict) else {}
+    anth["provider"] = "anthropic"
+    anth["mode"] = "api_key"
+    profiles["anthropic:default"] = anth
+    root_auth["profiles"] = profiles
+    cfg["auth"] = root_auth
+
+    return cfg
+
+
+def _kill_gateway_on_port(port: int) -> None:
+    """Best-effort: kill any python/node process holding `port` so the next
+    chat call gets a fresh gateway that reloads the new config. Swallow all
+    failures — if nothing is listening, lsof exits 1 and we move on."""
+    try:
+        pids_raw = subprocess.check_output(
+            ["/usr/sbin/lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8").strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return
+    for pid_str in pids_raw.split("\n"):
+        try:
+            pid = int(pid_str.strip())
+        except ValueError:
+            continue
+        try:
+            cmd = subprocess.check_output(
+                ["/bin/ps", "-p", str(pid), "-o", "command="],
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8").strip()
+        except (subprocess.CalledProcessError, OSError):
+            continue
+        # Only kill things we recognise as gateway-ish — never hit an
+        # unrelated process that happens to be holding the port.
+        if re.search(r"openclaw|node|python|uvicorn", cmd, re.IGNORECASE):
+            try:
+                os.kill(pid, 15)  # SIGTERM
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
+def _verify_anthropic_key(api_key: str) -> tuple[bool, Optional[str]]:
+    """Call /v1/messages with max_tokens=1 to confirm the key is live.
+
+    Success: HTTP 200 with a message body. Any non-200 returns (False, <msg>).
+    Network failures also return (False, <msg>) so the UI can show something
+    useful rather than hanging."""
+    body = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            if resp.status == 200:
+                return True, None
+            return False, f"Anthropic returned HTTP {resp.status}."
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode("utf-8"))
+            msg = payload.get("error", {}).get("message") if isinstance(payload.get("error"), dict) else None
+        except (ValueError, OSError):
+            msg = None
+        if e.code == 401:
+            return False, "Anthropic rejected the key (401). Double-check it at console.anthropic.com."
+        if e.code == 403:
+            return False, "Key is valid but lacks permission (403). Check billing + org access."
+        return False, msg or f"Anthropic returned HTTP {e.code}."
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return False, f"Couldn't reach Anthropic: {e}"
+
+
+class OnboardingPayload(BaseModel):
+    anthropic_api_key: str
+
+
+@app.post("/onboarding/configure")
+def onboarding_configure(payload: OnboardingPayload):
+    key = (payload.anthropic_api_key or "").strip()
+    # Defensive: reject empty, malformed, or obviously-fake keys client-side
+    # bypasses are common when someone hits the endpoint directly.
+    if not key:
+        raise HTTPException(status_code=400, detail="Missing anthropic_api_key.")
+    if not ANTHROPIC_KEY_RE.match(key):
+        raise HTTPException(
+            status_code=400,
+            detail="That doesn't look like an Anthropic key. They start with 'sk-ant-' and are at least 20 characters.",
+        )
+
+    # 1) Verify the key against Anthropic BEFORE touching disk. If it's dud,
+    #    we don't want to have already rewritten openclaw.json and bounced
+    #    the gateway.
+    ok, err = _verify_anthropic_key(key)
+    if not ok:
+        return {"success": False, "error": err or "Key did not verify."}
+
+    # 2) Store in Keychain. From this point the key exists in the system
+    #    credential store and os.environ — every subsequent openclaw
+    #    subprocess picks it up.
+    try:
+        _kc_set(ONBOARDING_TOOL_ID, ONBOARDING_FIELD, key)
+    except keyring.errors.KeyringError as e:
+        return {"success": False, "error": f"Could not save to Keychain: {e}"}
+    os.environ["ANTHROPIC_API_KEY"] = key
+
+    # 3) Merge + write openclaw.json atomically.
+    try:
+        existing = _read_openclaw_config()
+        merged = _merge_gateway_config(existing)
+        _atomic_write_json(OPENCLAW_CONFIG_PATH, merged)
+    except OSError as e:
+        # Key is in Keychain but config write failed — surface the error but
+        # don't roll back the key (user can hit Reconfigure to retry).
+        return {"success": False, "error": f"Wrote key to Keychain, but config file write failed: {e}"}
+
+    # 4) Best-effort: kick the old gateway so the next /chat starts fresh.
+    _kill_gateway_on_port(GATEWAY_PORT)
+
+    return {"success": True}

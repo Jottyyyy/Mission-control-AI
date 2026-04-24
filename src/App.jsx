@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Data from './data.jsx';
 import Sidebar from './Sidebar.jsx';
 import Dashboard from './Dashboard.jsx';
@@ -6,6 +6,14 @@ import Chat from './Chat.jsx';
 import PipelinePanel from './PipelinePanel.jsx';
 import MissionControl from './MissionControl.jsx';
 import Tweaks from './Tweaks.jsx';
+import Onboarding from './Onboarding.jsx';
+import { API_BASE } from './SettingsEditor.jsx';
+
+// Cross-file signal: Connections → App to re-open onboarding when Adam
+// clicks Reconfigure. Duplicated as a literal in Connections.jsx to avoid
+// an import cycle (App → MissionControl → Connections).
+const REOPEN_ONBOARDING_EVENT = "mc:reopen-onboarding";
+const SKIP_STORAGE_KEY = "adam.onboardingSkipped";
 
 function App() {
   const defaults = window.__TWEAKS || {};
@@ -43,6 +51,52 @@ function App() {
   const [pipelineMinimized, setPipelineMinimized] = useState(false);
 
   const [tweaksOpen, setTweaksOpen] = useState(false);
+
+  // Onboarding gate: "checking" while we poll /onboarding/status on boot.
+  // "show" when the backend says we're unconfigured and the user hasn't
+  // clicked Skip. "hidden" otherwise (main app visible).
+  const [onboardingPhase, setOnboardingPhase] = useState("checking");
+
+  const checkOnboarding = useCallback(async ({ forceReopen = false } = {}) => {
+    if (!forceReopen) {
+      // Honour the skip flag on normal boot — user explicitly deferred setup.
+      try {
+        if (localStorage.getItem(SKIP_STORAGE_KEY) === "1") {
+          setOnboardingPhase("hidden");
+          return;
+        }
+      } catch (_) { /* localStorage denied — fall through */ }
+    }
+    try {
+      const res = await fetch(`${API_BASE}/onboarding/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data?.needs_onboarding || forceReopen) {
+        setOnboardingPhase("show");
+      } else {
+        setOnboardingPhase("hidden");
+      }
+    } catch (_) {
+      // If we can't reach the backend yet (it's still booting), don't flash
+      // onboarding — show the main app and let the chat's own error UI handle
+      // the offline case. A subsequent reload will retry this check.
+      setOnboardingPhase("hidden");
+    }
+  }, []);
+
+  useEffect(() => { checkOnboarding(); }, [checkOnboarding]);
+
+  // MissionControl → Reconfigure dispatches this event; force the welcome
+  // screen open even if the backend still reports configured (e.g. user
+  // wants to rotate keys).
+  useEffect(() => {
+    const handler = () => {
+      try { localStorage.removeItem(SKIP_STORAGE_KEY); } catch (_) {}
+      checkOnboarding({ forceReopen: true });
+    };
+    window.addEventListener(REOPEN_ONBOARDING_EVENT, handler);
+    return () => window.removeEventListener(REOPEN_ONBOARDING_EVENT, handler);
+  }, [checkOnboarding]);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
@@ -162,6 +216,35 @@ function App() {
     screen === "dashboard" ? "Dashboard" :
     screen === "mission" ? "Mission control" :
     Data.assistants[assistantKey].name;
+
+  // While we're still talking to /onboarding/status, render nothing — the
+  // backend takes up to 30s to go healthy on a cold packaged launch and the
+  // main UI would briefly flash "chat broken" if we showed it first.
+  if (onboardingPhase === "checking") {
+    return (
+      <div
+        className="h-full w-full flex items-center justify-center"
+        style={{ background: "var(--bg)", color: "var(--fg-faint)", fontSize: 13 }}
+      >
+        <span className="pulse-dot" style={{ width: 8, height: 8, borderRadius: 999, background: "var(--fg-faint)", display: "inline-block" }} />
+      </div>
+    );
+  }
+
+  if (onboardingPhase === "show") {
+    return (
+      <Onboarding
+        onDone={() => {
+          try { localStorage.removeItem(SKIP_STORAGE_KEY); } catch (_) {}
+          setOnboardingPhase("hidden");
+        }}
+        onSkip={() => {
+          try { localStorage.setItem(SKIP_STORAGE_KEY, "1"); } catch (_) {}
+          setOnboardingPhase("hidden");
+        }}
+      />
+    );
+  }
 
   return (
     <div
