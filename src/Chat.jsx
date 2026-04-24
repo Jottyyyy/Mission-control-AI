@@ -3,6 +3,7 @@ import Data from './data.jsx';
 import Icon from './icons.jsx';
 import { renderMarkdown } from './markdown.jsx';
 import ActionCard, { splitByActionCards } from './ActionCard.jsx';
+import SetupModal from './SetupModal.jsx';
 
 const API_BASE = "http://127.0.0.1:8001";
 
@@ -151,6 +152,13 @@ function Chat({
   const fileInputRef = useRef(null);
   const [dragActive, setDragActive] = useState(false);
   const isMarketing = assistantKey === "marketing";
+
+  // Guided-setup modal. Opens when the user clicks Process all on a card
+  // while one or more of Pomanda/Cognism/Lusha isn't configured.
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [setupMissing, setSetupMissing] = useState(["pomanda", "cognism", "lusha"]);
+  const [setupContext, setSetupContext] = useState("");
+  const [pendingCardId, setPendingCardId] = useState(null);
 
   // Reset messages + input when assistant changes.
   useEffect(() => {
@@ -390,6 +398,25 @@ function Chat({
     const card = messages.find((m) => m.id === cardId);
     if (!card || !card.leads?.length) return;
 
+    // Gate on credentials — open the guided-setup modal if anything is missing.
+    try {
+      const statusRes = await fetch(`${API_BASE}/workflow/man/status`);
+      const s = await statusRes.json();
+      if (!s?.ready) {
+        setSetupMissing(s?.missing || ["pomanda", "cognism", "lusha"]);
+        setSetupContext(`to process ${card.leads.length} lead${card.leads.length === 1 ? "" : "s"}`);
+        setPendingCardId(cardId);
+        setSetupOpen(true);
+        return;
+      }
+    } catch { /* fall through — run anyway; backend handles per-row errors */ }
+
+    await _runFileCardBatch(cardId);
+  };
+
+  const _runFileCardBatch = async (cardId) => {
+    const card = messages.find((m) => m.id === cardId);
+    if (!card || !card.leads?.length) return;
     setMessages((m) => m.map((msg) => msg.id === cardId ? { ...msg, state: "processing" } : msg));
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
@@ -811,6 +838,32 @@ function Chat({
           <span>Pipeline running — in progress</span>
           <Icon.ChevronRight className="lucide-xs" style={{ color: "var(--fg-muted)" }}/>
         </div>
+      )}
+      {isMarketing && (
+        <SetupModal
+          open={setupOpen}
+          onClose={async () => {
+            setSetupOpen(false);
+            const cardId = pendingCardId;
+            setPendingCardId(null);
+            if (!cardId) return;
+            // Let the user know we're proceeding with whatever's configured.
+            try {
+              const res = await fetch(`${API_BASE}/workflow/man/status`);
+              const s = await res.json();
+              if (!s?.ready) {
+                setMessages((m) => [...m, {
+                  from: "assistant",
+                  text: "Processing with available data. You can configure the missing tools later from the Workflows tab for complete results.",
+                }]);
+              }
+            } catch { /* ignored */ }
+            await _runFileCardBatch(cardId);
+          }}
+          onConfigured={() => { /* keep modal open — user can continue the wizard */ }}
+          requiredTools={setupMissing}
+          context={setupContext}
+        />
       )}
     </div>
   );

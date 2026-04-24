@@ -85,6 +85,26 @@ function createWindow() {
     mainWindow.show();
   });
 
+  // Mirror renderer console messages to the main-process stderr so crashes are
+  // visible even when the renderer has white-screened. Also surface unhandled
+  // renderer errors via crashed / did-fail-load.
+  mainWindow.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    const levels = ['log', 'warn', 'error'];
+    process.stderr.write(`[renderer:${levels[level] || level}] ${message}  (${sourceId}:${line})\n`);
+  });
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    process.stderr.write(`[renderer] render-process-gone: ${JSON.stringify(details)}\n`);
+  });
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    process.stderr.write(`[renderer] did-fail-load ${code} ${desc} ${url}\n`);
+  });
+
+  // Auto-open DevTools when MC_DEVTOOLS=1. Keeps packaged builds clean for
+  // Adam but lets us flip it on for debugging.
+  if (process.env.MC_DEVTOOLS === '1' || isDev) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
+
   if (isDev) {
     mainWindow.loadURL(DEV_URL);
   } else {

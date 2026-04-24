@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Icon from './icons.jsx';
 import { API_BASE } from './SettingsEditor.jsx';
+import SetupModal from './SetupModal.jsx';
 
 // ---------------------------------------------------------------------------
 // MAN workflow UI — Sir Adam's primary daily flow.
@@ -47,6 +48,16 @@ export default function Workflows({ initialLeads, initialUploadMeta }) {
   const [processError, setProcessError] = useState("");
   const [results, setResults] = useState(null);
   const [progressIdx, setProgressIdx] = useState(0);
+
+  // Setup modal state. showSetup === true → modal is open.
+  // setupContext frames the reason ("to process N leads" vs "Configure APIs").
+  // pendingProcess === true → a blocked Process click is waiting on the user
+  // to either skip or finish setup, so we can resume immediately.
+  const [showSetup, setShowSetup] = useState(false);
+  const [setupContext, setSetupContext] = useState("");
+  const [setupMissing, setSetupMissing] = useState(["pomanda", "cognism", "lusha"]);
+  const [pendingProcess, setPendingProcess] = useState(false);
+  const [skippedSetupBanner, setSkippedSetupBanner] = useState(false);
 
   const processAbort = useRef(null);
 
@@ -155,8 +166,9 @@ export default function Workflows({ initialLeads, initialUploadMeta }) {
     [leads, selectedIdx]
   );
 
-  const startProcess = async () => {
-    if (!selectedLeads.length) return;
+  // Actually run the batch. Split from startProcess so we can gate on the
+  // setup modal without duplicating the fetch block.
+  const runBatch = async () => {
     setProcessError("");
     setResults(null);
     setProcessing(true);
@@ -193,13 +205,94 @@ export default function Workflows({ initialLeads, initialUploadMeta }) {
     }
   };
 
+  // Click handler for the Run button. Checks credential readiness first —
+  // opens the guided-setup modal if anything is missing, otherwise falls
+  // straight through to runBatch.
+  const startProcess = async () => {
+    if (!selectedLeads.length) return;
+    try {
+      const statusRes = await fetch(`${API_BASE}/workflow/man/status`);
+      const s = await statusRes.json();
+      if (!s?.ready) {
+        setSetupContext(`to process ${selectedLeads.length} lead${selectedLeads.length === 1 ? "" : "s"}`);
+        setSetupMissing(s?.missing || ["pomanda", "cognism", "lusha"]);
+        setPendingProcess(true);
+        setShowSetup(true);
+        return;
+      }
+    } catch {
+      // Fall through — if status check fails we just try the batch; the
+      // backend will surface its own "not configured" errors per row.
+    }
+    await runBatch();
+  };
+
+  const openSetupManually = async () => {
+    try {
+      const statusRes = await fetch(`${API_BASE}/workflow/man/status`);
+      const s = await statusRes.json();
+      setSetupMissing(s?.missing?.length ? s.missing : ["pomanda", "cognism", "lusha"]);
+    } catch {
+      setSetupMissing(["pomanda", "cognism", "lusha"]);
+    }
+    setSetupContext("To run the full verify-and-enrich workflow");
+    setPendingProcess(false);
+    setShowSetup(true);
+  };
+
+  const handleSetupClose = async () => {
+    setShowSetup(false);
+    if (!pendingProcess) return;
+    setPendingProcess(false);
+    // User may have configured something or skipped. Either way, proceed —
+    // backend handles any remaining "not configured" gracefully per-row.
+    try {
+      const res = await fetch(`${API_BASE}/workflow/man/status`);
+      const s = await res.json();
+      if (!s?.ready) setSkippedSetupBanner(true);
+    } catch { /* ignored */ }
+    await runBatch();
+  };
+
+  const handleSetupConfigured = async () => {
+    // Refresh our own status display so the banner updates immediately.
+    try {
+      const res = await fetch(`${API_BASE}/workflow/man/status`);
+      setStatus(await res.json());
+    } catch { /* ignored */ }
+  };
+
   // ---------- Render ----------
 
   return (
     <div className="px-4 sm:px-6 lg:px-8 py-8 overflow-y-auto flex-1">
       <div className="mx-auto w-full" style={{ maxWidth: 1120 }}>
-        <PageHeader />
+        <PageHeader onConfigureClick={openSetupManually} />
         <StatusBanner status={status} error={statusError} />
+        {skippedSetupBanner && (
+          <div
+            className="flex items-center justify-between mb-6"
+            style={{
+              border: "1px solid var(--border)",
+              background: "var(--bg-soft)",
+              borderRadius: 10,
+              padding: "10px 14px",
+              fontSize: 13, color: "var(--fg-muted)", gap: 12,
+            }}
+          >
+            <span>
+              Processing with available data. Configure the missing tools later for complete results.
+            </span>
+            <button
+              className="btn-ghost px-2 py-1"
+              style={{ fontSize: 12, color: "var(--fg-muted)" }}
+              onClick={() => setSkippedSetupBanner(false)}
+              aria-label="Dismiss"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         <UploadSection
           onFile={handleFile}
           uploading={uploading}
@@ -238,6 +331,13 @@ export default function Workflows({ initialLeads, initialUploadMeta }) {
           />
         )}
       </div>
+      <SetupModal
+        open={showSetup}
+        onClose={handleSetupClose}
+        onConfigured={handleSetupConfigured}
+        requiredTools={setupMissing}
+        context={setupContext}
+      />
     </div>
   );
 }
@@ -246,17 +346,29 @@ export default function Workflows({ initialLeads, initialUploadMeta }) {
 // Page header
 // ---------------------------------------------------------------------------
 
-function PageHeader() {
+function PageHeader({ onConfigureClick }) {
   return (
-    <div className="mb-8">
-      <div className="flex items-center gap-3 mb-2">
-        <Icon.Layers className="lucide" style={{ color: "var(--accent)" }} />
-        <h2 style={{ fontSize: 20, fontWeight: 500, margin: 0 }}>MAN identification</h2>
+    <div className="mb-8 flex items-start justify-between" style={{ gap: 16 }}>
+      <div>
+        <div className="flex items-center gap-3 mb-2">
+          <Icon.Layers className="lucide" style={{ color: "var(--accent)" }} />
+          <h2 style={{ fontSize: 20, fontWeight: 500, margin: 0 }}>MAN identification</h2>
+        </div>
+        <p style={{ color: "var(--fg-muted)", fontSize: 14, margin: 0 }}>
+          Upload a Zint batch. We verify each candidate MAN against Pomanda's shareholders,
+          then fill in any missing email or mobile via Cognism (then Lusha).
+        </p>
       </div>
-      <p style={{ color: "var(--fg-muted)", fontSize: 14, margin: 0 }}>
-        Upload a Zint batch. We verify each candidate MAN against Pomanda's shareholders,
-        then fill in any missing email or mobile via Cognism (then Lusha).
-      </p>
+      {onConfigureClick && (
+        <button
+          className="btn-secondary"
+          style={{ fontSize: 13, padding: "8px 14px", display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", flexShrink: 0 }}
+          onClick={onConfigureClick}
+        >
+          <Icon.Key className="lucide-sm" />
+          Configure APIs
+        </button>
+      )}
     </div>
   );
 }

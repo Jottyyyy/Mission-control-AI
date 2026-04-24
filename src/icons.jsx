@@ -47,6 +47,9 @@ import {
   AlertTriangle,
   CheckCircle2,
   Paperclip,
+  Key,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 
 const Icon = {
@@ -98,6 +101,9 @@ const Icon = {
   AlertTriangle,
   CheckCircle2,
   Paperclip,
+  Key,
+  Eye,
+  EyeOff,
 };
 
 export default Icon;
