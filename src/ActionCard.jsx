@@ -330,6 +330,161 @@ function GhlContactBody({ data }) {
   );
 }
 
+// --- GHL update-contact card body ---------------------------------------
+const GHL_UPDATE_LABELS = {
+  firstName: "First name",
+  lastName: "Last name",
+  name: "Name",
+  email: "Email",
+  phone: "Phone",
+  companyName: "Company",
+  address1: "Address",
+  city: "City",
+  state: "State",
+  country: "Country",
+  postalCode: "Postal code",
+  website: "Website",
+  source: "Source",
+  tags: "Tags",
+};
+
+function GhlUpdateContactBody({ data }) {
+  const updates = data && typeof data.updates === "object" ? data.updates : {};
+  const entries = Object.entries(updates);
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>
+        Update GHL contact
+      </div>
+      <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+        <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+          id:{data.contact_id || "?"}
+        </span>
+      </div>
+      {entries.length === 0 ? (
+        <div style={{ fontSize: 12, color: "var(--fg-faint)", fontStyle: "italic" }}>
+          (no fields to change)
+        </div>
+      ) : (
+        <div className="flex flex-col" style={{ gap: 4 }}>
+          {entries.map(([key, value]) => (
+            <div key={key} className="flex gap-3" style={{ alignItems: "baseline" }}>
+              <div
+                style={{
+                  width: 96,
+                  fontSize: 11,
+                  color: "var(--fg-faint)",
+                  letterSpacing: "0.04em",
+                  textTransform: "uppercase",
+                }}
+              >
+                {GHL_UPDATE_LABELS[key] || key}
+              </div>
+              <div style={{ flex: 1, color: "var(--fg)", wordBreak: "break-word" }}>
+                {Array.isArray(value) ? value.join(", ") : String(value)}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- GHL send-message card body ------------------------------------------
+function GhlSendMessageBody({ data }) {
+  const isEmail = data.message_type === "Email";
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div className="flex items-center gap-2">
+        <span
+          style={{
+            fontSize: 11,
+            padding: "2px 8px",
+            borderRadius: 999,
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            color: "var(--fg-muted)",
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+          }}
+        >
+          {isEmail ? "Email" : "SMS"}
+        </span>
+        <span
+          style={{
+            fontSize: 12,
+            color: "var(--fg-muted)",
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          }}
+        >
+          to id:{data.contact_id || "?"}
+        </span>
+      </div>
+      {isEmail && data.subject && <Row label="Subject" value={data.subject} />}
+      <div>
+        <div
+          style={{
+            fontSize: 11,
+            color: "var(--fg-faint)",
+            marginBottom: 4,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+          }}
+        >
+          Message
+        </div>
+        <div
+          style={{
+            whiteSpace: "pre-wrap",
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "8px 10px",
+            lineHeight: 1.55,
+            color: "var(--fg)",
+          }}
+        >
+          {data.body}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- GHL add-note card body ----------------------------------------------
+function GhlAddNoteBody({ data }) {
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div className="flex items-center gap-2">
+        <span style={{ fontSize: 16, fontWeight: 600 }}>Note</span>
+        <span
+          style={{
+            fontSize: 12,
+            color: "var(--fg-muted)",
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          }}
+        >
+          for id:{data.contact_id || "?"}
+        </span>
+      </div>
+      <div
+        style={{
+          whiteSpace: "pre-wrap",
+          background: "rgba(252, 211, 77, 0.10)",
+          border: "1px solid rgba(252, 211, 77, 0.45)",
+          borderRadius: 6,
+          padding: "10px 12px",
+          lineHeight: 1.55,
+          color: "var(--fg)",
+        }}
+      >
+        {data.body}
+      </div>
+    </div>
+  );
+}
+
 // --- Action registry — small so adding new types later is a 1-line change --
 const ACTION_META = {
   "gmail.send": {
@@ -459,10 +614,119 @@ const ACTION_META = {
       );
     },
   },
+  "ghl.update_contact": {
+    icon: Icon.RefreshCw,
+    label: "Update GHL contact",
+    confirmLabel: "Apply update",
+    busyLabel: "Updating…",
+    editPlaceholder: "Tell Jackson what to change (which field, which contact)…",
+    renderBody: (data) => <GhlUpdateContactBody data={data} />,
+    renderSuccess: (data, result) => {
+      const link = result && result.view_link;
+      const fieldCount = data?.updates ? Object.keys(data.updates).length : 0;
+      return (
+        <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+          <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+          GHL contact updated{fieldCount ? ` (${fieldCount} field${fieldCount === 1 ? "" : "s"})` : ""}
+          {link ? (
+            <>
+              {" — "}
+              <a
+                href={link}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--green)", textDecoration: "underline" }}
+              >
+                opens in GHL
+              </a>
+            </>
+          ) : (
+            "."
+          )}
+        </div>
+      );
+    },
+  },
+  "ghl.send_message": {
+    icon: Icon.MessageSquare,
+    label: "Send via GHL",
+    confirmLabel: "Send",
+    busyLabel: "Sending…",
+    editPlaceholder: "Tell Jackson what to change (recipient, tone, content)…",
+    renderBody: (data) => <GhlSendMessageBody data={data} />,
+    renderSuccess: (data, result) => {
+      const link = result && result.view_link;
+      const kind = (result && result.message_type) || data?.message_type || "Message";
+      return (
+        <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+          <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+          {kind} sent via GoHighLevel
+          {link ? (
+            <>
+              {" — "}
+              <a
+                href={link}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--green)", textDecoration: "underline" }}
+              >
+                opens conversation
+              </a>
+            </>
+          ) : (
+            "."
+          )}
+        </div>
+      );
+    },
+  },
+  "ghl.add_note": {
+    icon: Icon.NotebookPen,
+    label: "Add GHL note",
+    confirmLabel: "Add note",
+    busyLabel: "Adding…",
+    editPlaceholder: "Tell Jackson what to change (which contact, the wording)…",
+    renderBody: (data) => <GhlAddNoteBody data={data} />,
+    renderSuccess: (data, result) => {
+      const link = result && result.view_link;
+      return (
+        <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+          <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+          Note attached
+          {link ? (
+            <>
+              {" — "}
+              <a
+                href={link}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--green)", textDecoration: "underline" }}
+              >
+                opens contact in GHL
+              </a>
+            </>
+          ) : (
+            "."
+          )}
+        </div>
+      );
+    },
+  },
+};
+
+// Map an action_type to the integration tool_id whose credentials it needs,
+// plus a human-readable context for the SetupModal subtitle. Used by the
+// pre-confirm banner so Adam sees a "set up first" affordance instead of
+// only finding out at click-time.
+const ACTION_TOOL_REQUIREMENTS = {
+  "ghl.create_contact": { tool: "ghl", context: "to push contacts into GHL" },
+  "ghl.update_contact": { tool: "ghl", context: "to update GHL contacts" },
+  "ghl.send_message":   { tool: "ghl", context: "to send messages via GHL" },
+  "ghl.add_note":       { tool: "ghl", context: "to attach notes in GHL" },
 };
 
 // --- Main card ------------------------------------------------------------
-function ActionCard({ token, onEditRequest }) {
+function ActionCard({ token, onEditRequest, onNeedsSetup }) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [pending, setPending] = useState(null);
@@ -471,6 +735,9 @@ function ActionCard({ token, onEditRequest }) {
   const [editOpen, setEditOpen] = useState(false);
   const [editText, setEditText] = useState("");
   const editRef = useRef(null);
+  // null = unknown (still checking), true = configured, false = needs setup.
+  // Only populated for action types in ACTION_TOOL_REQUIREMENTS.
+  const [toolConfigured, setToolConfigured] = useState(null);
 
   // Load pending row once per token.
   useEffect(() => {
@@ -508,6 +775,30 @@ function ActionCard({ token, onEditRequest }) {
     if (editOpen && editRef.current) editRef.current.focus();
   }, [editOpen]);
 
+  // Pre-flight check: if this action depends on an integration that might be
+  // unconfigured (e.g. GHL), poll its status so the card can render a banner
+  // before Adam clicks Confirm. Only runs for action types we know about.
+  const pendingActionType = pending?.action_type;
+  const requirement = pendingActionType ? ACTION_TOOL_REQUIREMENTS[pendingActionType] : null;
+  useEffect(() => {
+    if (!requirement) {
+      setToolConfigured(null);
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/integrations/${requirement.tool}/status`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (!cancelled) setToolConfigured(!!data.connected);
+      } catch {
+        if (!cancelled) setToolConfigured(null);  // unknown — don't block
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [requirement?.tool, terminal?.kind]);
+
   const confirm = async () => {
     if (busy || terminal) return;
     setBusy(true);
@@ -523,6 +814,11 @@ function ActionCard({ token, onEditRequest }) {
       } else if (data?.success) {
         setTerminal({ kind: "sent", at: new Date().toISOString(), result: data.result });
       } else {
+        // Backend returned a `needs_setup` signal → surface to the parent so
+        // the SetupModal pops, instead of leaving a cryptic error on the card.
+        if (data?.needs_setup && onNeedsSetup) {
+          onNeedsSetup(data.needs_setup);
+        }
         setTerminal({ kind: "error", error: data?.error || `HTTP ${res.status}` });
       }
     } catch (err) {
@@ -704,6 +1000,46 @@ function ActionCard({ token, onEditRequest }) {
               style={{ fontSize: 12 }}
             >
               Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {requirement && toolConfigured === false && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: "8px 10px",
+            background: "rgba(180,67,44,0.06)",
+            border: "1px solid rgba(180,67,44,0.35)",
+            borderRadius: 6,
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 8,
+            fontSize: 12,
+            color: "var(--fg)",
+            lineHeight: 1.5,
+          }}
+        >
+          <Icon.AlertTriangle className="lucide-xs" style={{ color: "var(--danger)", marginTop: 2, flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ color: "var(--fg)" }}>
+              {requirement.tool.toUpperCase()} not configured — clicking confirm will fail.
+            </div>
+            <button
+              type="button"
+              onClick={() => onNeedsSetup?.({ tools: [requirement.tool], context: requirement.context })}
+              className="btn-ghost"
+              style={{
+                marginTop: 4,
+                padding: 0,
+                fontSize: 12,
+                color: "var(--accent)",
+                textDecoration: "underline",
+                cursor: "pointer",
+              }}
+            >
+              Set up {requirement.tool.toUpperCase()} first →
             </button>
           </div>
         </div>

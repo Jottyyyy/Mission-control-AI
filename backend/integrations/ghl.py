@@ -29,6 +29,16 @@ TIMEOUT = 12.0
 RATE_LIMIT_RETRIES = 2  # one initial + retry on 429 with backoff
 RATE_LIMIT_BACKOFF = (1.5, 4.0)  # seconds — tiny because /chat is interactive
 
+# Structured signal returned alongside `error` when GHL credentials are missing.
+# The frontend reads this to auto-open SetupModal instead of showing the raw
+# "GHL not configured" string. `context` is set per-call site so the modal
+# subtitle matches what Jackson was attempting.
+NOT_CONFIGURED_ERROR = "GHL not configured"
+
+
+def _needs_setup(context: str) -> dict:
+    return {"tools": ["ghl"], "context": context}
+
 
 def _get_credentials() -> tuple[Optional[str], Optional[str]]:
     """Return (api_key, location_id). Either may be None when unconfigured."""
@@ -139,7 +149,8 @@ def list_contacts(query: Optional[str] = None, limit: int = 20) -> dict:
     GHL against name/email/phone — empty query lists the most recent."""
     api_key, location_id = _get_credentials()
     if not api_key or not location_id:
-        return {"found": False, "contacts": [], "error": "GHL not configured"}
+        return {"found": False, "contacts": [], "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to search GHL contacts")}
 
     params: dict = {"locationId": location_id, "limit": max(1, min(limit, 100))}
     if query:
@@ -160,7 +171,8 @@ def get_contact(contact_id: str) -> dict:
     """Fetch a single contact by GHL ID."""
     api_key, _location_id = _get_credentials()
     if not api_key:
-        return {"found": False, "contact": None, "error": "GHL not configured"}
+        return {"found": False, "contact": None, "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to fetch a GHL contact")}
     if not contact_id:
         return {"found": False, "contact": None, "error": "Missing contact_id"}
 
@@ -181,7 +193,9 @@ def create_contact(contact_data: dict) -> dict:
     to a different Location."""
     api_key, location_id = _get_credentials()
     if not api_key or not location_id:
-        return {"success": False, "contact_id": None, "contact": None, "error": "GHL not configured"}
+        return {"success": False, "contact_id": None, "contact": None,
+                "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to create a GHL contact")}
 
     payload = {k: v for k, v in (contact_data or {}).items() if v not in (None, "")}
     payload["locationId"] = location_id
@@ -206,7 +220,8 @@ def update_contact(contact_id: str, updates: dict) -> dict:
     """Patch fields on an existing contact."""
     api_key, _location_id = _get_credentials()
     if not api_key:
-        return {"success": False, "contact": None, "error": "GHL not configured"}
+        return {"success": False, "contact": None, "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to update a GHL contact")}
     if not contact_id:
         return {"success": False, "contact": None, "error": "Missing contact_id"}
 
@@ -220,6 +235,45 @@ def update_contact(contact_id: str, updates: dict) -> dict:
 
     raw = body.get("contact") if isinstance(body, dict) else body
     return {"success": True, "contact": _normalise_contact(raw or {}), "error": None}
+
+
+def add_note(contact_id: str, body: str) -> dict:
+    """Attach a note to a GHL contact.
+
+    Notes use the contact-scoped POST /contacts/{id}/notes endpoint. GHL
+    returns the new note as `{note: {id, body, dateAdded, ...}}` on success."""
+    api_key, _location_id = _get_credentials()
+    if not api_key:
+        return {"success": False, "note_id": None, "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to add a note in GHL")}
+    if not contact_id:
+        return {"success": False, "note_id": None, "error": "Missing contact_id"}
+    text = (body or "").strip()
+    if not text:
+        return {"success": False, "note_id": None, "error": "Note body is empty"}
+
+    status, resp = _request(
+        "POST",
+        f"/contacts/{contact_id}/notes",
+        api_key=api_key,
+        body={"body": text},
+    )
+    if status not in (200, 201):
+        return {"success": False, "note_id": None, "error": _err(status, resp)}
+
+    note = resp.get("note") if isinstance(resp, dict) else None
+    if not isinstance(note, dict):
+        note = resp if isinstance(resp, dict) else {}
+    return {
+        "success": True,
+        "note_id": note.get("id"),
+        "note": {
+            "id": note.get("id"),
+            "body": note.get("body") or text,
+            "created_at": note.get("dateAdded") or note.get("createdAt"),
+        },
+        "error": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +303,8 @@ def list_opportunities(pipeline_id: Optional[str] = None, limit: int = 20) -> di
     """List opportunities, optionally filtered by pipeline."""
     api_key, location_id = _get_credentials()
     if not api_key or not location_id:
-        return {"found": False, "opportunities": [], "error": "GHL not configured"}
+        return {"found": False, "opportunities": [], "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to list GHL opportunities")}
 
     params: dict = {"location_id": location_id, "limit": max(1, min(limit, 100))}
     if pipeline_id:
@@ -271,7 +326,9 @@ def create_opportunity(opp_data: dict) -> dict:
     status, monetaryValue, source, pipelineStageId."""
     api_key, location_id = _get_credentials()
     if not api_key or not location_id:
-        return {"success": False, "opportunity_id": None, "error": "GHL not configured"}
+        return {"success": False, "opportunity_id": None,
+                "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to create a GHL opportunity")}
 
     payload = {k: v for k, v in (opp_data or {}).items() if v not in (None, "")}
     payload["locationId"] = location_id
@@ -317,7 +374,8 @@ def list_conversations(contact_id: Optional[str] = None, limit: int = 20) -> dic
     """List conversations in the Location, optionally narrowed to one contact."""
     api_key, location_id = _get_credentials()
     if not api_key or not location_id:
-        return {"found": False, "conversations": [], "error": "GHL not configured"}
+        return {"found": False, "conversations": [], "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to list GHL conversations")}
 
     params: dict = {"locationId": location_id, "limit": max(1, min(limit, 100))}
     if contact_id:
@@ -338,7 +396,8 @@ def get_conversation_messages(conversation_id: str) -> dict:
     """Return the message thread for one conversation."""
     api_key, _location_id = _get_credentials()
     if not api_key:
-        return {"found": False, "messages": [], "error": "GHL not configured"}
+        return {"found": False, "messages": [], "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to read a GHL conversation")}
     if not conversation_id:
         return {"found": False, "messages": [], "error": "Missing conversation_id"}
 
@@ -365,6 +424,58 @@ def get_conversation_messages(conversation_id: str) -> dict:
     return {"found": bool(msgs), "messages": msgs, "error": None}
 
 
+_VALID_MESSAGE_TYPES = {"SMS", "Email"}
+
+
+def send_message(
+    contact_id: str,
+    message_type: str,
+    body: str,
+    subject: Optional[str] = None,
+) -> dict:
+    """Send an outbound SMS or Email via the GHL conversations API.
+
+    GHL's V2 endpoint is `POST /conversations/messages`. The body needs
+    `type`, `contactId`, and `message`; `subject` is required for Email.
+    On success the response carries a `messageId` and the resolved
+    `conversationId`."""
+    api_key, _location_id = _get_credentials()
+    if not api_key:
+        return {"success": False, "message_id": None, "conversation_id": None,
+                "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to send a message via GHL")}
+    if not contact_id:
+        return {"success": False, "message_id": None, "conversation_id": None, "error": "Missing contact_id"}
+    if message_type not in _VALID_MESSAGE_TYPES:
+        return {"success": False, "message_id": None, "conversation_id": None,
+                "error": f"message_type must be one of {sorted(_VALID_MESSAGE_TYPES)}"}
+    text = (body or "").strip()
+    if not text:
+        return {"success": False, "message_id": None, "conversation_id": None, "error": "Message body is empty"}
+    if message_type == "Email" and not (subject or "").strip():
+        return {"success": False, "message_id": None, "conversation_id": None, "error": "Email requires a subject"}
+
+    payload: dict = {
+        "type": message_type,
+        "contactId": contact_id,
+        "message": text,
+    }
+    if message_type == "Email":
+        payload["subject"] = subject.strip()
+        payload["html"] = text  # GHL accepts plain text in `html` for simple sends.
+
+    status, resp = _request("POST", "/conversations/messages", api_key=api_key, body=payload)
+    if status not in (200, 201):
+        return {"success": False, "message_id": None, "conversation_id": None, "error": _err(status, resp)}
+
+    return {
+        "success": True,
+        "message_id": resp.get("messageId") or resp.get("id"),
+        "conversation_id": resp.get("conversationId"),
+        "error": None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Calendars
 # ---------------------------------------------------------------------------
@@ -373,7 +484,8 @@ def list_calendars() -> dict:
     """List calendars attached to the configured Location."""
     api_key, location_id = _get_credentials()
     if not api_key or not location_id:
-        return {"found": False, "calendars": [], "error": "GHL not configured"}
+        return {"found": False, "calendars": [], "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to list GHL calendars")}
 
     status, body = _request("GET", "/calendars/", api_key=api_key, params={"locationId": location_id})
     if status != 200:
@@ -399,7 +511,8 @@ def list_calendar_events(
     """List events on one calendar between optional ISO start/end."""
     api_key, location_id = _get_credentials()
     if not api_key or not location_id:
-        return {"found": False, "events": [], "error": "GHL not configured"}
+        return {"found": False, "events": [], "error": NOT_CONFIGURED_ERROR,
+                "needs_setup": _needs_setup("to list GHL calendar events")}
     if not calendar_id:
         return {"found": False, "events": [], "error": "Missing calendar_id"}
 
@@ -441,9 +554,11 @@ def verify_credentials() -> dict:
        warning?: str}"""
     api_key, location_id = _get_credentials()
     if not api_key:
-        return {"success": False, "error": "API key not configured"}
+        return {"success": False, "error": "API key not configured",
+                "needs_setup": _needs_setup("to verify GHL credentials")}
     if not location_id:
-        return {"success": False, "error": "Location ID not configured"}
+        return {"success": False, "error": "Location ID not configured",
+                "needs_setup": _needs_setup("to verify GHL credentials")}
 
     warning = None
     if not api_key.startswith("pit-"):

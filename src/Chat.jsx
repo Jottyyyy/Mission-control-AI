@@ -153,18 +153,50 @@ function Chat({
   const [dragActive, setDragActive] = useState(false);
   const isMarketing = assistantKey === "marketing";
 
-  // Guided-setup modal. Opens when the user clicks Process all on a card
-  // while one or more of Pomanda/Cognism/Lusha isn't configured.
+  // Guided-setup modal. Two trigger paths:
+  //   1. Marketing: Adam clicks Process all without Pomanda/Cognism/Lusha →
+  //      pre-batch credential check.
+  //   2. Either chat: Jackson attempts a tool call, backend returns a
+  //      `needs_setup` signal in /chat or /tools/execute → modal pops up so
+  //      Adam can configure on the spot.
   const [setupOpen, setSetupOpen] = useState(false);
   const [setupMissing, setSetupMissing] = useState(["pomanda", "cognism", "lusha"]);
   const [setupContext, setSetupContext] = useState("");
   const [pendingCardId, setPendingCardId] = useState(null);
+  // Per-conversation set of tools Adam has already declined to set up — once
+  // dismissed, we don't re-pop the modal for the same tool until he resets the
+  // chat. Pure UI state; doesn't persist past page reload.
+  const [declinedSetups, setDeclinedSetups] = useState(() => new Set());
 
   // Reset messages + input when assistant changes.
   useEffect(() => {
     setMessages([]);
     setConfirmReset(false);
+    setDeclinedSetups(new Set());
   }, [assistantKey]);
+
+  // New conversation → clear per-conversation declined-setups so a fresh
+  // chat can re-prompt for the same tool if Jackson hits the same wall.
+  useEffect(() => {
+    setDeclinedSetups(new Set());
+  }, [activeConversationUuid]);
+
+  // Trigger the SetupModal from a backend `needs_setup` signal. Returns true
+  // when the modal was opened (so the caller can swap a generic error message
+  // for a friendlier "let me show you how" line).
+  const maybeTriggerSetup = (needs_setup) => {
+    if (!needs_setup) return false;
+    const tools = Array.isArray(needs_setup.tools) ? needs_setup.tools.filter(Boolean) : [];
+    if (tools.length === 0) return false;
+    // Skip if every tool was already declined this conversation.
+    const fresh = tools.filter((t) => !declinedSetups.has(t));
+    if (fresh.length === 0) return false;
+    setSetupMissing(fresh);
+    setSetupContext(needs_setup.context || "to use that tool");
+    setPendingCardId(null);
+    setSetupOpen(true);
+    return true;
+  };
 
   // Load conversation whenever the selected uuid changes.
   useEffect(() => {
@@ -277,6 +309,9 @@ function Chat({
         setActiveConversationUuid(data.conversation_id);
         updateUrl(data.conversation_id);
       }
+
+      // Backend told us a tool needs configuring → pop SetupModal.
+      maybeTriggerSetup(data.needs_setup);
     } catch (err) {
       let text;
       if (err && err.name === "AbortError") {
@@ -686,6 +721,7 @@ function Chat({
                             key={`m-${i}-c-${j}-${piece.token}`}
                             token={piece.token}
                             onEditRequest={(text) => handleSend(text)}
+                            onNeedsSetup={maybeTriggerSetup}
                           />
                         ) : (
                           <React.Fragment key={`m-${i}-t-${j}`}>
@@ -839,32 +875,66 @@ function Chat({
           <Icon.ChevronRight className="lucide-xs" style={{ color: "var(--fg-muted)" }}/>
         </div>
       )}
-      {isMarketing && (
-        <SetupModal
-          open={setupOpen}
-          onClose={async () => {
-            setSetupOpen(false);
-            const cardId = pendingCardId;
-            setPendingCardId(null);
-            if (!cardId) return;
-            // Let the user know we're proceeding with whatever's configured.
-            try {
-              const res = await fetch(`${API_BASE}/workflow/man/status`);
-              const s = await res.json();
-              if (!s?.ready) {
-                setMessages((m) => [...m, {
-                  from: "assistant",
-                  text: "Processing with available data. You can configure the missing tools later from the Workflows tab for complete results.",
-                }]);
-              }
-            } catch { /* ignored */ }
+      <SetupModal
+        open={setupOpen}
+        onClose={async () => {
+          setSetupOpen(false);
+          const cardId = pendingCardId;
+          setPendingCardId(null);
+
+          // Re-check what's still missing so we can be specific in the message
+          // and remember which tools Adam decided not to configure.
+          let stillMissing = [];
+          try {
+            const res = await fetch(`${API_BASE}/workflow/man/status`);
+            const s = await res.json();
+            stillMissing = setupMissing.filter((t) => {
+              if (t === "ghl") return !s?.ghl_configured;
+              if (t === "pomanda") return !s?.pomanda_configured;
+              if (t === "cognism") return !s?.cognism_configured;
+              if (t === "lusha") return !s?.lusha_configured;
+              return false;
+            });
+          } catch { /* ignored — fall through to unknown state */ }
+
+          if (cardId) {
+            // Marketing pre-batch path: nudge that we're proceeding with what
+            // Adam has, then run the batch.
+            if (stillMissing.length > 0) {
+              setMessages((m) => [...m, {
+                from: "assistant",
+                text: "Processing with available data. You can configure the missing tools later from the Workflows tab for complete results.",
+              }]);
+            }
             await _runFileCardBatch(cardId);
-          }}
-          onConfigured={() => { /* keep modal open — user can continue the wizard */ }}
-          requiredTools={setupMissing}
-          context={setupContext}
-        />
-      )}
+            return;
+          }
+
+          // Chat-triggered path: leave a friendly trail so Adam knows the
+          // conversation isn't stuck, and remember which tools he skipped so
+          // we don't keep popping the modal in this conversation.
+          if (stillMissing.length > 0) {
+            setDeclinedSetups((prev) => {
+              const next = new Set(prev);
+              stillMissing.forEach((t) => next.add(t));
+              return next;
+            });
+            setMessages((m) => [...m, {
+              from: "assistant",
+              text: `No problem — let me know when you're ready to set ${stillMissing.length === 1 ? stillMissing[0].toUpperCase() : "those tools"} up.`,
+            }]);
+          } else {
+            // Everything Adam was asked to configure is now connected.
+            setMessages((m) => [...m, {
+              from: "assistant",
+              text: "Connected. Try that again whenever you're ready.",
+            }]);
+          }
+        }}
+        onConfigured={() => { /* keep modal open — user can continue the wizard */ }}
+        requiredTools={setupMissing}
+        context={setupContext}
+      />
     </div>
   );
 }

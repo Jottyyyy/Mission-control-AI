@@ -682,8 +682,9 @@ def chat(req: ChatRequest):
 
         # Action-marker post-processing. Setup mode never emits actions —
         # it's a credential walk-through, nothing to execute on Adam's behalf.
+        needs_setup: Optional[dict] = None
         if effective_mode != "setup":
-            reply = _extract_and_register_actions(reply, conv_uuid, cur)
+            reply, needs_setup = _extract_and_register_actions(reply, conv_uuid, cur)
 
         cur.execute(
             "INSERT INTO messages (conversation_id, role, content, model_used) VALUES (?, ?, ?, ?)",
@@ -696,12 +697,15 @@ def chat(req: ChatRequest):
         conn.commit()
         conn.close()
 
-        return {
+        response: dict = {
             "reply": reply,
             "mode": effective_mode,
             "conversation_id": conv_uuid,
             "model_used": model_used,
         }
+        if needs_setup:
+            response["needs_setup"] = needs_setup
+        return response
 
     except subprocess.TimeoutExpired:
         conn.close()
@@ -1762,12 +1766,124 @@ def _validate_ghl_create_contact(data: dict) -> tuple[Optional[dict], Optional[s
     return normalised, None
 
 
+# Allowed update fields on a GHL contact. Anything else is dropped silently
+# rather than rejected outright — keeps Jackson's hallucinations safe instead
+# of making them surface as a confusing validation error to Adam.
+_GHL_CONTACT_UPDATE_FIELDS = {
+    "firstName", "lastName", "name", "email", "phone", "companyName",
+    "address1", "city", "state", "country", "postalCode", "website",
+    "source",
+}
+
+_GHL_CONTACT_UPDATE_ALIASES = {
+    "first_name": "firstName",
+    "last_name": "lastName",
+    "company": "companyName",
+    "company_name": "companyName",
+    "postal_code": "postalCode",
+}
+
+
+def _validate_ghl_update_contact(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Validate args for `ghl.update_contact`.
+
+    Required: contact_id, plus an `updates` dict carrying at least one
+    allowed field. We translate snake_case aliases (`first_name` →
+    `firstName`) so Jackson can emit either shape."""
+    contact_id = (data.get("contact_id") or data.get("contactId") or "").strip()
+    if not contact_id:
+        return None, "Missing 'contact_id'."
+
+    updates_raw = data.get("updates")
+    if not isinstance(updates_raw, dict) or not updates_raw:
+        return None, "Missing or empty 'updates'."
+
+    cleaned: dict = {}
+    for key, value in updates_raw.items():
+        canonical = _GHL_CONTACT_UPDATE_ALIASES.get(key, key)
+        if canonical not in _GHL_CONTACT_UPDATE_FIELDS:
+            continue
+        if isinstance(value, str) and value.strip():
+            cleaned[canonical] = value.strip()
+
+    tags = updates_raw.get("tags")
+    if isinstance(tags, list):
+        tag_list = [t.strip() for t in tags if isinstance(t, str) and t.strip()]
+        if tag_list:
+            cleaned["tags"] = tag_list
+
+    if cleaned.get("email") and not _EMAIL_RE.match(cleaned["email"]):
+        return None, f"Invalid email: {cleaned['email']!r}."
+
+    if not cleaned:
+        return None, "No supported fields in 'updates'."
+
+    return {"contact_id": contact_id, "updates": cleaned}, None
+
+
+def _validate_ghl_send_message(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Validate args for `ghl.send_message`.
+
+    Required: contact_id, message_type ('SMS' or 'Email'), body. Subject is
+    required for Email and rejected (silently dropped) on SMS so Jackson
+    can't accidentally leak a draft subject into a text message."""
+    contact_id = (data.get("contact_id") or data.get("contactId") or "").strip()
+    if not contact_id:
+        return None, "Missing 'contact_id'."
+
+    mtype = (data.get("message_type") or data.get("type") or "").strip()
+    if mtype.lower() == "sms":
+        mtype = "SMS"
+    elif mtype.lower() == "email":
+        mtype = "Email"
+    if mtype not in ("SMS", "Email"):
+        return None, "message_type must be 'SMS' or 'Email'."
+
+    body = (data.get("body") or data.get("message") or "").strip()
+    if not body:
+        return None, "Missing 'body'."
+    if len(body) > 5000:
+        return None, "Body exceeds 5000 characters."
+
+    normalised: dict = {
+        "contact_id": contact_id,
+        "message_type": mtype,
+        "body": body,
+    }
+
+    if mtype == "Email":
+        subject = (data.get("subject") or "").strip()
+        if not subject:
+            return None, "Email requires a 'subject'."
+        normalised["subject"] = subject
+
+    return normalised, None
+
+
+def _validate_ghl_add_note(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Validate args for `ghl.add_note`. Required: contact_id + non-empty body."""
+    contact_id = (data.get("contact_id") or data.get("contactId") or "").strip()
+    if not contact_id:
+        return None, "Missing 'contact_id'."
+
+    body = (data.get("body") or data.get("note") or "").strip()
+    if not body:
+        return None, "Missing 'body'."
+    if len(body) > 5000:
+        return None, "Body exceeds 5000 characters."
+
+    return {"contact_id": contact_id, "body": body}, None
+
+
 _ACTION_VALIDATORS = {
     "gmail.send": _validate_gmail_send,
     "calendar.create_event": _validate_calendar_create_event,
     "drive.create_doc": _validate_drive_create_doc,
     "contacts.create": _validate_contacts_create,
     "ghl.create_contact": _validate_ghl_create_contact,
+    "ghl.update_contact": _validate_ghl_update_contact,
+    "ghl.send_message": _validate_ghl_send_message,
+    "ghl.add_note": _validate_ghl_add_note,
 }
 
 
@@ -1781,30 +1897,208 @@ def _expire_old_pending_actions(cur: sqlite3.Cursor) -> None:
     )
 
 
-def _extract_and_register_actions(reply: str, conv_uuid: Optional[str], cur: sqlite3.Cursor) -> str:
-    """Walk Jackson's reply, turn each valid ```action:<type>``` block into
-    a pending_actions row, and replace it with [[action-card:<token>]].
+# ---------------------------------------------------------------------------
+# Read-only actions — execute inline, no confirmation card.
+# ---------------------------------------------------------------------------
+#
+# `action:ghl.search_contacts`, `action:ghl.list_*` and similar lookups don't
+# touch GHL state. There's no value in routing them through the pending_action
+# table — Adam doesn't need to confirm a search. Instead, the marker parser
+# executes them immediately and replaces the marker with a small markdown
+# block that becomes part of Jackson's reply (and therefore part of the
+# conversation history Jackson reads on the next turn — that's how he gets
+# from "find Sarah" to "send Sarah a message").
+#
+# A read handler returns the substitute markdown string. Failures still
+# produce a string ("> Couldn't reach GHL: …") rather than crashing the
+# whole reply — leaving the marker behind would confuse Adam.
+
+def _truncate(text: Optional[str], n: int = 80) -> str:
+    s = (text or "").strip().replace("\n", " ")
+    return (s[: n - 1] + "…") if len(s) > n else s
+
+
+# Each read handler returns (markdown, needs_setup_or_None). The text is
+# spliced into Jackson's reply; needs_setup (when present) bubbles up to the
+# /chat response so the frontend can auto-open SetupModal.
+def _read_ghl_search_contacts(args: dict) -> tuple[str, Optional[dict]]:
+    query = (args.get("query") or "").strip()
+    try:
+        limit = int(args.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 50))
+    res = ghl.list_contacts(query=query or None, limit=limit)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        msg = (
+            "> _GHL isn't connected yet — I'll show you how to set it up._"
+            if needs
+            else f"> _GHL search failed: {res['error']}_"
+        )
+        return msg, needs
+    contacts = res.get("contacts") or []
+    if not contacts:
+        return f"> _No GHL contacts found for `{query or '(any)'}`._", None
+    lines = [f"**GHL contacts matching `{query}`** ({len(contacts)}):" if query
+             else f"**Recent GHL contacts** ({len(contacts)}):"]
+    for c in contacts:
+        nm = c.get("name") or " ".join(filter(None, [c.get("first_name"), c.get("last_name")])).strip() or "(no name)"
+        bits = [b for b in (c.get("email"), c.get("phone"), c.get("company")) if b]
+        meta = " · ".join(bits)
+        lines.append(f"- **{nm}** — {meta or '_no contact info_'} `id:{c.get('id')}`")
+    return "\n".join(lines), None
+
+
+def _read_ghl_list_opportunities(args: dict) -> tuple[str, Optional[dict]]:
+    pipeline_id = args.get("pipeline_id") or None
+    try:
+        limit = int(args.get("limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 50))
+    res = ghl.list_opportunities(pipeline_id=pipeline_id, limit=limit)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        msg = (
+            "> _GHL isn't connected yet — I'll show you how to set it up._"
+            if needs
+            else f"> _GHL opportunities lookup failed: {res['error']}_"
+        )
+        return msg, needs
+    opps = res.get("opportunities") or []
+    if not opps:
+        return "> _No GHL opportunities found._", None
+    lines = [f"**GHL opportunities** ({len(opps)}):"]
+    for o in opps:
+        money = o.get("monetary_value")
+        money_str = f"£{money:,.0f}" if isinstance(money, (int, float)) else ""
+        contact = o.get("contact_name") or ""
+        status = o.get("status") or ""
+        bits = " · ".join(filter(None, [contact, status, money_str]))
+        lines.append(f"- **{o.get('name') or '(unnamed)'}** {('— ' + bits) if bits else ''} `id:{o.get('id')}`")
+    return "\n".join(lines), None
+
+
+def _read_ghl_list_conversations(args: dict) -> tuple[str, Optional[dict]]:
+    contact_id = args.get("contact_id") or None
+    try:
+        limit = int(args.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 50))
+    res = ghl.list_conversations(contact_id=contact_id, limit=limit)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        msg = (
+            "> _GHL isn't connected yet — I'll show you how to set it up._"
+            if needs
+            else f"> _GHL conversations lookup failed: {res['error']}_"
+        )
+        return msg, needs
+    convos = res.get("conversations") or []
+    if not convos:
+        return "> _No GHL conversations found._", None
+    lines = [f"**Recent GHL conversations** ({len(convos)}):"]
+    for c in convos:
+        nm = c.get("contact_name") or "(unknown)"
+        last = _truncate(c.get("last_message_body"), 100) or "_(empty)_"
+        unread = c.get("unread_count") or 0
+        unread_tag = f" · {unread} unread" if unread else ""
+        lines.append(f"- **{nm}**{unread_tag}: {last} `id:{c.get('id')}`")
+    return "\n".join(lines), None
+
+
+def _read_ghl_list_calendar_events(args: dict) -> tuple[str, Optional[dict]]:
+    calendar_id = (args.get("calendar_id") or "").strip()
+    start = args.get("start")
+    end = args.get("end")
+    if not calendar_id:
+        cal_res = ghl.list_calendars()
+        if cal_res.get("needs_setup"):
+            return "> _GHL isn't connected yet — I'll show you how to set it up._", cal_res["needs_setup"]
+        cals = cal_res.get("calendars") or []
+        if not cals:
+            return "> _No GHL calendars configured._", None
+        calendar_id = cals[0]["id"]
+    res = ghl.list_calendar_events(calendar_id, start=start, end=end)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        msg = (
+            "> _GHL isn't connected yet — I'll show you how to set it up._"
+            if needs
+            else f"> _GHL calendar lookup failed: {res['error']}_"
+        )
+        return msg, needs
+    events = res.get("events") or []
+    if not events:
+        return "> _No GHL events in that range._", None
+    lines = [f"**GHL events** ({len(events)}):"]
+    for e in events:
+        rng = " → ".join(filter(None, [e.get("start"), e.get("end")]))
+        lines.append(f"- **{e.get('title') or '(untitled)'}** — {rng or '_no time_'} `id:{e.get('id')}`")
+    return "\n".join(lines), None
+
+
+_READ_ACTION_HANDLERS = {
+    "ghl.search_contacts": _read_ghl_search_contacts,
+    "ghl.list_opportunities": _read_ghl_list_opportunities,
+    "ghl.list_conversations": _read_ghl_list_conversations,
+    "ghl.list_calendar_events": _read_ghl_list_calendar_events,
+}
+
+
+def _extract_and_register_actions(
+    reply: str,
+    conv_uuid: Optional[str],
+    cur: sqlite3.Cursor,
+) -> tuple[str, Optional[dict]]:
+    """Walk Jackson's reply, dispatch each ```action:<type>``` block.
+
+    Read-only types (`ghl.search_contacts`, `ghl.list_*`) execute inline and
+    are replaced with a markdown summary. Write types create a pending_actions
+    row and become `[[action-card:<token>]]`.
+
+    Returns `(rewritten_reply, needs_setup_or_None)`. When any read handler
+    detects missing credentials, the first such signal is bubbled up so the
+    /chat endpoint can echo it back and the frontend can pop SetupModal.
 
     Invalid JSON or unknown type → marker stays in place (no row created).
     This keeps hallucinations harmless: without a row, the UI can't render
     a card and Adam can't confirm a ghost action."""
     if not reply or "```action:" not in reply:
-        return reply
+        return reply, None
 
     _expire_old_pending_actions(cur)
+
+    needs_setup_signals: list[dict] = []
 
     def replace(match: re.Match) -> str:
         action_type = match.group(1).strip()
         raw_json = match.group(2).strip()
-        validator = _ACTION_VALIDATORS.get(action_type)
-        if not validator:
-            return match.group(0)  # leave untouched — unknown action type
+
+        # Parse JSON once and reuse for either path.
         try:
-            data = json.loads(raw_json)
+            data = json.loads(raw_json) if raw_json else {}
         except (ValueError, TypeError):
             return match.group(0)
         if not isinstance(data, dict):
             return match.group(0)
+
+        # Read-only fast path — no validator, no pending row, no confirmation.
+        read_handler = _READ_ACTION_HANDLERS.get(action_type)
+        if read_handler:
+            try:
+                text, needs = read_handler(data)
+            except Exception as exc:  # noqa: BLE001
+                return f"> _GHL read failed: {exc}_"
+            if needs:
+                needs_setup_signals.append(needs)
+            return text
+
+        validator = _ACTION_VALIDATORS.get(action_type)
+        if not validator:
+            return match.group(0)  # leave untouched — unknown action type
         normalised, err = validator(data)
         if err or normalised is None:
             return match.group(0)
@@ -1819,7 +2113,30 @@ def _extract_and_register_actions(reply: str, conv_uuid: Optional[str], cur: sql
         )
         return f"[[action-card:{token}]]"
 
-    return _ACTION_MARKER_RE.sub(replace, reply)
+    rewritten = _ACTION_MARKER_RE.sub(replace, reply)
+    needs_setup = _merge_needs_setup(needs_setup_signals) if needs_setup_signals else None
+    return rewritten, needs_setup
+
+
+def _merge_needs_setup(signals: list[dict]) -> Optional[dict]:
+    """Combine multiple read-handler needs_setup payloads into one.
+
+    De-dupes the tools list while preserving order. Uses the first signal's
+    `context` — multiple read actions for the same tool in one reply are
+    rare, and the first context is the most representative."""
+    if not signals:
+        return None
+    tools: list[str] = []
+    seen: set[str] = set()
+    for s in signals:
+        for t in s.get("tools") or []:
+            if t and t not in seen:
+                tools.append(t)
+                seen.add(t)
+    if not tools:
+        return None
+    context = signals[0].get("context") or ""
+    return {"tools": tools, "context": context}
 
 
 # -- Executors --------------------------------------------------------------
@@ -2093,7 +2410,66 @@ def _execute_ghl_create_contact(action_data: dict) -> tuple[bool, dict]:
             "contact": result.get("contact"),
             "view_link": view_link,
         }
-    return False, {"error": result.get("error") or "GHL create_contact failed."}
+    return False, _failure(result, "GHL create_contact failed.")
+
+
+def _ghl_view_link(contact_id: Optional[str]) -> Optional[str]:
+    """Build a deep link into Adam's GHL UI for a contact."""
+    location_id = _kc_get("ghl", "location_id") or ""
+    if not contact_id or not location_id:
+        return None
+    return f"https://app.gohighlevel.com/v2/location/{location_id}/contacts/detail/{contact_id}"
+
+
+def _failure(result: dict, fallback: str) -> dict:
+    """Build a uniform executor failure dict. Forwards `needs_setup` from
+    the integration client when present so /tools/execute can pop SetupModal
+    instead of just showing the raw error string."""
+    out = {"error": result.get("error") or fallback}
+    if result.get("needs_setup"):
+        out["needs_setup"] = result["needs_setup"]
+    return out
+
+
+def _execute_ghl_update_contact(action_data: dict) -> tuple[bool, dict]:
+    contact_id = action_data["contact_id"]
+    result = ghl.update_contact(contact_id, action_data["updates"])
+    if result.get("success"):
+        return True, {
+            "contact_id": contact_id,
+            "contact": result.get("contact"),
+            "view_link": _ghl_view_link(contact_id),
+        }
+    return False, _failure(result, "GHL update_contact failed.")
+
+
+def _execute_ghl_send_message(action_data: dict) -> tuple[bool, dict]:
+    result = ghl.send_message(
+        contact_id=action_data["contact_id"],
+        message_type=action_data["message_type"],
+        body=action_data["body"],
+        subject=action_data.get("subject"),
+    )
+    if result.get("success"):
+        return True, {
+            "message_id": result.get("message_id"),
+            "conversation_id": result.get("conversation_id"),
+            "message_type": action_data["message_type"],
+            "view_link": _ghl_view_link(action_data["contact_id"]),
+        }
+    return False, _failure(result, "GHL send_message failed.")
+
+
+def _execute_ghl_add_note(action_data: dict) -> tuple[bool, dict]:
+    result = ghl.add_note(action_data["contact_id"], action_data["body"])
+    if result.get("success"):
+        return True, {
+            "note_id": result.get("note_id"),
+            "note": result.get("note"),
+            "contact_id": action_data["contact_id"],
+            "view_link": _ghl_view_link(action_data["contact_id"]),
+        }
+    return False, _failure(result, "GHL add_note failed.")
 
 
 _EXECUTORS = {
@@ -2102,6 +2478,9 @@ _EXECUTORS = {
     "drive.create_doc": _execute_drive_create_doc,
     "contacts.create": _execute_contacts_create,
     "ghl.create_contact": _execute_ghl_create_contact,
+    "ghl.update_contact": _execute_ghl_update_contact,
+    "ghl.send_message": _execute_ghl_send_message,
+    "ghl.add_note": _execute_ghl_add_note,
 }
 
 
@@ -2202,12 +2581,17 @@ def tools_execute(payload: ExecutePayload):
     conn.commit()
     conn.close()
 
-    return {
+    response: dict = {
         "success": success,
         "result": result if success else None,
         "error": result.get("error") if not success else None,
         "audit_id": audit_id,
     }
+    # `needs_setup` only appears on credential-missing failures — the frontend
+    # uses it to auto-open SetupModal in place of the generic error message.
+    if not success and isinstance(result, dict) and result.get("needs_setup"):
+        response["needs_setup"] = result["needs_setup"]
+    return response
 
 
 @app.post("/tools/cancel/{token}")

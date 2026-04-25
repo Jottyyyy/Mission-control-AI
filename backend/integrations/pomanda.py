@@ -29,7 +29,11 @@ def _auth() -> tuple[Optional[str], Optional[dict]]:
     """Return (api_key, None) or (None, error_dict)."""
     api_key = _kc_get("pomanda", "api_key")
     if not api_key:
-        return None, {"ok": False, "error": "Pomanda not configured"}
+        return None, {
+            "ok": False,
+            "error": "Pomanda not configured",
+            "needs_setup": {"tools": ["pomanda"], "context": "to identify the MAN via Pomanda"},
+        }
     return api_key, None
 
 

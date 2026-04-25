@@ -42,7 +42,9 @@ def enrich_person(
 ) -> dict:
     api_key = _kc_get("lusha", "api_key")
     if not api_key:
-        return _empty_result(error="Lusha not configured")
+        out = _empty_result(error="Lusha not configured")
+        out["needs_setup"] = {"tools": ["lusha"], "context": "to enrich contacts via Lusha"}
+        return out
 
     first, last = _split_name(name)
     payload: dict = {

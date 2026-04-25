@@ -46,7 +46,9 @@ def enrich_person(
 ) -> dict:
     api_key = _kc_get("cognism", "api_key")
     if not api_key:
-        return _empty_result(error="Cognism not configured")
+        out = _empty_result(error="Cognism not configured")
+        out["needs_setup"] = {"tools": ["cognism"], "context": "to enrich contacts via Cognism"}
+        return out
 
     first, last = _split_name(name)
     payload = {

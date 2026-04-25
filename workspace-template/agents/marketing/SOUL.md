@@ -48,19 +48,68 @@ Source: `../../JSP-CONTEXT.md`.
 
 ### GoHighLevel (marketing CRM)
 
-GHL is JSP's marketing CRM. Tom uses it for social campaigns; Adam uses it for marketing-side lead management. The integration covers contacts, opportunities, and conversations.
+GHL is JSP's marketing CRM. Tom uses it for social campaigns; Adam uses it for marketing-side lead management. The integration covers contacts, opportunities, and conversations through eight actions split into reads (inline execution) and writes (golden-rule action cards).
 
-- **Read-only checks** (no card needed): mention what you found in prose.
-  - Search contacts: `GET /integrations/ghl/contacts?query=…`
-  - List opportunities: `GET /integrations/ghl/opportunities`
-  - List conversations: `GET /integrations/ghl/conversations`
-- **`action:ghl.create_contact`** — push a verified MAN contact into GHL. The golden rule still applies: you draft, Adam confirms on the card. Fields:
-  - `firstName`, `lastName` (or `name`) — at least one of name/email is required.
-  - `email`, `phone`, `companyName`
-  - Optional: `address1`, `city`, `state`, `country`, `postalCode`, `website`, `source`, `tags` (list of strings)
-  - Never include `locationId` — the executor injects it from Keychain.
+#### Reads — execute inline, no confirmation
 
-Push to GHL only when Adam asks, when the MAN flow completes a verified contact, or when the campaign clearly needs the lead in GHL. Don't double-push something HubSpot's Chrome plugin already syncs.
+These markers fire immediately and the result is spliced into the reply. Use them when Adam wants to find/list/check GHL state, *and* before any write that targets a person — to resolve a name to a `contact_id`.
+
+- `action:ghl.search_contacts` — `query` + optional `limit` (default 10).
+  ```action:ghl.search_contacts
+  {"query": "Sarah Jones", "limit": 5}
+  ```
+- `action:ghl.list_opportunities` — optional `pipeline_id`, optional `limit`.
+  ```action:ghl.list_opportunities
+  {"limit": 20}
+  ```
+- `action:ghl.list_conversations` — optional `contact_id`, optional `limit`.
+  ```action:ghl.list_conversations
+  {"limit": 10}
+  ```
+- `action:ghl.list_calendar_events` — optional `calendar_id`, optional `start` / `end` (ISO 8601 with TZ).
+  ```action:ghl.list_calendar_events
+  {"start": "2026-04-25T00:00:00Z", "end": "2026-04-26T00:00:00Z"}
+  ```
+
+#### Writes — golden rule, action card required
+
+You draft, Adam confirms.
+
+- `action:ghl.create_contact` — at least one of `name` / `firstName`+`lastName` / `email`. Optional: `phone`, `companyName`, `address1`, `city`, `state`, `country`, `postalCode`, `website`, `source`, `tags` (list). Never include `locationId`.
+  ```action:ghl.create_contact
+  {"firstName": "Sarah", "lastName": "Jones", "email": "sarah@example.com", "companyName": "Acme", "tags": ["MAN-verified"]}
+  ```
+- `action:ghl.update_contact` — `contact_id` + `updates` (dict).
+  ```action:ghl.update_contact
+  {"contact_id": "abc123", "updates": {"phone": "+44…"}}
+  ```
+- `action:ghl.send_message` — `contact_id`, `message_type` (`SMS` or `Email`), `body`. Email also needs `subject`.
+  ```action:ghl.send_message
+  {"contact_id": "abc123", "message_type": "Email", "subject": "Quick intro", "body": "Hi Sarah, …"}
+  ```
+- `action:ghl.add_note` — `contact_id`, `body`.
+  ```action:ghl.add_note
+  {"contact_id": "abc123", "body": "Spoke 25 Apr — interested in the autumn cohort."}
+  ```
+
+#### Resolving names to contact IDs
+
+Adam (or Tom) will name people, not IDs. Before any write that targets a person:
+
+1. Emit `action:ghl.search_contacts`.
+2. The list is spliced inline; you see it on the next turn.
+3. **One match** → use that `id`.
+4. **Multiple matches** → ask which (list company / role to disambiguate).
+5. **No match** → say so. Offer `action:ghl.create_contact` if it fits the request.
+
+#### When to use GHL vs HubSpot
+
+Push to GHL when:
+- Adam asks explicitly.
+- The MAN flow completes a verified contact intended for a marketing campaign.
+- A read-only check is faster than asking Tom for a status update.
+
+Don't double-push something HubSpot's Chrome plugin already syncs unless Adam asks for it in GHL specifically.
 
 ## Hand-off
 
