@@ -15,7 +15,10 @@ import { API_BASE } from './SettingsEditor.jsx';
 //   wizard    → three-step flow (instructions → paste key → verify)
 // ---------------------------------------------------------------------------
 
-const TOOL_ORDER = ["pomanda", "cognism", "lusha"];
+const TOOL_ORDER = ["pomanda", "cognism", "lusha", "ghl"];
+
+// Fallback for legacy single-key tools that don't declare a fields array.
+const DEFAULT_FIELDS = [{ key: "api_key", label: "API Key", password: true }];
 
 const TOOL_CONTENT = {
   pomanda: {
@@ -51,6 +54,31 @@ const TOOL_CONTENT = {
     keyFormatHint: "Your key is in UUID format: xxxxxxxx-xxxx-xxxx…",
     icon: "Phone",
   },
+  ghl: {
+    label: "GoHighLevel",
+    tagline: "Marketing CRM for contacts and conversations",
+    stepOneDescription:
+      "GoHighLevel is your marketing automation platform. Mission Control uses it to sync verified contacts from the MAN workflow, manage opportunities, and view conversations.",
+    dashboardUrl: "https://app.gohighlevel.com",
+    keyPath: "Settings → Integrations → Private Integrations → Create new integration",
+    whoToAsk: "Tom at JSP runs the GHL Agency. He can grant Adam access if needed.",
+    keyFormatHint: "Token starts with 'pit-' and is followed by a UUID. Location ID is a short alphanumeric string from Settings → Business Profile.",
+    icon: "TrendingUp",
+    setupSteps: [
+      "Open GHL → Settings (gear icon, top-right)",
+      "Click Integrations → Private Integrations → Create new integration",
+      "Name it 'Mission Control AI'",
+      "Tick the scopes: contacts.readonly + .write, opportunities.readonly + .write, conversations.readonly + .write, calendars.readonly + .write, locations.readonly",
+      "Click Generate token (it starts with 'pit-')",
+      "Copy your Location ID from Settings → Business Profile",
+    ],
+    fields: [
+      { key: "api_key",     label: "Private Integration Token", password: true,
+        placeholder: "pit-xxxxxxxx-xxxx-xxxx-xxxx-…" },
+      { key: "location_id", label: "Location ID",               password: false,
+        placeholder: "From Settings → Business Profile" },
+    ],
+  },
 };
 
 export default function SetupModal({
@@ -63,8 +91,8 @@ export default function SetupModal({
   const [view, setView] = useState("overview");       // "overview" | "wizard"
   const [activeTool, setActiveTool] = useState(null);
   const [step, setStep] = useState(1);                // 1 | 2 | 3
-  const [apiKey, setApiKey] = useState("");
-  const [showKey, setShowKey] = useState(false);
+  const [values, setValues] = useState({});           // { [fieldKey]: string }
+  const [revealed, setRevealed] = useState({});       // { [fieldKey]: bool }
   const [verifyState, setVerifyState] = useState("idle"); // idle | loading | success | error
   const [verifyError, setVerifyError] = useState("");
   const [connected, setConnected] = useState({});     // {pomanda: bool, ...}
@@ -77,8 +105,8 @@ export default function SetupModal({
     setView("overview");
     setActiveTool(null);
     setStep(1);
-    setApiKey("");
-    setShowKey(false);
+    setValues({});
+    setRevealed({});
     setVerifyState("idle");
     setVerifyError("");
     setConfirmClose(false);
@@ -92,7 +120,8 @@ export default function SetupModal({
           setConnected({
             pomanda: !!data.pomanda_configured,
             cognism: !!data.cognism_configured,
-            lusha: !!data.lusha_configured,
+            lusha:   !!data.lusha_configured,
+            ghl:     !!data.ghl_configured,
           });
         }
       } catch {
@@ -114,12 +143,20 @@ export default function SetupModal({
         // Forward Enter within the wizard unless typing in a textarea.
         if (document.activeElement?.tagName === "TEXTAREA") return;
         if (step === 1) advanceStep();
-        else if (step === 2 && apiKey.trim() && verifyState !== "loading") handleVerify();
+        else if (step === 2 && allFieldsFilled() && verifyState !== "loading") handleVerify();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, view, step, apiKey, verifyState]);
+  }, [open, view, step, values, activeTool, verifyState]);
+
+  const fieldsForTool = (toolId) => TOOL_CONTENT[toolId]?.fields || DEFAULT_FIELDS;
+
+  const allFieldsFilled = () => {
+    if (!activeTool) return false;
+    const fields = fieldsForTool(activeTool);
+    return fields.every((f) => (values[f.key] || "").trim().length > 0);
+  };
 
   // Derive ordered tool list — placed BEFORE the early-return so hook order
   // remains stable between open and closed renders (React error #310).
@@ -148,8 +185,8 @@ export default function SetupModal({
   const openWizard = (toolId) => {
     setActiveTool(toolId);
     setStep(1);
-    setApiKey("");
-    setShowKey(false);
+    setValues({});
+    setRevealed({});
     setVerifyState("idle");
     setVerifyError("");
     setView("wizard");
@@ -165,8 +202,14 @@ export default function SetupModal({
   };
 
   const handleVerify = async () => {
-    const key = apiKey.trim();
-    if (!key || !activeTool) return;
+    if (!activeTool) return;
+    const fields = fieldsForTool(activeTool);
+    const credentials = {};
+    for (const f of fields) {
+      const v = (values[f.key] || "").trim();
+      if (!v) return; // button is gated, but defend anyway
+      credentials[f.key] = v;
+    }
     setStep(3);
     setVerifyState("loading");
     setVerifyError("");
@@ -174,7 +217,7 @@ export default function SetupModal({
       const saveRes = await fetch(`${API_BASE}/integrations/${activeTool}/credentials`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ credentials: { api_key: key } }),
+        body: JSON.stringify({ credentials }),
       });
       if (!saveRes.ok) {
         const b = await saveRes.json().catch(() => ({}));
@@ -190,14 +233,14 @@ export default function SetupModal({
         onConfigured?.(activeTool);
       } else {
         setVerifyState("error");
-        setVerifyError(testData?.error || "The key was saved, but the test call failed.");
+        setVerifyError(testData?.error || "Credentials saved, but the test call failed.");
       }
     } catch (err) {
       setVerifyState("error");
       setVerifyError(
         err instanceof TypeError
           ? "Can't reach the local backend. Is it running?"
-          : (err?.message || "Something went wrong saving the key.")
+          : (err?.message || "Something went wrong saving the credentials.")
       );
     }
   };
@@ -251,10 +294,12 @@ export default function SetupModal({
           <WizardView
             toolId={activeTool}
             step={step}
-            apiKey={apiKey}
-            setApiKey={setApiKey}
-            showKey={showKey}
-            setShowKey={setShowKey}
+            fields={fieldsForTool(activeTool)}
+            values={values}
+            setValues={setValues}
+            revealed={revealed}
+            setRevealed={setRevealed}
+            allFilled={allFieldsFilled()}
             verifyState={verifyState}
             verifyError={verifyError}
             connected={connected}
@@ -374,7 +419,7 @@ function ToolRow({ toolId, configured, onSetUp }) {
 // ---------------------------------------------------------------------------
 
 function WizardView({
-  toolId, step, apiKey, setApiKey, showKey, setShowKey,
+  toolId, step, fields, values, setValues, revealed, setRevealed, allFilled,
   verifyState, verifyError, connected, orderedTools,
   onClose, onBackToOverview, onAdvance, onStepBack, onVerify, onRetry, onNextTool,
 }) {
@@ -398,10 +443,11 @@ function WizardView({
         {step === 2 && (
           <StepTwo
             content={content}
-            apiKey={apiKey}
-            setApiKey={setApiKey}
-            showKey={showKey}
-            setShowKey={setShowKey}
+            fields={fields}
+            values={values}
+            setValues={setValues}
+            revealed={revealed}
+            setRevealed={setRevealed}
           />
         )}
         {step === 3 && (
@@ -453,7 +499,7 @@ function WizardView({
             className="btn-primary"
             style={{ fontSize: 14, padding: "8px 16px", display: "flex", alignItems: "center", gap: 6 }}
             onClick={onVerify}
-            disabled={!apiKey.trim()}
+            disabled={!allFilled}
           >
             Verify
             <Icon.ChevronRight className="lucide-xs" />
@@ -471,10 +517,9 @@ function StepOne({ content }) {
     <div style={{ fontSize: 14, color: "var(--fg)", lineHeight: 1.6 }}>
       <p style={{ marginTop: 0, color: "var(--fg-muted)" }}>{content.stepOneDescription}</p>
 
-      <ol style={{ paddingLeft: 18, margin: "14px 0 0 0" }}>
-        <li style={{ marginBottom: 10 }}>
-          Open {content.label}'s dashboard
-          <div style={{ marginTop: 6 }}>
+      {content.setupSteps ? (
+        <>
+          <div style={{ marginTop: 14 }}>
             <a
               href={content.dashboardUrl}
               target="_blank"
@@ -490,76 +535,131 @@ function StepOne({ content }) {
               Open {content.dashboardUrl.replace(/^https?:\/\//, "")}
             </a>
           </div>
-        </li>
-        <li style={{ marginBottom: 10 }}>
-          Sign in
-          <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 4 }}>
-            If you don't have an account, {content.whoToAsk}
-          </div>
-        </li>
-        <li style={{ marginBottom: 10 }}>
-          Go to <span style={{ fontFamily: "Menlo, Courier, monospace", fontSize: 13 }}>{content.keyPath}</span>
-        </li>
-        <li style={{ marginBottom: 10 }}>
-          Copy the key to your clipboard
-        </li>
-      </ol>
+          <ol style={{ paddingLeft: 18, margin: "14px 0 0 0" }}>
+            {content.setupSteps.map((step, i) => (
+              <li key={i} style={{ marginBottom: 8 }}>{step}</li>
+            ))}
+          </ol>
+        </>
+      ) : (
+        <ol style={{ paddingLeft: 18, margin: "14px 0 0 0" }}>
+          <li style={{ marginBottom: 10 }}>
+            Open {content.label}'s dashboard
+            <div style={{ marginTop: 6 }}>
+              <a
+                href={content.dashboardUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary"
+                style={{
+                  fontSize: 13, padding: "6px 12px",
+                  display: "inline-flex", alignItems: "center", gap: 6,
+                  textDecoration: "none", color: "var(--fg)",
+                }}
+              >
+                <Icon.ExternalLink className="lucide-xs" />
+                Open {content.dashboardUrl.replace(/^https?:\/\//, "")}
+              </a>
+            </div>
+          </li>
+          <li style={{ marginBottom: 10 }}>
+            Sign in
+            <div style={{ fontSize: 13, color: "var(--fg-muted)", marginTop: 4 }}>
+              If you don't have an account, {content.whoToAsk}
+            </div>
+          </li>
+          <li style={{ marginBottom: 10 }}>
+            Go to <span style={{ fontFamily: "Menlo, Courier, monospace", fontSize: 13 }}>{content.keyPath}</span>
+          </li>
+          <li style={{ marginBottom: 10 }}>
+            Copy the key to your clipboard
+          </li>
+        </ol>
+      )}
 
       <p style={{ marginTop: 14, color: "var(--fg-muted)" }}>
-        Got it? Click Next when you have the key copied.
+        Got it? Click Next when you have what you need.
       </p>
     </div>
   );
 }
 
-function StepTwo({ content, apiKey, setApiKey, showKey, setShowKey }) {
-  const EyeCmp = showKey ? Icon.EyeOff : Icon.Eye;
+function StepTwo({ content, fields, values, setValues, revealed, setRevealed }) {
+  const intro = fields.length === 1
+    ? `Paste your ${content.label} API key:`
+    : `Paste each ${content.label} value:`;
+
   return (
     <div style={{ fontSize: 14, color: "var(--fg)" }}>
       <div style={{ marginBottom: 10, color: "var(--fg-muted)" }}>
-        Paste your {content.label} API key:
+        {intro}
       </div>
-      <div
-        style={{
-          display: "flex", alignItems: "center", gap: 8,
-          border: "1px solid var(--border-strong)",
-          borderRadius: 8,
-          padding: "2px 4px 2px 10px",
-          background: "var(--bg-elev)",
-        }}
-      >
-        <input
-          type={showKey ? "text" : "password"}
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder={content.keyFormatHint || "Paste your key here"}
-          autoFocus
-          spellCheck={false}
-          style={{
-            flex: 1,
-            border: "none",
-            outline: "none",
-            background: "transparent",
-            fontFamily: "Menlo, Courier, monospace",
-            fontSize: 13,
-            padding: "8px 4px",
-            color: "var(--fg)",
-          }}
-          aria-label={`${content.label} API key`}
-        />
-        <button
-          type="button"
-          onClick={() => setShowKey((s) => !s)}
-          className="btn-ghost p-1.5"
-          style={{ color: "var(--fg-muted)" }}
-          aria-label={showKey ? "Hide key" : "Show key"}
-          title={showKey ? "Hide key" : "Show key"}
-        >
-          <EyeCmp className="lucide-sm" />
-        </button>
+
+      <div className="flex flex-col" style={{ gap: 10 }}>
+        {fields.map((f, i) => {
+          const isPassword = !!f.password;
+          const isRevealed = !!revealed[f.key];
+          const EyeCmp = isRevealed ? Icon.EyeOff : Icon.Eye;
+          return (
+            <div key={f.key}>
+              <div
+                style={{
+                  fontSize: 12,
+                  color: "var(--fg-muted)",
+                  marginBottom: 4,
+                  letterSpacing: "0.02em",
+                }}
+              >
+                {f.label}
+              </div>
+              <div
+                style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  border: "1px solid var(--border-strong)",
+                  borderRadius: 8,
+                  padding: "2px 4px 2px 10px",
+                  background: "var(--bg-elev)",
+                }}
+              >
+                <input
+                  type={isPassword && !isRevealed ? "password" : "text"}
+                  value={values[f.key] || ""}
+                  onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
+                  placeholder={f.placeholder || ""}
+                  autoFocus={i === 0}
+                  spellCheck={false}
+                  style={{
+                    flex: 1,
+                    border: "none",
+                    outline: "none",
+                    background: "transparent",
+                    fontFamily: "Menlo, Courier, monospace",
+                    fontSize: 13,
+                    padding: "8px 4px",
+                    color: "var(--fg)",
+                  }}
+                  aria-label={`${content.label} ${f.label}`}
+                />
+                {isPassword && (
+                  <button
+                    type="button"
+                    onClick={() => setRevealed((s) => ({ ...s, [f.key]: !s[f.key] }))}
+                    className="btn-ghost p-1.5"
+                    style={{ color: "var(--fg-muted)" }}
+                    aria-label={isRevealed ? "Hide value" : "Show value"}
+                    title={isRevealed ? "Hide value" : "Show value"}
+                  >
+                    <EyeCmp className="lucide-sm" />
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
       </div>
+
       {content.keyFormatHint && (
-        <div style={{ fontSize: 12, color: "var(--fg-faint)", marginTop: 6 }}>
+        <div style={{ fontSize: 12, color: "var(--fg-faint)", marginTop: 8 }}>
           {content.keyFormatHint}
         </div>
       )}
@@ -574,8 +674,8 @@ function StepTwo({ content, apiKey, setApiKey, showKey, setShowKey }) {
           lineHeight: 1.55,
         }}
       >
-        Your key is stored in macOS Keychain — encrypted and only accessible by
-        Mission Control on this Mac. It never leaves your machine.
+        Values are stored in macOS Keychain — encrypted and only accessible by
+        Mission Control on this Mac. They never leave your machine.
       </div>
     </div>
   );
@@ -611,6 +711,7 @@ function StepThree({
           {toolId === "pomanda" && "You can now verify MANs automatically from Companies House data."}
           {toolId === "cognism" && "You can now enrich missing emails and mobile numbers."}
           {toolId === "lusha" && "Lusha will fill in any contact info Cognism can't find."}
+          {toolId === "ghl" && "Mission Control can now sync verified contacts and view GHL conversations."}
         </div>
         <div className="flex items-center" style={{ gap: 8, flexWrap: "wrap" }}>
           <button

@@ -287,6 +287,49 @@ function ContactsBody({ data }) {
   );
 }
 
+// --- GHL contact card body ----------------------------------------------
+function GhlContactBody({ data }) {
+  const fullName = data.name
+    || [data.firstName, data.lastName].filter(Boolean).join(" ").trim();
+  const tags = Array.isArray(data.tags) ? data.tags : [];
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>
+        {fullName || "Unnamed contact"}
+      </div>
+      {data.email       && <IconLine emoji="📧" text={data.email} />}
+      {data.phone       && <IconLine emoji="📱" text={data.phone} />}
+      {data.companyName && <IconLine emoji="🏢" text={data.companyName} />}
+      {data.website     && <IconLine emoji="🌐" text={data.website} />}
+      {data.source      && <IconLine emoji="📍" text={`Source: ${data.source}`} />}
+      {tags.length > 0 && (
+        <div className="flex flex-wrap" style={{ gap: 6, marginTop: 2 }}>
+          {tags.map((t) => (
+            <span
+              key={t}
+              style={{
+                fontSize: 11,
+                padding: "2px 8px",
+                borderRadius: 999,
+                background: "var(--bg)",
+                border: "1px solid var(--border)",
+                color: "var(--fg-muted)",
+              }}
+            >
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
+      {!fullName && !data.email && !data.phone && (
+        <div style={{ fontSize: 12, color: "var(--fg-faint)", fontStyle: "italic" }}>
+          Empty draft — Adam should edit before pushing.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // --- Action registry — small so adding new types later is a 1-line change --
 const ACTION_META = {
   "gmail.send": {
@@ -379,6 +422,42 @@ const ACTION_META = {
         {data?.name ? `${data.name} added to your Google Contacts.` : "Contact added to your Google Contacts."}
       </div>
     ),
+  },
+  "ghl.create_contact": {
+    icon: Icon.TrendingUp,
+    label: "New GHL contact",
+    confirmLabel: "Push to GHL",
+    busyLabel: "Pushing…",
+    editPlaceholder: "Tell Jackson what to change (name, email, phone, company, tags)…",
+    renderBody: (data) => <GhlContactBody data={data} />,
+    renderSuccess: (data, result) => {
+      const link = result && result.view_link;
+      const displayName = data?.name
+        || [data?.firstName, data?.lastName].filter(Boolean).join(" ").trim()
+        || data?.email
+        || "Contact";
+      return (
+        <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+          <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+          {displayName} pushed to GoHighLevel
+          {link ? (
+            <>
+              {" — "}
+              <a
+                href={link}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--green)", textDecoration: "underline" }}
+              >
+                opens in GHL
+              </a>
+            </>
+          ) : (
+            "."
+          )}
+        </div>
+      );
+    },
   },
 };
 

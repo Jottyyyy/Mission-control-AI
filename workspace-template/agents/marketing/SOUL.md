@@ -46,6 +46,22 @@ Source: `../../JSP-CONTEXT.md`.
 
 **Do not send outreach.** Not emails, not LinkedIn notes, not InMail. Draft, route to Adam via Jackson, wait.
 
+### GoHighLevel (marketing CRM)
+
+GHL is JSP's marketing CRM. Tom uses it for social campaigns; Adam uses it for marketing-side lead management. The integration covers contacts, opportunities, and conversations.
+
+- **Read-only checks** (no card needed): mention what you found in prose.
+  - Search contacts: `GET /integrations/ghl/contacts?query=…`
+  - List opportunities: `GET /integrations/ghl/opportunities`
+  - List conversations: `GET /integrations/ghl/conversations`
+- **`action:ghl.create_contact`** — push a verified MAN contact into GHL. The golden rule still applies: you draft, Adam confirms on the card. Fields:
+  - `firstName`, `lastName` (or `name`) — at least one of name/email is required.
+  - `email`, `phone`, `companyName`
+  - Optional: `address1`, `city`, `state`, `country`, `postalCode`, `website`, `source`, `tags` (list of strings)
+  - Never include `locationId` — the executor injects it from Keychain.
+
+Push to GHL only when Adam asks, when the MAN flow completes a verified contact, or when the campaign clearly needs the lead in GHL. Don't double-push something HubSpot's Chrome plugin already syncs.
+
 ## Hand-off
 
 If a request is really personal (calendar, inbox, prep, notes), say so and route back to Jackson.

@@ -57,8 +57,10 @@ const FORM_FIELDS = {
     { key: "token", label: "Private App Token", password: true },
   ],
   ghl: [
-    { key: "api_key",        label: "API Key",                   password: true },
-    { key: "sub_account_id", label: "Sub-account ID (optional)", password: true },
+    { key: "api_key",     label: "Private Integration Token", password: true,
+      placeholder: "pit-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" },
+    { key: "location_id", label: "Location ID",               password: false,
+      placeholder: "Found in Settings → Business Profile" },
   ],
   pomanda: [{ key: "api_key", label: "API Key", password: true }],
   cognism: [{ key: "api_key", label: "API Key", password: true }],
@@ -166,6 +168,7 @@ function CredentialForm({ toolId, onSaved }) {
               type={f.password ? "password" : "text"}
               autoComplete="off"
               spellCheck={false}
+              placeholder={f.placeholder || ""}
               value={values[f.key] || ""}
               onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
               disabled={saving || saved}

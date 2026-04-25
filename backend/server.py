@@ -23,7 +23,7 @@ import keyring  # noqa: E402
 import keyring.errors  # noqa: E402
 
 # MAN workflow clients (read Keychain via the same service/username convention).
-from integrations import pomanda, cognism, lusha  # noqa: E402
+from integrations import pomanda, cognism, lusha, ghl  # noqa: E402
 from workflows import man_workflow  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -1106,8 +1106,8 @@ _INTEGRATIONS: dict[str, dict] = {
     },
     "ghl": {
         "label": "GoHighLevel",
-        "required_fields": ["api_key"],
-        "all_fields": ["api_key", "sub_account_id"],
+        "required_fields": ["api_key", "location_id"],
+        "all_fields": ["api_key", "location_id"],
         "oauth": False,
     },
     "pomanda": {
@@ -1262,21 +1262,49 @@ def _test_hubspot() -> dict:
 
 
 def _test_ghl() -> dict:
+    """Verify the V2 Private Integration token against the user's Location.
+
+    Calls GET /locations/{location_id} on services.leadconnectorhq.com — the
+    cheapest read that proves both pieces of the credential are good. Tokens
+    minted via Settings → Private Integrations carry a `pit-` prefix; we warn
+    if it's missing but still attempt the call (the prefix isn't strictly
+    enforced by the API and a future format change shouldn't break us)."""
     api_key = _kc_get("ghl", "api_key")
+    location_id = _kc_get("ghl", "location_id")
     if not api_key:
-        return {"success": False, "error": "No GHL API key stored."}
+        return {"success": False, "error": "API key not configured."}
+    if not location_id:
+        return {"success": False, "error": "Location ID not configured."}
+
+    warning = None
+    if not api_key.startswith("pit-"):
+        warning = "Token doesn't start with 'pit-' — make sure you generated a Private Integration token, not a legacy v1 key."
+
     status, body = _http_json(
         "GET",
-        "https://rest.gohighlevel.com/v1/locations/",
-        headers={"Authorization": f"Bearer {api_key}"},
+        f"https://services.leadconnectorhq.com/locations/{location_id}",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Version": "2021-07-28",
+            "Accept": "application/json",
+        },
     )
     if status == 200:
-        return {"success": True}
+        loc = body.get("location") if isinstance(body, dict) else None
+        name = loc.get("name") if isinstance(loc, dict) else None
+        result = {"success": True, "location_name": name, "scopes_active": "verified"}
+        if warning:
+            result["warning"] = warning
+        return result
     if status == 401:
-        return {"success": False, "error": "Key rejected (401). Re-check the generated API key."}
+        return {"success": False, "error": "Token rejected (401). Regenerate in GHL Settings → Private Integrations."}
     if status == 403:
-        return {"success": False, "error": "Forbidden (403). Key may not have access to this sub-account."}
-    return {"success": False, "error": body.get("msg") or body.get("error") or f"HTTP {status}"}
+        return {"success": False, "error": "Forbidden (403). Token is missing the locations.readonly scope."}
+    if status == 404:
+        return {"success": False, "error": "Location ID not found (404). Check Settings → Business Profile."}
+    if status == 429:
+        return {"success": False, "error": "GHL rate-limited the test (429). Try again shortly."}
+    return {"success": False, "error": (body.get("message") if isinstance(body, dict) else None) or body.get("error") or f"HTTP {status}"}
 
 
 def _google_refresh_access_token() -> Optional[str]:
@@ -1683,11 +1711,63 @@ def _validate_contacts_create(data: dict) -> tuple[Optional[dict], Optional[str]
     return normalised, None
 
 
+def _validate_ghl_create_contact(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Confirmation-required: pushes a contact into GHL. Mirrors the shape
+    Jackson emits — at least one of name/firstName/email must be present so
+    we don't write empty rows. `locationId` is intentionally NOT accepted
+    here; the executor injects it from Keychain."""
+    first = (data.get("firstName") or data.get("first_name") or "").strip()
+    last = (data.get("lastName") or data.get("last_name") or "").strip()
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    phone = (data.get("phone") or "").strip()
+
+    if not (first or last or name or email):
+        return None, "Need at least a name or email."
+    if email and not _EMAIL_RE.match(email):
+        return None, f"Invalid email: {email!r}."
+
+    normalised: dict = {}
+    if first:
+        normalised["firstName"] = first
+    if last:
+        normalised["lastName"] = last
+    if name:
+        normalised["name"] = name
+    if email:
+        normalised["email"] = email
+    if phone:
+        normalised["phone"] = phone
+
+    company = (data.get("companyName") or data.get("company") or "").strip()
+    if company:
+        normalised["companyName"] = company
+
+    for k_in, k_out in (
+        ("address1", "address1"), ("city", "city"), ("state", "state"),
+        ("country", "country"), ("postalCode", "postalCode"),
+        ("postal_code", "postalCode"), ("website", "website"),
+        ("source", "source"),
+    ):
+        v = data.get(k_in)
+        if isinstance(v, str) and v.strip():
+            normalised[k_out] = v.strip()
+
+    tags = data.get("tags")
+    if isinstance(tags, list):
+        cleaned = [t.strip() for t in tags if isinstance(t, str) and t.strip()]
+        if cleaned:
+            normalised["tags"] = cleaned
+
+    return normalised, None
+
+
 _ACTION_VALIDATORS = {
     "gmail.send": _validate_gmail_send,
     "calendar.create_event": _validate_calendar_create_event,
     "drive.create_doc": _validate_drive_create_doc,
     "contacts.create": _validate_contacts_create,
+    "ghl.create_contact": _validate_ghl_create_contact,
 }
 
 
@@ -1993,11 +2073,35 @@ def _execute_contacts_create(action_data: dict) -> tuple[bool, dict]:
     return False, {"error": msg}
 
 
+def _execute_ghl_create_contact(action_data: dict) -> tuple[bool, dict]:
+    """Push a validated contact payload into GHL via the V2 client.
+
+    The executor doesn't need access tokens — `ghl.create_contact` reads its
+    credentials directly from Keychain, mirroring the Cognism / Lusha pattern.
+    On success we surface the contact ID and a deep link Adam can open in
+    the GHL UI (his white-labelled domain may differ; we use the canonical
+    one and let GHL redirect)."""
+    result = ghl.create_contact(action_data)
+    if result.get("success"):
+        contact_id = result.get("contact_id")
+        view_link = (
+            f"https://app.gohighlevel.com/v2/location/{_kc_get('ghl', 'location_id') or ''}/contacts/detail/{contact_id}"
+            if contact_id else None
+        )
+        return True, {
+            "contact_id": contact_id,
+            "contact": result.get("contact"),
+            "view_link": view_link,
+        }
+    return False, {"error": result.get("error") or "GHL create_contact failed."}
+
+
 _EXECUTORS = {
     "gmail.send": _execute_gmail_send,
     "calendar.create_event": _execute_calendar_create_event,
     "drive.create_doc": _execute_drive_create_doc,
     "contacts.create": _execute_contacts_create,
+    "ghl.create_contact": _execute_ghl_create_contact,
 }
 
 
@@ -2156,6 +2260,54 @@ def tools_audit(limit: int = Query(50, ge=1, le=500)):
             "user": r["user"],
         })
     return {"audit": out}
+
+
+# ---------------------------------------------------------------------------
+# GoHighLevel — read-only convenience endpoints for the marketing UI / Jackson.
+# ---------------------------------------------------------------------------
+#
+# These mirror the read-only methods on `integrations.ghl`. They never write
+# to GHL — write paths must go through the action-card pattern so Adam stays
+# in the loop. All four return the client's normalised shape verbatim, so the
+# frontend can render directly without further parsing.
+
+@app.get("/integrations/ghl/contacts")
+def ghl_contacts(query: Optional[str] = Query(None), limit: int = Query(20, ge=1, le=100)):
+    return ghl.list_contacts(query=query, limit=limit)
+
+
+@app.get("/integrations/ghl/contacts/{contact_id}")
+def ghl_contact(contact_id: str):
+    return ghl.get_contact(contact_id)
+
+
+@app.get("/integrations/ghl/opportunities")
+def ghl_opportunities(pipeline_id: Optional[str] = Query(None), limit: int = Query(20, ge=1, le=100)):
+    return ghl.list_opportunities(pipeline_id=pipeline_id, limit=limit)
+
+
+@app.get("/integrations/ghl/conversations")
+def ghl_conversations(contact_id: Optional[str] = Query(None), limit: int = Query(20, ge=1, le=100)):
+    return ghl.list_conversations(contact_id=contact_id, limit=limit)
+
+
+@app.get("/integrations/ghl/conversations/{conversation_id}/messages")
+def ghl_conversation_messages(conversation_id: str):
+    return ghl.get_conversation_messages(conversation_id)
+
+
+@app.get("/integrations/ghl/calendars")
+def ghl_calendars():
+    return ghl.list_calendars()
+
+
+@app.get("/integrations/ghl/calendars/{calendar_id}/events")
+def ghl_calendar_events(
+    calendar_id: str,
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+):
+    return ghl.list_calendar_events(calendar_id, start=start, end=end)
 
 
 # ---------------------------------------------------------------------------
@@ -2541,6 +2693,10 @@ def man_status():
     pomanda_ok = bool(_kc_get("pomanda", "api_key"))
     cognism_ok = bool(_kc_get("cognism", "api_key"))
     lusha_ok = bool(_kc_get("lusha", "api_key"))
+    # GHL is *not* required for the MAN workflow itself — it's a downstream
+    # destination for verified contacts. Surfaced here so the UI can show a
+    # "push to GHL" affordance once the workflow finishes.
+    ghl_ok = bool(_kc_get("ghl", "api_key") and _kc_get("ghl", "location_id"))
     missing = [
         tid for tid, ok in (
             ("pomanda", pomanda_ok),
@@ -2553,6 +2709,7 @@ def man_status():
         "pomanda_configured": pomanda_ok,
         "cognism_configured": cognism_ok,
         "lusha_configured": lusha_ok,
+        "ghl_configured": ghl_ok,
         "missing": missing,
     }
 
