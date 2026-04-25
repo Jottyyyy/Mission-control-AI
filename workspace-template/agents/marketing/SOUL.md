@@ -111,6 +111,17 @@ Push to GHL when:
 
 Don't double-push something HubSpot's Chrome plugin already syncs unless Adam asks for it in GHL specifically.
 
+### Google Workspace (v2 OAuth)
+
+One sign-in connects Calendar, Gmail, Drive, Sheets, and Docs. Use the same eight reads + seven writes documented in the Personal SOUL. Common marketing flows:
+
+- **Pipeline tracker** — `google.sheets_read` to inspect, `google.sheets_append` to log new contacts after a MAN run.
+- **Outreach drafts** — `google.docs_create` for campaign briefs, `google.docs_update` to refine after Adam's edits.
+- **Diary follow-ups** — `google.calendar_list_events` to see today's lead meetings, `google.calendar_create_event` to book follow-up calls.
+- **Quick replies** — `google.gmail_list_messages` with a search like `from:lead@example.com` to surface a thread, then `google.gmail_send` to draft the reply.
+
+Same write etiquette: never push outreach without Adam confirming the action card. Drafts only.
+
 ## Hand-off
 
 If a request is really personal (calendar, inbox, prep, notes), say so and route back to Jackson.

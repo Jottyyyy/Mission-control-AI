@@ -15,7 +15,7 @@ import { API_BASE } from './SettingsEditor.jsx';
 //   wizard    → three-step flow (instructions → paste key → verify)
 // ---------------------------------------------------------------------------
 
-const TOOL_ORDER = ["pomanda", "cognism", "lusha", "ghl"];
+const TOOL_ORDER = ["pomanda", "cognism", "lusha", "ghl", "google"];
 
 // Fallback for legacy single-key tools that don't declare a fields array.
 const DEFAULT_FIELDS = [{ key: "api_key", label: "API Key", password: true }];
@@ -79,6 +79,39 @@ const TOOL_CONTENT = {
         placeholder: "From Settings → Business Profile" },
     ],
   },
+  google: {
+    label: "Google Workspace",
+    tagline: "Calendar, Gmail, Drive, Sheets, and Docs",
+    stepOneDescription:
+      "Mission Control connects to your Google account via OAuth. One sign-in grants access to calendar, email, drive, spreadsheets, and docs.",
+    dashboardUrl: "https://console.cloud.google.com",
+    keyPath: "APIs & Services → Credentials → Create OAuth client ID",
+    whoToAsk: "Tom or your IT lead can help with the Cloud Console setup if you've never used it.",
+    keyFormatHint: "Client ID ends in `.apps.googleusercontent.com`. Client secret starts with `GOCSPX-`.",
+    icon: "Mail",
+    setupSteps: [
+      "Open the Google Cloud Console (link above)",
+      "Create a new project (or pick an existing one)",
+      "APIs & Services → Library → enable: Calendar, Gmail, Drive, Sheets, Docs",
+      "APIs & Services → OAuth consent screen → set up (External, Testing)",
+      "Add yourself as a Test User (your Google email)",
+      "APIs & Services → Credentials → Create OAuth client ID",
+      "Application type: Web application",
+      "Authorized redirect URIs: http://localhost:8001/auth/google/callback",
+      "Copy Client ID and Client Secret",
+      "Paste below — then I'll open Google in your browser to sign in",
+    ],
+    fields: [
+      { key: "client_id",     label: "Client ID",     password: false,
+        placeholder: "...apps.googleusercontent.com" },
+      { key: "client_secret", label: "Client Secret", password: true,
+        placeholder: "GOCSPX-…" },
+    ],
+    // After Save, instead of POST /integrations/google/test, run the OAuth
+    // flow: open the browser to /auth/google/start and poll /auth/google/status
+    // until connected: true (or timeout).
+    custom_verify: "google_oauth",
+  },
 };
 
 export default function SetupModal({
@@ -114,14 +147,20 @@ export default function SetupModal({
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(`${API_BASE}/workflow/man/status`);
-        const data = await res.json();
+        const [manRes, googleRes] = await Promise.all([
+          fetch(`${API_BASE}/workflow/man/status`).then((r) => r.json()).catch(() => ({})),
+          fetch(`${API_BASE}/integrations/google/status`).then((r) => r.json()).catch(() => ({})),
+        ]);
         if (!cancelled) {
           setConnected({
-            pomanda: !!data.pomanda_configured,
-            cognism: !!data.cognism_configured,
-            lusha:   !!data.lusha_configured,
-            ghl:     !!data.ghl_configured,
+            pomanda: !!manRes.pomanda_configured,
+            cognism: !!manRes.cognism_configured,
+            lusha:   !!manRes.lusha_configured,
+            ghl:     !!manRes.ghl_configured,
+            // /integrations/google/status returns connected when both
+            // refresh_token and client_id+secret exist; the `required_fields`
+            // check on `connected: true` already gates that for us.
+            google:  !!googleRes.connected,
           });
         }
       } catch {
@@ -223,6 +262,16 @@ export default function SetupModal({
         const b = await saveRes.json().catch(() => ({}));
         throw new Error(b?.detail || `HTTP ${saveRes.status}`);
       }
+
+      // Custom verify path — Google's flow is "save creds, open browser to
+      // OAuth, poll status until connected". The standard /test endpoint
+      // would fail because we don't have an access_token yet.
+      const customVerify = TOOL_CONTENT[activeTool]?.custom_verify;
+      if (customVerify === "google_oauth") {
+        await runGoogleOAuthVerify();
+        return;
+      }
+
       const testRes = await fetch(`${API_BASE}/integrations/${activeTool}/test`, {
         method: "POST",
       });
@@ -243,6 +292,47 @@ export default function SetupModal({
           : (err?.message || "Something went wrong saving the credentials.")
       );
     }
+  };
+
+  // Google OAuth: open the consent URL in a popup, then poll
+  // /auth/google/status every 2s until either `connected: true` or a 60-second
+  // timeout. The popup auto-closes itself after the callback HTML loads — we
+  // don't depend on `window.open()`'s return handle so popup-blockers that
+  // redirect to a new tab still work.
+  const runGoogleOAuthVerify = async () => {
+    setVerifyState("oauth_waiting");
+    setVerifyError("");
+    let url;
+    try {
+      const r = await fetch(`${API_BASE}/auth/google/start`);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d?.detail || `HTTP ${r.status}`);
+      url = d?.auth_url;
+      if (!url) throw new Error("No auth URL returned.");
+    } catch (err) {
+      setVerifyState("error");
+      setVerifyError(err?.message || "Couldn't start Google sign-in.");
+      return;
+    }
+
+    try { window.open(url, "mc-google-oauth", "width=520,height=700"); } catch { /* popup blocked — Adam will see "still waiting" */ }
+
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      await new Promise((res) => setTimeout(res, 2000));
+      try {
+        const s = await fetch(`${API_BASE}/auth/google/status`).then((r) => r.json());
+        if (s?.connected) {
+          setVerifyState("success");
+          setConnected((prev) => ({ ...prev, google: true }));
+          onConfigured?.("google");
+          return;
+        }
+      } catch { /* transient — keep polling */ }
+    }
+
+    setVerifyState("error");
+    setVerifyError("Couldn't complete sign-in within 60 seconds. Click 'Try again' below.");
   };
 
   const onBackdropClick = (e) => {
@@ -695,6 +785,21 @@ function StepThree({
       </div>
     );
   }
+  if (verifyState === "oauth_waiting") {
+    return (
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0", fontSize: 14, color: "var(--fg)" }}>
+          <Icon.Loader className="lucide-sm spin" style={{ color: "var(--accent)" }} />
+          Waiting for you to sign in with Google…
+        </div>
+        <div style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.55, padding: "0 0 8px 0" }}>
+          A browser window should have opened. Grant access to Calendar,
+          Gmail, Drive, Sheets, and Docs. The window will close itself when
+          you're done.
+        </div>
+      </div>
+    );
+  }
   if (verifyState === "success") {
     return (
       <div>
@@ -712,6 +817,7 @@ function StepThree({
           {toolId === "cognism" && "You can now enrich missing emails and mobile numbers."}
           {toolId === "lusha" && "Lusha will fill in any contact info Cognism can't find."}
           {toolId === "ghl" && "Mission Control can now sync verified contacts and view GHL conversations."}
+          {toolId === "google" && "Calendar, Gmail, Drive, Sheets, and Docs are all connected."}
         </div>
         <div className="flex items-center" style={{ gap: 8, flexWrap: "wrap" }}>
           <button

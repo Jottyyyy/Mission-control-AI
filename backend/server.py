@@ -24,6 +24,14 @@ import keyring.errors  # noqa: E402
 
 # MAN workflow clients (read Keychain via the same service/username convention).
 from integrations import pomanda, cognism, lusha, ghl  # noqa: E402
+from integrations import (  # noqa: E402
+    google_oauth,
+    google_calendar,
+    google_gmail,
+    google_drive,
+    google_sheets,
+    google_docs,
+)
 from workflows import man_workflow  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -1195,6 +1203,15 @@ _INTEGRATIONS: dict[str, dict] = {
         "all_fields": ["api_key"],
         "oauth": False,
     },
+    "google": {
+        "label": "Google Workspace (v2)",
+        "required_fields": ["client_id", "client_secret"],
+        # OAuth tokens are written by /auth/google/callback, not by the
+        # credentials endpoint — but we list them here so /integrations
+        # status reflects whether Adam is fully connected.
+        "all_fields": ["client_id", "client_secret", "access_token", "refresh_token", "expires_at", "email"],
+        "oauth": True,
+    },
 }
 
 
@@ -1626,6 +1643,92 @@ def google_oauth_callback(code: Optional[str] = None, error: Optional[str] = Non
 
 
 # ---------------------------------------------------------------------------
+# Google Workspace v2 — single OAuth client, five services.
+# ---------------------------------------------------------------------------
+#
+# Distinct namespace from the legacy `google-workspace` integration above:
+#   - Tool ID: "google" (vs "google-workspace")
+#   - Keychain prefix: google:* (vs google-workspace:*)
+#   - Redirect URI: /auth/google/callback (vs /integrations/google-workspace/oauth-callback)
+#
+# The two coexist while we migrate the inline gmail.send / calendar.create_event
+# / drive.create_doc / contacts.create executors over to per-service modules.
+# Adam can have either flow set up without conflict.
+
+# Credentials surface for "google" piggybacks on the standard
+# /integrations/{tool_id}/credentials handler — the _INTEGRATIONS entry above
+# defines client_id + client_secret as required fields, and the SetupModal
+# already POSTs `{credentials: {client_id, client_secret}}` there. Token
+# fields (access/refresh/expires/email) are written by /auth/google/callback.
+
+@app.post("/integrations/google/disconnect")
+def google_disconnect():
+    """Sign out without losing the OAuth client config — Adam keeps the
+    Cloud Console client around but revokes the current session."""
+    google_oauth.disconnect()
+    return {"disconnected": True}
+
+
+@app.get("/auth/google/start")
+def google_auth_start():
+    """Build the consent URL and hand it back to the SetupModal so it can
+    open the browser. We return JSON instead of a 302 — that lets the modal
+    show a "Continue in your browser" button rather than navigating the
+    main app away from itself."""
+    if not google_oauth.has_client_credentials():
+        raise HTTPException(status_code=400, detail="Save client_id and client_secret first.")
+    state = google_oauth.issue_state()
+    url = google_oauth.build_auth_url(state)
+    if not url:
+        raise HTTPException(status_code=500, detail="Could not build auth URL.")
+    return {"auth_url": url, "state": state}
+
+
+@app.get("/auth/google/callback", response_class=HTMLResponse)
+def google_auth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """Receive the authorization code from Google, exchange for tokens, and
+    render an auto-close success page. The SetupModal is concurrently polling
+    /auth/google/status so the UI flips to Connected without needing this
+    page to talk to it directly."""
+    def _page(msg: str, ok: bool) -> str:
+        colour = "#16a34a" if ok else "#dc2626"
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Mission Control — Google sign-in</title>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:480px;margin:80px auto;padding:0 24px;color:#111}}h1{{font-size:18px;font-weight:500}}p{{font-size:14px;line-height:1.6;color:#555}}.badge{{display:inline-block;padding:2px 10px;border-radius:999px;background:{colour};color:#fff;font-size:12px}}</style>
+<script>setTimeout(() => {{ try {{ window.close(); }} catch (_) {{}} }}, 1500);</script>
+</head><body>
+<span class="badge">{'Connected' if ok else 'Error'}</span>
+<h1>{msg}</h1>
+<p>You can close this window and return to Mission Control.</p>
+</body></html>"""
+
+    if error:
+        return HTMLResponse(_page(f"Google returned: {error}", ok=False), status_code=400)
+    if not code:
+        return HTMLResponse(_page("Missing authorization code.", ok=False), status_code=400)
+    if not google_oauth.consume_state(state or ""):
+        # State mismatch — refuse the code rather than risk a CSRF-style
+        # confusion attack stitching someone else's grant onto this backend.
+        return HTMLResponse(_page("State mismatch — please retry sign-in.", ok=False), status_code=400)
+
+    result = google_oauth.exchange_code_for_tokens(code)
+    if not result.get("success"):
+        return HTMLResponse(_page(f"Token exchange failed: {result.get('error')}", ok=False), status_code=400)
+
+    email = result.get("email") or "your account"
+    return HTMLResponse(_page(f"Connected as {email}.", ok=True))
+
+
+@app.get("/auth/google/status")
+def google_auth_status():
+    return google_oauth.get_status()
+
+
+# ---------------------------------------------------------------------------
 # Tool-calling — Phase 1: confirmation-first actions.
 # ---------------------------------------------------------------------------
 #
@@ -1938,12 +2041,144 @@ def _validate_ghl_add_note(data: dict) -> tuple[Optional[dict], Optional[str]]:
     return {"contact_id": contact_id, "body": body}, None
 
 
+# --- Google Workspace v2 validators -----------------------------------------
+#
+# Mirror the existing single-service validators (gmail.send, calendar.create_event)
+# but namespaced under `google.*` so they can coexist with the legacy executors
+# during the migration window.
+
+def _validate_google_calendar_create_event(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    summary = (data.get("summary") or "").strip()
+    start = (data.get("start") or "").strip()
+    end = (data.get("end") or "").strip()
+    if not summary:
+        return None, "Missing 'summary'."
+    if not start or not _ISO_LOCAL_RE.match(start):
+        return None, "Missing or malformed 'start' (expect YYYY-MM-DDTHH:MM:SS local time)."
+    if not end or not _ISO_LOCAL_RE.match(end):
+        return None, "Missing or malformed 'end' (expect YYYY-MM-DDTHH:MM:SS local time)."
+    try:
+        if datetime.fromisoformat(end) <= datetime.fromisoformat(start):
+            return None, "'end' must be after 'start'."
+    except ValueError:
+        return None, "Unparseable datetime."
+
+    out: dict = {
+        "summary": summary,
+        "start": start,
+        "end": end,
+        "timezone": (data.get("timezone") or "Europe/London").strip() or "Europe/London",
+    }
+    desc = data.get("description")
+    if isinstance(desc, str) and desc.strip():
+        out["description"] = desc.strip()
+    loc = data.get("location")
+    if isinstance(loc, str) and loc.strip():
+        out["location"] = loc.strip()
+    attendees = data.get("attendees")
+    if isinstance(attendees, list):
+        cleaned = [a.strip() for a in attendees if isinstance(a, str) and _EMAIL_RE.match(a.strip())]
+        if cleaned:
+            out["attendees"] = cleaned
+    return out, None
+
+
+def _validate_google_gmail_send(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    to = (data.get("to") or "").strip()
+    subject = (data.get("subject") or "").strip()
+    body = (data.get("body") or "").strip()
+    if not to or "@" not in to:
+        return None, "Invalid 'to'."
+    if not subject:
+        return None, "Missing 'subject'."
+    if not body:
+        return None, "Missing 'body'."
+    out: dict = {"to": to, "subject": subject, "body": body}
+    cc = (data.get("cc") or "").strip()
+    bcc = (data.get("bcc") or "").strip()
+    if cc:
+        out["cc"] = cc
+    if bcc:
+        out["bcc"] = bcc
+    return out, None
+
+
+def _validate_google_drive_create_file(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Minimal Drive create — title + optional plain-text content. We route
+    through the Docs surface for actual content creation (richer + same auth)."""
+    name = (data.get("name") or data.get("title") or "").strip()
+    if not name:
+        return None, "Missing 'name'."
+    out: dict = {"name": name}
+    content = data.get("content")
+    if isinstance(content, str):
+        out["content"] = content
+    folder = data.get("folder_id")
+    if isinstance(folder, str) and folder.strip():
+        out["folder_id"] = folder.strip()
+    return out, None
+
+
+def _validate_google_sheets_append(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    sid = (data.get("spreadsheet_id") or "").strip()
+    if not sid:
+        return None, "Missing 'spreadsheet_id'."
+    rng = (data.get("range") or "Sheet1!A:Z").strip()
+    rows = data.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None, "Missing 'rows' (list of lists)."
+    cleaned: list[list] = []
+    for row in rows:
+        if isinstance(row, list):
+            cleaned.append(row)
+        elif isinstance(row, str):
+            cleaned.append([row])
+    if not cleaned:
+        return None, "No usable rows."
+    return {"spreadsheet_id": sid, "range": rng, "rows": cleaned}, None
+
+
+def _validate_google_sheets_create(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    title = (data.get("title") or "").strip()
+    if not title:
+        return None, "Missing 'title'."
+    return {"title": title}, None
+
+
+def _validate_google_docs_create(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    title = (data.get("title") or "").strip()
+    if not title:
+        return None, "Missing 'title'."
+    out: dict = {"title": title}
+    content = data.get("content")
+    if isinstance(content, str):
+        out["content"] = content
+    return out, None
+
+
+def _validate_google_docs_update(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    doc_id = (data.get("doc_id") or data.get("document_id") or "").strip()
+    if not doc_id:
+        return None, "Missing 'doc_id'."
+    content = data.get("content")
+    if not isinstance(content, str):
+        return None, "Missing 'content' (string)."
+    return {"doc_id": doc_id, "content": content}, None
+
+
 _ACTION_VALIDATORS = {
     "gmail.send": _validate_gmail_send,
     "calendar.create_event": _validate_calendar_create_event,
     "drive.create_doc": _validate_drive_create_doc,
     "contacts.create": _validate_contacts_create,
     "ghl.create_contact": _validate_ghl_create_contact,
+    "google.calendar_create_event": _validate_google_calendar_create_event,
+    "google.gmail_send":             _validate_google_gmail_send,
+    "google.drive_create_file":      _validate_google_drive_create_file,
+    "google.sheets_append":          _validate_google_sheets_append,
+    "google.sheets_create":          _validate_google_sheets_create,
+    "google.docs_create":            _validate_google_docs_create,
+    "google.docs_update":            _validate_google_docs_update,
     "ghl.update_contact": _validate_ghl_update_contact,
     "ghl.send_message": _validate_ghl_send_message,
     "ghl.add_note": _validate_ghl_add_note,
@@ -2103,11 +2338,161 @@ def _read_ghl_list_calendar_events(args: dict) -> tuple[str, Optional[dict]]:
     return "\n".join(lines), None
 
 
+# --- Google Workspace read handlers ----------------------------------------
+#
+# All return (markdown_summary, needs_setup_or_None). `needs_setup` bubbles up
+# through _extract_and_register_actions so the chat layer can pop SetupModal
+# in place of a generic "Google not connected" line.
+
+def _google_disconnected_msg() -> str:
+    return "> _Google isn't connected yet — I'll show you how to set it up._"
+
+
+def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict]]:
+    res = google_calendar.list_events(
+        time_min=args.get("time_min"),
+        time_max=args.get("time_max"),
+        max_results=args.get("max_results") or 20,
+    )
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        return (_google_disconnected_msg() if needs else f"> _Calendar lookup failed: {res['error']}_"), needs
+    events = res.get("events") or []
+    if not events:
+        return "> _No upcoming events found._", None
+    lines = [f"**Calendar events** ({len(events)}):"]
+    for e in events:
+        when = " → ".join(filter(None, [e.get("start"), e.get("end")]))
+        lines.append(f"- **{e.get('summary') or '(untitled)'}** — {when or '_no time_'} `id:{e.get('id')}`")
+    return "\n".join(lines), None
+
+
+def _read_google_gmail_list_messages(args: dict) -> tuple[str, Optional[dict]]:
+    query = (args.get("query") or "is:inbox").strip()
+    max_results = args.get("max_results") or 10
+    res = google_gmail.list_messages(query=query, max_results=max_results)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        return (_google_disconnected_msg() if needs else f"> _Gmail lookup failed: {res['error']}_"), needs
+    msgs = res.get("messages") or []
+    if not msgs:
+        return f"> _No messages match `{query}`._", None
+    lines = [f"**Gmail — `{query}`** ({len(msgs)}):"]
+    for m in msgs:
+        sender = (m.get("from") or "").split("<")[0].strip() or m.get("from") or "(unknown)"
+        snippet = (m.get("snippet") or "").strip().replace("\n", " ")[:100]
+        lines.append(f"- **{m.get('subject') or '(no subject)'}** — {sender}: {snippet} `id:{m.get('id')}`")
+    return "\n".join(lines), None
+
+
+def _read_google_gmail_get_message(args: dict) -> tuple[str, Optional[dict]]:
+    mid = (args.get("message_id") or "").strip()
+    if not mid:
+        return "> _Need a `message_id` to fetch the full email._", None
+    res = google_gmail.get_message(mid)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        return (_google_disconnected_msg() if needs else f"> _Gmail fetch failed: {res['error']}_"), needs
+    m = res.get("message") or {}
+    body = (m.get("body_text") or "").strip()
+    if len(body) > 1500:
+        body = body[:1500] + "\n…(truncated)"
+    return (
+        f"**{m.get('subject') or '(no subject)'}**\n"
+        f"From: {m.get('from')}\nDate: {m.get('date')}\n\n{body or '_(no plain-text body)_'}",
+        None,
+    )
+
+
+def _read_google_drive_list_files(args: dict) -> tuple[str, Optional[dict]]:
+    query = args.get("query")
+    max_results = args.get("max_results") or 20
+    res = google_drive.list_files(query=query, max_results=max_results)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        return (_google_disconnected_msg() if needs else f"> _Drive lookup failed: {res['error']}_"), needs
+    files = res.get("files") or []
+    if not files:
+        return "> _No matching Drive files._", None
+    lines = [f"**Drive files** ({len(files)}):"]
+    for f in files:
+        kind = (f.get("mime_type") or "").split(".")[-1].split("/")[-1]
+        lines.append(f"- **{f.get('name') or '(unnamed)'}** ({kind}) — modified {f.get('modified_time') or '?'} `id:{f.get('id')}`")
+    return "\n".join(lines), None
+
+
+def _read_google_drive_search(args: dict) -> tuple[str, Optional[dict]]:
+    name = (args.get("name_contains") or args.get("query") or "").strip()
+    if not name:
+        return "> _Need a search term._", None
+    res = google_drive.search_files(name, max_results=args.get("max_results") or 20)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        return (_google_disconnected_msg() if needs else f"> _Drive search failed: {res['error']}_"), needs
+    files = res.get("files") or []
+    if not files:
+        return f"> _No Drive files match `{name}`._", None
+    lines = [f"**Drive search `{name}`** ({len(files)}):"]
+    for f in files:
+        lines.append(f"- **{f.get('name') or '(unnamed)'}** — `id:{f.get('id')}`")
+    return "\n".join(lines), None
+
+
+def _read_google_sheets_read(args: dict) -> tuple[str, Optional[dict]]:
+    sid = (args.get("spreadsheet_id") or "").strip()
+    rng = (args.get("range") or "A1:Z100").strip()
+    if not sid:
+        return "> _Need a `spreadsheet_id` to read._", None
+    res = google_sheets.read_range(sid, range=rng)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        return (_google_disconnected_msg() if needs else f"> _Sheets read failed: {res['error']}_"), needs
+    values = res.get("values") or []
+    if not values:
+        return f"> _No data in `{rng}`._", None
+    # Render up to first 20 rows × 6 cols as a markdown table.
+    head = values[0] if values else []
+    rows = values[1:21] if len(values) > 1 else []
+    cols = max(len(r) for r in values[:21])
+    cols = min(cols, 6)
+    md = ["| " + " | ".join((head + [""] * cols)[:cols] or [""] * cols) + " |"]
+    md.append("| " + " | ".join(["---"] * cols) + " |")
+    for r in rows:
+        md.append("| " + " | ".join((r + [""] * cols)[:cols]) + " |")
+    if len(values) > 21:
+        md.append(f"_…and {len(values) - 21} more rows._")
+    return f"**{res.get('range') or rng}**\n" + "\n".join(md), None
+
+
+def _read_google_docs_get(args: dict) -> tuple[str, Optional[dict]]:
+    did = (args.get("doc_id") or "").strip()
+    if not did:
+        return "> _Need a `doc_id` to read._", None
+    res = google_docs.get_doc(did)
+    needs = res.get("needs_setup")
+    if res.get("error"):
+        return (_google_disconnected_msg() if needs else f"> _Docs read failed: {res['error']}_"), needs
+    content = (res.get("content") or "").strip()
+    if len(content) > 1500:
+        content = content[:1500] + "\n…(truncated)"
+    return (
+        f"**{res.get('title') or '(untitled)'}**\n\n{content or '_(empty doc)_'}",
+        None,
+    )
+
+
 _READ_ACTION_HANDLERS = {
     "ghl.search_contacts": _read_ghl_search_contacts,
     "ghl.list_opportunities": _read_ghl_list_opportunities,
     "ghl.list_conversations": _read_ghl_list_conversations,
     "ghl.list_calendar_events": _read_ghl_list_calendar_events,
+    "google.calendar_list_events": _read_google_calendar_list_events,
+    "google.gmail_list_messages":  _read_google_gmail_list_messages,
+    "google.gmail_get_message":    _read_google_gmail_get_message,
+    "google.drive_list_files":     _read_google_drive_list_files,
+    "google.drive_search":         _read_google_drive_search,
+    "google.sheets_read":          _read_google_sheets_read,
+    "google.docs_get":             _read_google_docs_get,
 }
 
 
@@ -2535,6 +2920,113 @@ def _execute_ghl_add_note(action_data: dict) -> tuple[bool, dict]:
     return False, _failure(result, "GHL add_note failed.")
 
 
+# --- Google Workspace v2 executors -----------------------------------------
+#
+# Thin shells over the per-service modules. Failures forward `needs_setup`
+# through `_failure` so the UI pops SetupModal on credential-missing errors.
+
+def _execute_google_calendar_create_event(action_data: dict) -> tuple[bool, dict]:
+    res = google_calendar.create_event(
+        summary=action_data["summary"],
+        start=action_data["start"],
+        end=action_data["end"],
+        timezone=action_data.get("timezone"),
+        description=action_data.get("description"),
+        location=action_data.get("location"),
+        attendees=action_data.get("attendees"),
+    )
+    if res.get("success"):
+        return True, {
+            "event_id": res.get("event_id"),
+            "html_link": res.get("html_link"),
+            "summary": res.get("summary") or action_data.get("summary"),
+        }
+    return False, _failure(res, "Google Calendar create_event failed.")
+
+
+def _execute_google_gmail_send(action_data: dict) -> tuple[bool, dict]:
+    res = google_gmail.send_message(
+        to=action_data["to"],
+        subject=action_data["subject"],
+        body=action_data["body"],
+        cc=action_data.get("cc"),
+        bcc=action_data.get("bcc"),
+    )
+    if res.get("success"):
+        return True, {
+            "message_id": res.get("message_id"),
+            "thread_id": res.get("thread_id"),
+        }
+    return False, _failure(res, "Gmail send failed.")
+
+
+def _execute_google_drive_create_file(action_data: dict) -> tuple[bool, dict]:
+    """Drive file create routes through Docs for richer content support — v1
+    treats every Drive create as "make a Google Doc with this name + body"
+    so Adam doesn't have to think about MIME types in chat."""
+    res = google_docs.create_doc(
+        title=action_data["name"],
+        content=action_data.get("content") or "",
+    )
+    if res.get("success"):
+        return True, {
+            "doc_id": res.get("doc_id"),
+            "url": res.get("url"),
+            "title": res.get("title") or action_data["name"],
+            "warning": res.get("error"),  # set when content insert failed mid-create
+        }
+    return False, _failure(res, "Drive create_file failed.")
+
+
+def _execute_google_sheets_append(action_data: dict) -> tuple[bool, dict]:
+    res = google_sheets.append_rows(
+        spreadsheet_id=action_data["spreadsheet_id"],
+        range=action_data["range"],
+        rows=action_data["rows"],
+    )
+    if res.get("success"):
+        return True, {
+            "spreadsheet_id": res.get("spreadsheet_id"),
+            "updated_range": res.get("updated_range"),
+            "updated_rows": res.get("updated_rows"),
+            "url": f"https://docs.google.com/spreadsheets/d/{res.get('spreadsheet_id')}/edit",
+        }
+    return False, _failure(res, "Sheets append failed.")
+
+
+def _execute_google_sheets_create(action_data: dict) -> tuple[bool, dict]:
+    res = google_sheets.create_sheet(action_data["title"])
+    if res.get("success"):
+        return True, {
+            "spreadsheet_id": res.get("spreadsheet_id"),
+            "url": res.get("url"),
+            "title": res.get("title"),
+        }
+    return False, _failure(res, "Sheets create failed.")
+
+
+def _execute_google_docs_create(action_data: dict) -> tuple[bool, dict]:
+    res = google_docs.create_doc(action_data["title"], content=action_data.get("content"))
+    if res.get("success"):
+        return True, {
+            "doc_id": res.get("doc_id"),
+            "url": res.get("url"),
+            "title": res.get("title") or action_data["title"],
+            "warning": res.get("error"),  # see google_docs.create_doc partial-success branch
+        }
+    return False, _failure(res, "Docs create failed.")
+
+
+def _execute_google_docs_update(action_data: dict) -> tuple[bool, dict]:
+    res = google_docs.update_doc(action_data["doc_id"], action_data["content"])
+    if res.get("success"):
+        return True, {
+            "doc_id": res.get("doc_id"),
+            "url": res.get("url"),
+        }
+    return False, _failure(res, "Docs update failed.")
+
+
 _EXECUTORS = {
     "gmail.send": _execute_gmail_send,
     "calendar.create_event": _execute_calendar_create_event,
@@ -2544,6 +3036,13 @@ _EXECUTORS = {
     "ghl.update_contact": _execute_ghl_update_contact,
     "ghl.send_message": _execute_ghl_send_message,
     "ghl.add_note": _execute_ghl_add_note,
+    "google.calendar_create_event": _execute_google_calendar_create_event,
+    "google.gmail_send":             _execute_google_gmail_send,
+    "google.drive_create_file":      _execute_google_drive_create_file,
+    "google.sheets_append":          _execute_google_sheets_append,
+    "google.sheets_create":          _execute_google_sheets_create,
+    "google.docs_create":            _execute_google_docs_create,
+    "google.docs_update":            _execute_google_docs_update,
 }
 
 

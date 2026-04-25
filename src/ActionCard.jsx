@@ -485,6 +485,143 @@ function GhlAddNoteBody({ data }) {
   );
 }
 
+// --- Google Workspace v2 body components --------------------------------
+
+function GoogleCalendarEventBody({ data }) {
+  const attendees = Array.isArray(data.attendees) ? data.attendees : [];
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13, color: "var(--fg)" }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>
+        {data.summary || "Untitled event"}
+      </div>
+      <IconLine emoji="🕐" text={`${data.start || "?"} → ${data.end || "?"}`} />
+      {data.timezone && data.timezone !== "Europe/London" && (
+        <div style={{ fontSize: 11, color: "var(--fg-faint)" }}>{data.timezone}</div>
+      )}
+      {data.location    && <IconLine emoji="📍" text={data.location} />}
+      {attendees.length > 0 && (
+        <IconLine emoji="👥" text={attendees.join(", ")} />
+      )}
+      {data.description && (
+        <div style={{ fontStyle: "italic", color: "var(--fg-muted)", marginTop: 4, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>
+          {data.description}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GoogleGmailSendBody({ data }) {
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13 }}>
+      <Row label="To"      value={data.to} />
+      {data.cc  && <Row label="Cc"  value={data.cc} />}
+      {data.bcc && <Row label="Bcc" value={data.bcc} />}
+      <Row label="Subject" value={data.subject} />
+      <div>
+        <div style={{ fontSize: 11, color: "var(--fg-faint)", marginBottom: 4, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          Body
+        </div>
+        <div style={{ whiteSpace: "pre-wrap", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", lineHeight: 1.55 }}>
+          {data.body}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GoogleDriveCreateBody({ data }) {
+  const preview = (data.content || "").trim();
+  const truncated = preview.length > 240;
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13 }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>{data.name || "(no name)"}</div>
+      <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+        Will be created as a Google Doc on your Drive.
+      </div>
+      {preview && (
+        <div style={{ whiteSpace: "pre-wrap", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", color: "var(--fg-muted)" }}>
+          {truncated ? preview.slice(0, 240) + "…" : preview}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GoogleSheetsAppendBody({ data }) {
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  const previewRows = rows.slice(0, 5);
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13 }}>
+      <Row label="Sheet" value={data.spreadsheet_id} />
+      <Row label="Range" value={data.range || "Sheet1!A:Z"} />
+      <div>
+        <div style={{ fontSize: 11, color: "var(--fg-faint)", marginBottom: 4, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          Rows ({rows.length})
+        </div>
+        <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, color: "var(--fg-muted)" }}>
+          {previewRows.map((r, i) => (
+            <div key={i} style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {(r || []).join("\t")}
+            </div>
+          ))}
+          {rows.length > previewRows.length && (
+            <div style={{ color: "var(--fg-faint)" }}>…and {rows.length - previewRows.length} more rows</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GoogleSheetsCreateBody({ data }) {
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13 }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>{data.title || "(no title)"}</div>
+      <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+        A new spreadsheet will be created on your Drive.
+      </div>
+    </div>
+  );
+}
+
+function GoogleDocsCreateBody({ data }) {
+  const preview = (data.content || "").trim();
+  const truncated = preview.length > 240;
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13 }}>
+      <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.3 }}>{data.title || "(no title)"}</div>
+      {preview ? (
+        <div style={{ whiteSpace: "pre-wrap", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", color: "var(--fg-muted)" }}>
+          {truncated ? preview.slice(0, 240) + "…" : preview}
+        </div>
+      ) : (
+        <div style={{ fontSize: 12, color: "var(--fg-faint)", fontStyle: "italic" }}>
+          (empty doc — Adam can fill it in after creation)
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GoogleDocsUpdateBody({ data }) {
+  const preview = (data.content || "").trim();
+  const truncated = preview.length > 320;
+  return (
+    <div className="flex flex-col gap-2" style={{ fontSize: 13 }}>
+      <Row label="Doc" value={data.doc_id} />
+      <div>
+        <div style={{ fontSize: 11, color: "var(--fg-faint)", marginBottom: 4, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          New body (replaces existing content)
+        </div>
+        <div style={{ whiteSpace: "pre-wrap", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", color: "var(--fg-muted)" }}>
+          {truncated ? preview.slice(0, 320) + "…" : preview}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // --- Action registry — small so adding new types later is a 1-line change --
 const ACTION_META = {
   "gmail.send": {
@@ -712,6 +849,107 @@ const ACTION_META = {
       );
     },
   },
+  "google.calendar_create_event": {
+    icon: Icon.Calendar,
+    label: "Calendar event",
+    confirmLabel: "Create event",
+    busyLabel: "Creating…",
+    editPlaceholder: "Tell Jackson what to change (time, attendees, details)…",
+    renderBody: (data) => <GoogleCalendarEventBody data={data} />,
+    renderSuccess: (_data, result) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        Event created{result?.html_link ? <> — <a href={result.html_link} target="_blank" rel="noopener noreferrer" style={{ color: "var(--green)", textDecoration: "underline" }}>opens in Google Calendar</a></> : "."}
+      </div>
+    ),
+  },
+  "google.gmail_send": {
+    icon: Icon.Mail,
+    label: "Send email",
+    confirmLabel: "Send",
+    busyLabel: "Sending…",
+    editPlaceholder: "Tell Jackson what to change (recipient, tone, content)…",
+    renderBody: (data) => <GoogleGmailSendBody data={data} />,
+    successPrefix: "Email sent to",
+    successKey: (data) => data?.to,
+  },
+  "google.drive_create_file": {
+    icon: Icon.FileText,
+    label: "Create on Drive",
+    confirmLabel: "Create file",
+    busyLabel: "Creating…",
+    editPlaceholder: "Tell Jackson what to change (name or content)…",
+    renderBody: (data) => <GoogleDriveCreateBody data={data} />,
+    renderSuccess: (data, result) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        Created {result?.title || data?.name}{result?.url ? <> — <a href={result.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--green)", textDecoration: "underline" }}>opens in Drive</a></> : "."}
+        {result?.warning && (
+          <div style={{ color: "var(--fg-muted)", fontSize: 12, marginTop: 4 }}>{result.warning}</div>
+        )}
+      </div>
+    ),
+  },
+  "google.sheets_append": {
+    icon: Icon.Database,
+    label: "Append to spreadsheet",
+    confirmLabel: "Append rows",
+    busyLabel: "Appending…",
+    editPlaceholder: "Tell Jackson what to change (which sheet, which rows)…",
+    renderBody: (data) => <GoogleSheetsAppendBody data={data} />,
+    renderSuccess: (_data, result) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        Appended {result?.updated_rows || "rows"} to {result?.updated_range || "the sheet"}
+        {result?.url ? <> — <a href={result.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--green)", textDecoration: "underline" }}>opens in Sheets</a></> : "."}
+      </div>
+    ),
+  },
+  "google.sheets_create": {
+    icon: Icon.Database,
+    label: "Create spreadsheet",
+    confirmLabel: "Create",
+    busyLabel: "Creating…",
+    editPlaceholder: "Tell Jackson what to change (the title)…",
+    renderBody: (data) => <GoogleSheetsCreateBody data={data} />,
+    renderSuccess: (_data, result) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        Created {result?.title}{result?.url ? <> — <a href={result.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--green)", textDecoration: "underline" }}>opens in Sheets</a></> : "."}
+      </div>
+    ),
+  },
+  "google.docs_create": {
+    icon: Icon.FileText,
+    label: "Create Google Doc",
+    confirmLabel: "Create",
+    busyLabel: "Creating…",
+    editPlaceholder: "Tell Jackson what to change (title or content)…",
+    renderBody: (data) => <GoogleDocsCreateBody data={data} />,
+    renderSuccess: (data, result) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        Created {result?.title || data?.title}{result?.url ? <> — <a href={result.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--green)", textDecoration: "underline" }}>opens in Docs</a></> : "."}
+        {result?.warning && (
+          <div style={{ color: "var(--fg-muted)", fontSize: 12, marginTop: 4 }}>{result.warning}</div>
+        )}
+      </div>
+    ),
+  },
+  "google.docs_update": {
+    icon: Icon.FileText,
+    label: "Update Google Doc",
+    confirmLabel: "Replace body",
+    busyLabel: "Updating…",
+    editPlaceholder: "Tell Jackson what to change (the new body)…",
+    renderBody: (data) => <GoogleDocsUpdateBody data={data} />,
+    renderSuccess: (_data, result) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        Doc updated{result?.url ? <> — <a href={result.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--green)", textDecoration: "underline" }}>opens in Docs</a></> : "."}
+      </div>
+    ),
+  },
 };
 
 // Map an action_type to the integration tool_id whose credentials it needs,
@@ -723,6 +961,13 @@ const ACTION_TOOL_REQUIREMENTS = {
   "ghl.update_contact": { tool: "ghl", context: "to update GHL contacts" },
   "ghl.send_message":   { tool: "ghl", context: "to send messages via GHL" },
   "ghl.add_note":       { tool: "ghl", context: "to attach notes in GHL" },
+  "google.calendar_create_event": { tool: "google", context: "to create a calendar event" },
+  "google.gmail_send":             { tool: "google", context: "to send an email" },
+  "google.drive_create_file":      { tool: "google", context: "to create a Drive file" },
+  "google.sheets_append":          { tool: "google", context: "to append rows to a spreadsheet" },
+  "google.sheets_create":          { tool: "google", context: "to create a spreadsheet" },
+  "google.docs_create":            { tool: "google", context: "to create a Google Doc" },
+  "google.docs_update":            { tool: "google", context: "to update a Google Doc" },
 };
 
 // --- Main card ------------------------------------------------------------
