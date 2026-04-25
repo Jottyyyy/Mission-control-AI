@@ -16,6 +16,7 @@ from ._common import _http_json
 
 BASE = "https://docs.googleapis.com/v1"
 TIMEOUT = 15.0
+SERVICE_KEY = "docs"
 
 
 def _authed_request(
@@ -44,10 +45,22 @@ def _authed_request(
 def _err(status: int, body: dict) -> str:
     if status == 0:
         return f"Couldn't reach Google Docs: {body.get('error', 'network error')}"
+    if status == 403:
+        api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+        if api:
+            return f"{api['service_label']} isn't enabled in your Google Cloud project."
     err = body.get("error") if isinstance(body, dict) else None
     if isinstance(err, dict):
         return err.get("message") or f"HTTP {status}"
     return f"HTTP {status}"
+
+
+def _failure(base: dict, status: int, body: dict) -> dict:
+    out = {**base, "error": _err(status, body)}
+    api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+    if api:
+        out["needs_api_enable"] = api
+    return out
 
 
 def create_doc(title: str, content: Optional[str] = None) -> dict:
@@ -67,7 +80,7 @@ def create_doc(title: str, content: Optional[str] = None) -> dict:
         return {"success": False, "doc_id": None, "url": None,
                 "error": "Google not connected", "needs_setup": needs}
     if status not in (200, 201) or not isinstance(body, dict):
-        return {"success": False, "doc_id": None, "url": None, "error": _err(status, body)}
+        return _failure({"success": False, "doc_id": None, "url": None}, status, body)
     doc_id = body.get("documentId")
     if not doc_id:
         return {"success": False, "doc_id": None, "url": None, "error": "No documentId in response."}
@@ -108,7 +121,7 @@ def get_doc(doc_id: str) -> dict:
         return {"found": False, "title": None, "content": None,
                 "error": "Google not connected", "needs_setup": needs}
     if status != 200 or not isinstance(body, dict):
-        return {"found": False, "title": None, "content": None, "error": _err(status, body)}
+        return _failure({"found": False, "title": None, "content": None}, status, body)
     return {
         "found": True,
         "doc_id": body.get("documentId"),
@@ -159,7 +172,7 @@ def update_doc(doc_id: str, content: str) -> dict:
     if needs:
         return {"success": False, "error": "Google not connected", "needs_setup": needs}
     if g_status != 200 or not isinstance(g_body, dict):
-        return {"success": False, "error": _err(g_status, g_body)}
+        return _failure({"success": False}, g_status, g_body)
 
     body_section = g_body.get("body") or {}
     contents = body_section.get("content") or []
@@ -185,7 +198,7 @@ def update_doc(doc_id: str, content: str) -> dict:
         body={"requests": requests},
     )
     if u_status not in (200, 201):
-        return {"success": False, "error": _err(u_status, u_body)}
+        return _failure({"success": False}, u_status, u_body)
     return {
         "success": True,
         "doc_id": doc_id,

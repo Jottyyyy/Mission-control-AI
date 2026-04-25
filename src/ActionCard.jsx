@@ -1061,10 +1061,16 @@ function ActionCard({ token, onEditRequest, onNeedsSetup }) {
       } else {
         // Backend returned a `needs_setup` signal → surface to the parent so
         // the SetupModal pops, instead of leaving a cryptic error on the card.
+        // Backend `needs_api_enable` rides on the terminal state itself so the
+        // card renders an inline activation link (NOT the modal).
         if (data?.needs_setup && onNeedsSetup) {
           onNeedsSetup(data.needs_setup);
         }
-        setTerminal({ kind: "error", error: data?.error || `HTTP ${res.status}` });
+        setTerminal({
+          kind: "error",
+          error: data?.error || `HTTP ${res.status}`,
+          needs_api_enable: data?.needs_api_enable || null,
+        });
       }
     } catch (err) {
       setTerminal({ kind: "error", error: err?.message || "Network error." });
@@ -1187,6 +1193,7 @@ function ActionCard({ token, onEditRequest, onNeedsSetup }) {
         <div style={cardStyle}>
           <HeaderRow IconCmp={IconCmp} label={meta.label} />
           {meta.renderBody(data)}
+          {terminal.needs_api_enable && <ApiEnableBanner info={terminal.needs_api_enable} />}
           <div style={{ fontSize: 12, color: "var(--danger)", marginTop: 10 }}>
             {terminal.error || "Something went wrong."}
           </div>
@@ -1317,6 +1324,59 @@ function ActionCard({ token, onEditRequest, onNeedsSetup }) {
           style={{ fontSize: 13, color: "var(--fg-muted)" }}
         >
           Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Inline banner inside an action card when /tools/execute fails because the
+// underlying Google API isn't enabled in Cloud Console. Same shape as the
+// Chat-level banner, scoped to the failed card so Adam sees it next to the
+// retry button. Distinct from the SetupModal flow.
+function ApiEnableBanner({ info }) {
+  if (!info || !info.console_url) return null;
+  const label = info.service_label || "Google API";
+  const open = () => {
+    try { window.open(info.console_url, "mc-google-enable", "noopener,noreferrer"); } catch { /* ignore */ }
+  };
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        padding: "10px 12px",
+        background: "rgba(180, 67, 44, 0.06)",
+        border: "1px solid rgba(180, 67, 44, 0.35)",
+        borderRadius: 8,
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 10,
+        fontSize: 13,
+        lineHeight: 1.5,
+      }}
+    >
+      <Icon.AlertTriangle className="lucide-sm" style={{ color: "var(--danger)", flexShrink: 0, marginTop: 2 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ color: "var(--fg)", fontWeight: 500, marginBottom: 4 }}>
+          {label} isn't enabled in your Google Cloud project
+        </div>
+        <div style={{ color: "var(--fg-muted)", marginBottom: 8 }}>
+          Click below, enable it in the Console, wait ~30 seconds for propagation, then Retry.
+        </div>
+        <button
+          type="button"
+          onClick={open}
+          className="btn-secondary"
+          style={{
+            fontSize: 12,
+            padding: "4px 10px",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          <Icon.ExternalLink className="lucide-xs" />
+          Open Cloud Console to enable
         </button>
       </div>
     </div>

@@ -15,6 +15,7 @@ from ._common import _http_json
 BASE = "https://www.googleapis.com/drive/v3"
 UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
 TIMEOUT = 12.0
+SERVICE_KEY = "drive"
 
 DEFAULT_FIELDS = "id, name, mimeType, modifiedTime, size, webViewLink, owners(displayName,emailAddress)"
 
@@ -55,10 +56,22 @@ def _authed_request(
 def _err(status: int, body: dict) -> str:
     if status == 0:
         return f"Couldn't reach Google Drive: {body.get('error', 'network error')}"
+    if status == 403:
+        api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+        if api:
+            return f"{api['service_label']} isn't enabled in your Google Cloud project."
     err = body.get("error") if isinstance(body, dict) else None
     if isinstance(err, dict):
         return err.get("message") or f"HTTP {status}"
     return f"HTTP {status}"
+
+
+def _failure(base: dict, status: int, body: dict) -> dict:
+    out = {**base, "error": _err(status, body)}
+    api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+    if api:
+        out["needs_api_enable"] = api
+    return out
 
 
 def _normalise_file(f: dict) -> dict:
@@ -103,7 +116,7 @@ def list_files(query: Optional[str] = None, max_results: int = 20) -> dict:
     if needs:
         return {"found": False, "files": [], "error": "Google not connected", "needs_setup": needs}
     if status != 200:
-        return {"found": False, "files": [], "error": _err(status, body)}
+        return _failure({"found": False, "files": []}, status, body)
     items = body.get("files") if isinstance(body, dict) else None
     if not isinstance(items, list):
         items = []
@@ -128,5 +141,5 @@ def get_file(file_id: str) -> dict:
     if needs:
         return {"found": False, "file": None, "error": "Google not connected", "needs_setup": needs}
     if status != 200:
-        return {"found": False, "file": None, "error": _err(status, body)}
+        return _failure({"found": False, "file": None}, status, body)
     return {"found": True, "file": _normalise_file(body), "error": None}

@@ -18,6 +18,7 @@ from ._common import _http_json
 
 BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 TIMEOUT = 12.0
+SERVICE_KEY = "gmail"
 
 
 def _authed_request(
@@ -53,10 +54,22 @@ def _authed_request(
 def _err(status: int, body: dict) -> str:
     if status == 0:
         return f"Couldn't reach Gmail: {body.get('error', 'network error')}"
+    if status == 403:
+        api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+        if api:
+            return f"{api['service_label']} isn't enabled in your Google Cloud project."
     err = body.get("error") if isinstance(body, dict) else None
     if isinstance(err, dict):
         return err.get("message") or f"HTTP {status}"
     return f"HTTP {status}"
+
+
+def _failure(base: dict, status: int, body: dict) -> dict:
+    out = {**base, "error": _err(status, body)}
+    api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+    if api:
+        out["needs_api_enable"] = api
+    return out
 
 
 def _header_value(headers: list[dict], name: str) -> Optional[str]:
@@ -94,7 +107,7 @@ def list_messages(query: str = "is:inbox", max_results: int = 20) -> dict:
     if needs:
         return {"found": False, "messages": [], "error": "Google not connected", "needs_setup": needs}
     if status != 200:
-        return {"found": False, "messages": [], "error": _err(status, body)}
+        return _failure({"found": False, "messages": []}, status, body)
     ids = [m.get("id") for m in (body.get("messages") or []) if isinstance(m, dict) and m.get("id")]
     summaries: list[dict] = []
     for mid in ids:
@@ -119,7 +132,7 @@ def get_message(message_id: str) -> dict:
     if needs:
         return {"found": False, "message": None, "error": "Google not connected", "needs_setup": needs}
     if status != 200:
-        return {"found": False, "message": None, "error": _err(status, body)}
+        return _failure({"found": False, "message": None}, status, body)
     payload = body.get("payload") if isinstance(body, dict) else None
     headers = (payload or {}).get("headers") or []
     text = _extract_plaintext(payload)
@@ -195,7 +208,7 @@ def send_message(
         return {"success": False, "message_id": None,
                 "error": "Google not connected", "needs_setup": needs}
     if status not in (200, 201):
-        return {"success": False, "message_id": None, "error": _err(status, resp)}
+        return _failure({"success": False, "message_id": None}, status, resp)
     return {
         "success": True,
         "message_id": resp.get("id"),

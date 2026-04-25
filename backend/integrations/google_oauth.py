@@ -318,3 +318,62 @@ def access_or_error(context: str) -> tuple[Optional[str], Optional[dict]]:
     if not token:
         return None, _not_configured(context)
     return token, None
+
+
+# ---------------------------------------------------------------------------
+# Service-level API enablement detection.
+# ---------------------------------------------------------------------------
+#
+# OAuth grants Adam access to Google's APIs in principle, but each individual
+# service must be enabled in the Cloud Console project. A 403 with
+# `status=PERMISSION_DENIED` and `details[].reason=SERVICE_DISABLED` means
+# "auth is fine, just toggle the API on". Surfacing this distinctly from a
+# generic 403 lets the UI show Adam a one-click activation link instead of
+# making him guess.
+
+# (label, host) per service-key. The host is also the segment Cloud Console
+# uses for its overview URLs, so the canonical activation URL is derivable
+# without hardcoding twice.
+SERVICE_API_LABELS: dict[str, tuple[str, str]] = {
+    "calendar": ("Google Calendar API", "calendar-json.googleapis.com"),
+    "gmail":    ("Gmail API",            "gmail.googleapis.com"),
+    "drive":    ("Google Drive API",     "drive.googleapis.com"),
+    "sheets":   ("Google Sheets API",    "sheets.googleapis.com"),
+    "docs":     ("Google Docs API",      "docs.googleapis.com"),
+}
+
+
+def detect_api_not_enabled(body: dict, service_key: str) -> Optional[dict]:
+    """Inspect a Google error body and return a needs_api_enable dict iff the
+    failure is specifically because the API isn't enabled.
+
+    Returns None for non-PERMISSION_DENIED 403s, scope errors, generic 403s,
+    and anything we don't recognise — those keep their plain-error path.
+
+    Preserves Google's `metadata.activationUrl` when present (it sometimes
+    deep-links to the exact project so Adam doesn't have to pick) and falls
+    back to the canonical console URL otherwise."""
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error") or {}
+    if not isinstance(error, dict):
+        return None
+    if error.get("status") != "PERMISSION_DENIED":
+        return None
+    details = error.get("details") or []
+    if not isinstance(details, list):
+        return None
+    for d in details:
+        if not isinstance(d, dict):
+            continue
+        if d.get("reason") != "SERVICE_DISABLED":
+            continue
+        label, host = SERVICE_API_LABELS.get(service_key, (service_key, f"{service_key}.googleapis.com"))
+        url = (d.get("metadata") or {}).get("activationUrl") \
+              or f"https://console.developers.google.com/apis/api/{host}/overview"
+        return {
+            "service": service_key,
+            "service_label": label,
+            "console_url": url,
+        }
+    return None

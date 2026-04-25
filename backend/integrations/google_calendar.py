@@ -16,6 +16,7 @@ from ._common import _http_json
 
 BASE = "https://www.googleapis.com/calendar/v3"
 TIMEOUT = 12.0
+SERVICE_KEY = "calendar"
 
 
 def _authed_request(
@@ -61,6 +62,12 @@ def _err_dict(status: int, body: dict) -> str:
     if status == 0:
         return f"Couldn't reach Google Calendar: {body.get('error', 'network error')}"
     if status == 403:
+        # Specific SERVICE_DISABLED gets a friendlier message — the caller
+        # also attaches `needs_api_enable` via _failure() so the UI can
+        # render a one-click activation banner alongside.
+        api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+        if api:
+            return f"{api['service_label']} isn't enabled in your Google Cloud project."
         return "Forbidden (403). Check the Calendar scope was granted."
     err = body.get("error") if isinstance(body, dict) else None
     if isinstance(err, dict):
@@ -68,6 +75,15 @@ def _err_dict(status: int, body: dict) -> str:
     if isinstance(err, str):
         return err
     return f"HTTP {status}"
+
+
+def _failure(base: dict, status: int, body: dict) -> dict:
+    """Compose a failure dict: base fields + error + (optional) needs_api_enable."""
+    out = {**base, "error": _err_dict(status, body)}
+    api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+    if api:
+        out["needs_api_enable"] = api
+    return out
 
 
 def _normalise_event(e: dict) -> dict:
@@ -112,7 +128,7 @@ def list_events(time_min: Optional[str] = None, time_max: Optional[str] = None, 
     if needs:
         return {"found": False, "events": [], "error": "Google not connected", "needs_setup": needs}
     if status != 200:
-        return {"found": False, "events": [], "error": _err_dict(status, body)}
+        return _failure({"found": False, "events": []}, status, body)
     items = body.get("items") if isinstance(body, dict) else None
     if not isinstance(items, list):
         items = []
@@ -127,7 +143,7 @@ def get_event(event_id: str) -> dict:
     if needs:
         return {"found": False, "event": None, "error": "Google not connected", "needs_setup": needs}
     if status != 200:
-        return {"found": False, "event": None, "error": _err_dict(status, body)}
+        return _failure({"found": False, "event": None}, status, body)
     return {"found": True, "event": _normalise_event(body), "error": None}
 
 
@@ -168,7 +184,7 @@ def create_event(
         return {"success": False, "event_id": None, "html_link": None,
                 "error": "Google not connected", "needs_setup": needs}
     if status not in (200, 201):
-        return {"success": False, "event_id": None, "html_link": None, "error": _err_dict(status, body)}
+        return _failure({"success": False, "event_id": None, "html_link": None}, status, body)
     return {
         "success": True,
         "event_id": body.get("id"),

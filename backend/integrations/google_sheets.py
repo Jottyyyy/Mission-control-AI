@@ -15,6 +15,7 @@ from ._common import _http_json
 
 BASE = "https://sheets.googleapis.com/v4"
 TIMEOUT = 12.0
+SERVICE_KEY = "sheets"
 
 
 def _authed_request(
@@ -49,10 +50,22 @@ def _authed_request(
 def _err(status: int, body: dict) -> str:
     if status == 0:
         return f"Couldn't reach Google Sheets: {body.get('error', 'network error')}"
+    if status == 403:
+        api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+        if api:
+            return f"{api['service_label']} isn't enabled in your Google Cloud project."
     err = body.get("error") if isinstance(body, dict) else None
     if isinstance(err, dict):
         return err.get("message") or f"HTTP {status}"
     return f"HTTP {status}"
+
+
+def _failure(base: dict, status: int, body: dict) -> dict:
+    out = {**base, "error": _err(status, body)}
+    api = google_oauth.detect_api_not_enabled(body, SERVICE_KEY)
+    if api:
+        out["needs_api_enable"] = api
+    return out
 
 
 def read_range(spreadsheet_id: str, range: str = "A1:Z100") -> dict:
@@ -65,7 +78,7 @@ def read_range(spreadsheet_id: str, range: str = "A1:Z100") -> dict:
     if needs:
         return {"found": False, "values": [], "error": "Google not connected", "needs_setup": needs}
     if status != 200:
-        return {"found": False, "values": [], "error": _err(status, body)}
+        return _failure({"found": False, "values": []}, status, body)
     values = body.get("values") if isinstance(body, dict) else None
     if not isinstance(values, list):
         values = []
@@ -92,7 +105,7 @@ def append_rows(spreadsheet_id: str, range: str, rows: list[list]) -> dict:
         return {"success": False, "updated_range": None,
                 "error": "Google not connected", "needs_setup": needs}
     if status not in (200, 201):
-        return {"success": False, "updated_range": None, "error": _err(status, body)}
+        return _failure({"success": False, "updated_range": None}, status, body)
     updates = body.get("updates") if isinstance(body, dict) else None
     return {
         "success": True,
@@ -117,7 +130,7 @@ def create_sheet(title: str) -> dict:
         return {"success": False, "spreadsheet_id": None, "url": None,
                 "error": "Google not connected", "needs_setup": needs}
     if status not in (200, 201):
-        return {"success": False, "spreadsheet_id": None, "url": None, "error": _err(status, body)}
+        return _failure({"success": False, "spreadsheet_id": None, "url": None}, status, body)
     sid = body.get("spreadsheetId")
     url = body.get("spreadsheetUrl") or (f"https://docs.google.com/spreadsheets/d/{sid}/edit" if sid else None)
     return {

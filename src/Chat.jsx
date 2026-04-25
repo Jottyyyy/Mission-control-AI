@@ -57,6 +57,60 @@ function BrainPill({ model }) {
   );
 }
 
+// Inline banner shown when a Google service request returned 403 with
+// reason=SERVICE_DISABLED (i.e. OAuth is fine, the specific API just isn't
+// enabled in Cloud Console). Distinct from the SetupModal flow — Adam needs
+// a one-click jump to Google's activation page, not the credential wizard.
+function ApiEnableBanner({ info }) {
+  if (!info || !info.console_url) return null;
+  const label = info.service_label || "Google API";
+  const open = () => {
+    try { window.open(info.console_url, "mc-google-enable", "noopener,noreferrer"); } catch { /* ignore */ }
+  };
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        padding: "10px 12px",
+        background: "rgba(180, 67, 44, 0.06)",
+        border: "1px solid rgba(180, 67, 44, 0.35)",
+        borderRadius: 8,
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 10,
+        fontSize: 13,
+        lineHeight: 1.5,
+      }}
+    >
+      <Icon.AlertTriangle className="lucide-sm" style={{ color: "var(--danger)", flexShrink: 0, marginTop: 2 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ color: "var(--fg)", fontWeight: 500, marginBottom: 4 }}>
+          {label} isn't enabled in your Google Cloud project
+        </div>
+        <div style={{ color: "var(--fg-muted)", marginBottom: 8 }}>
+          One-click enable in Cloud Console, wait ~30 seconds for it to propagate, then try again.
+        </div>
+        <button
+          type="button"
+          onClick={open}
+          className="btn-secondary"
+          style={{
+            fontSize: 12,
+            padding: "4px 10px",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            textDecoration: "none",
+          }}
+        >
+          <Icon.ExternalLink className="lucide-xs" />
+          Open Cloud Console to enable
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function FileCard({ card, onProcess, onDownload }) {
   const { filename, state, leads, error, results } = card;
   const leadCount = (leads || []).length;
@@ -337,7 +391,15 @@ function Chat({
       const data = await res.json();
       setMessages((m) => [
         ...m,
-        { from: "assistant", text: data.reply ?? "", model_used: data.model_used },
+        {
+          from: "assistant",
+          text: data.reply ?? "",
+          model_used: data.model_used,
+          // `needs_api_enable` rides on the message itself so the banner
+          // renders alongside the (already-rewritten) reply text. Distinct
+          // from `needs_setup`, which still goes to the SetupModal.
+          needs_api_enable: data.needs_api_enable || null,
+        },
       ]);
 
       if (data.conversation_id && data.conversation_id !== activeConversationUuid) {
@@ -765,6 +827,7 @@ function Chat({
                         )
                       )}
                 </div>
+                {m.needs_api_enable && <ApiEnableBanner info={m.needs_api_enable} />}
                 {!m.error && <BrainPill model={m.model_used} />}
               </div>
             )}

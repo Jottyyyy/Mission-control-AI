@@ -748,8 +748,9 @@ def chat(req: ChatRequest):
         # Action-marker post-processing. Setup mode never emits actions —
         # it's a credential walk-through, nothing to execute on Adam's behalf.
         needs_setup: Optional[dict] = None
+        needs_api_enable: Optional[dict] = None
         if effective_mode != "setup":
-            reply, needs_setup = _extract_and_register_actions(reply, conv_uuid, cur)
+            reply, needs_setup, needs_api_enable = _extract_and_register_actions(reply, conv_uuid, cur)
 
         cur.execute(
             "INSERT INTO messages (conversation_id, role, content, model_used) VALUES (?, ?, ?, ?)",
@@ -770,6 +771,8 @@ def chat(req: ChatRequest):
         }
         if needs_setup:
             response["needs_setup"] = needs_setup
+        if needs_api_enable:
+            response["needs_api_enable"] = needs_api_enable
         return response
 
     except subprocess.TimeoutExpired:
@@ -2219,7 +2222,7 @@ def _truncate(text: Optional[str], n: int = 80) -> str:
 # Each read handler returns (markdown, needs_setup_or_None). The text is
 # spliced into Jackson's reply; needs_setup (when present) bubbles up to the
 # /chat response so the frontend can auto-open SetupModal.
-def _read_ghl_search_contacts(args: dict) -> tuple[str, Optional[dict]]:
+def _read_ghl_search_contacts(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     query = (args.get("query") or "").strip()
     try:
         limit = int(args.get("limit") or 10)
@@ -2228,16 +2231,17 @@ def _read_ghl_search_contacts(args: dict) -> tuple[str, Optional[dict]]:
     limit = max(1, min(limit, 50))
     res = ghl.list_contacts(query=query or None, limit=limit)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
         msg = (
             "> _GHL isn't connected yet — I'll show you how to set it up._"
             if needs
             else f"> _GHL search failed: {res['error']}_"
         )
-        return msg, needs
+        return msg, needs, None
     contacts = res.get("contacts") or []
     if not contacts:
-        return f"> _No GHL contacts found for `{query or '(any)'}`._", None
+        return f"> _No GHL contacts found for `{query or '(any)'}`._", None, None
     lines = [f"**GHL contacts matching `{query}`** ({len(contacts)}):" if query
              else f"**Recent GHL contacts** ({len(contacts)}):"]
     for c in contacts:
@@ -2245,10 +2249,10 @@ def _read_ghl_search_contacts(args: dict) -> tuple[str, Optional[dict]]:
         bits = [b for b in (c.get("email"), c.get("phone"), c.get("company")) if b]
         meta = " · ".join(bits)
         lines.append(f"- **{nm}** — {meta or '_no contact info_'} `id:{c.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
-def _read_ghl_list_opportunities(args: dict) -> tuple[str, Optional[dict]]:
+def _read_ghl_list_opportunities(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     pipeline_id = args.get("pipeline_id") or None
     try:
         limit = int(args.get("limit") or 20)
@@ -2257,16 +2261,17 @@ def _read_ghl_list_opportunities(args: dict) -> tuple[str, Optional[dict]]:
     limit = max(1, min(limit, 50))
     res = ghl.list_opportunities(pipeline_id=pipeline_id, limit=limit)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
         msg = (
             "> _GHL isn't connected yet — I'll show you how to set it up._"
             if needs
             else f"> _GHL opportunities lookup failed: {res['error']}_"
         )
-        return msg, needs
+        return msg, needs, None
     opps = res.get("opportunities") or []
     if not opps:
-        return "> _No GHL opportunities found._", None
+        return "> _No GHL opportunities found._", None, None
     lines = [f"**GHL opportunities** ({len(opps)}):"]
     for o in opps:
         money = o.get("monetary_value")
@@ -2275,10 +2280,10 @@ def _read_ghl_list_opportunities(args: dict) -> tuple[str, Optional[dict]]:
         status = o.get("status") or ""
         bits = " · ".join(filter(None, [contact, status, money_str]))
         lines.append(f"- **{o.get('name') or '(unnamed)'}** {('— ' + bits) if bits else ''} `id:{o.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
-def _read_ghl_list_conversations(args: dict) -> tuple[str, Optional[dict]]:
+def _read_ghl_list_conversations(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     contact_id = args.get("contact_id") or None
     try:
         limit = int(args.get("limit") or 10)
@@ -2287,16 +2292,17 @@ def _read_ghl_list_conversations(args: dict) -> tuple[str, Optional[dict]]:
     limit = max(1, min(limit, 50))
     res = ghl.list_conversations(contact_id=contact_id, limit=limit)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
         msg = (
             "> _GHL isn't connected yet — I'll show you how to set it up._"
             if needs
             else f"> _GHL conversations lookup failed: {res['error']}_"
         )
-        return msg, needs
+        return msg, needs, None
     convos = res.get("conversations") or []
     if not convos:
-        return "> _No GHL conversations found._", None
+        return "> _No GHL conversations found._", None, None
     lines = [f"**Recent GHL conversations** ({len(convos)}):"]
     for c in convos:
         nm = c.get("contact_name") or "(unknown)"
@@ -2304,38 +2310,39 @@ def _read_ghl_list_conversations(args: dict) -> tuple[str, Optional[dict]]:
         unread = c.get("unread_count") or 0
         unread_tag = f" · {unread} unread" if unread else ""
         lines.append(f"- **{nm}**{unread_tag}: {last} `id:{c.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
-def _read_ghl_list_calendar_events(args: dict) -> tuple[str, Optional[dict]]:
+def _read_ghl_list_calendar_events(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     calendar_id = (args.get("calendar_id") or "").strip()
     start = args.get("start")
     end = args.get("end")
     if not calendar_id:
         cal_res = ghl.list_calendars()
         if cal_res.get("needs_setup"):
-            return "> _GHL isn't connected yet — I'll show you how to set it up._", cal_res["needs_setup"]
+            return "> _GHL isn't connected yet — I'll show you how to set it up._", cal_res["needs_setup"], None
         cals = cal_res.get("calendars") or []
         if not cals:
-            return "> _No GHL calendars configured._", None
+            return "> _No GHL calendars configured._", None, None
         calendar_id = cals[0]["id"]
     res = ghl.list_calendar_events(calendar_id, start=start, end=end)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
         msg = (
             "> _GHL isn't connected yet — I'll show you how to set it up._"
             if needs
             else f"> _GHL calendar lookup failed: {res['error']}_"
         )
-        return msg, needs
+        return msg, needs, None
     events = res.get("events") or []
     if not events:
-        return "> _No GHL events in that range._", None
+        return "> _No GHL events in that range._", None, None
     lines = [f"**GHL events** ({len(events)}):"]
     for e in events:
         rng = " → ".join(filter(None, [e.get("start"), e.get("end")]))
         lines.append(f"- **{e.get('title') or '(untitled)'}** — {rng or '_no time_'} `id:{e.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
 # --- Google Workspace read handlers ----------------------------------------
@@ -2348,51 +2355,54 @@ def _google_disconnected_msg() -> str:
     return "> _Google isn't connected yet — I'll show you how to set it up._"
 
 
-def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict]]:
+def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     res = google_calendar.list_events(
         time_min=args.get("time_min"),
         time_max=args.get("time_max"),
         max_results=args.get("max_results") or 20,
     )
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
-        return (_google_disconnected_msg() if needs else f"> _Calendar lookup failed: {res['error']}_"), needs
+        return (_google_disconnected_msg() if needs else f"> _Calendar lookup failed: {res['error']}_"), needs, api
     events = res.get("events") or []
     if not events:
-        return "> _No upcoming events found._", None
+        return "> _No upcoming events found._", None, None
     lines = [f"**Calendar events** ({len(events)}):"]
     for e in events:
         when = " → ".join(filter(None, [e.get("start"), e.get("end")]))
         lines.append(f"- **{e.get('summary') or '(untitled)'}** — {when or '_no time_'} `id:{e.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
-def _read_google_gmail_list_messages(args: dict) -> tuple[str, Optional[dict]]:
+def _read_google_gmail_list_messages(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     query = (args.get("query") or "is:inbox").strip()
     max_results = args.get("max_results") or 10
     res = google_gmail.list_messages(query=query, max_results=max_results)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
-        return (_google_disconnected_msg() if needs else f"> _Gmail lookup failed: {res['error']}_"), needs
+        return (_google_disconnected_msg() if needs else f"> _Gmail lookup failed: {res['error']}_"), needs, api
     msgs = res.get("messages") or []
     if not msgs:
-        return f"> _No messages match `{query}`._", None
+        return f"> _No messages match `{query}`._", None, None
     lines = [f"**Gmail — `{query}`** ({len(msgs)}):"]
     for m in msgs:
         sender = (m.get("from") or "").split("<")[0].strip() or m.get("from") or "(unknown)"
         snippet = (m.get("snippet") or "").strip().replace("\n", " ")[:100]
         lines.append(f"- **{m.get('subject') or '(no subject)'}** — {sender}: {snippet} `id:{m.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
-def _read_google_gmail_get_message(args: dict) -> tuple[str, Optional[dict]]:
+def _read_google_gmail_get_message(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     mid = (args.get("message_id") or "").strip()
     if not mid:
-        return "> _Need a `message_id` to fetch the full email._", None
+        return "> _Need a `message_id` to fetch the full email._", None, None
     res = google_gmail.get_message(mid)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
-        return (_google_disconnected_msg() if needs else f"> _Gmail fetch failed: {res['error']}_"), needs
+        return (_google_disconnected_msg() if needs else f"> _Gmail fetch failed: {res['error']}_"), needs, api
     m = res.get("message") or {}
     body = (m.get("body_text") or "").strip()
     if len(body) > 1500:
@@ -2401,55 +2411,59 @@ def _read_google_gmail_get_message(args: dict) -> tuple[str, Optional[dict]]:
         f"**{m.get('subject') or '(no subject)'}**\n"
         f"From: {m.get('from')}\nDate: {m.get('date')}\n\n{body or '_(no plain-text body)_'}",
         None,
-    )
+        None,
+    )  # text, needs_setup, needs_api_enable
 
 
-def _read_google_drive_list_files(args: dict) -> tuple[str, Optional[dict]]:
+def _read_google_drive_list_files(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     query = args.get("query")
     max_results = args.get("max_results") or 20
     res = google_drive.list_files(query=query, max_results=max_results)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
-        return (_google_disconnected_msg() if needs else f"> _Drive lookup failed: {res['error']}_"), needs
+        return (_google_disconnected_msg() if needs else f"> _Drive lookup failed: {res['error']}_"), needs, api
     files = res.get("files") or []
     if not files:
-        return "> _No matching Drive files._", None
+        return "> _No matching Drive files._", None, None
     lines = [f"**Drive files** ({len(files)}):"]
     for f in files:
         kind = (f.get("mime_type") or "").split(".")[-1].split("/")[-1]
         lines.append(f"- **{f.get('name') or '(unnamed)'}** ({kind}) — modified {f.get('modified_time') or '?'} `id:{f.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
-def _read_google_drive_search(args: dict) -> tuple[str, Optional[dict]]:
+def _read_google_drive_search(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     name = (args.get("name_contains") or args.get("query") or "").strip()
     if not name:
-        return "> _Need a search term._", None
+        return "> _Need a search term._", None, None
     res = google_drive.search_files(name, max_results=args.get("max_results") or 20)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
-        return (_google_disconnected_msg() if needs else f"> _Drive search failed: {res['error']}_"), needs
+        return (_google_disconnected_msg() if needs else f"> _Drive search failed: {res['error']}_"), needs, api
     files = res.get("files") or []
     if not files:
-        return f"> _No Drive files match `{name}`._", None
+        return f"> _No Drive files match `{name}`._", None, None
     lines = [f"**Drive search `{name}`** ({len(files)}):"]
     for f in files:
         lines.append(f"- **{f.get('name') or '(unnamed)'}** — `id:{f.get('id')}`")
-    return "\n".join(lines), None
+    return "\n".join(lines), None, None
 
 
-def _read_google_sheets_read(args: dict) -> tuple[str, Optional[dict]]:
+def _read_google_sheets_read(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     sid = (args.get("spreadsheet_id") or "").strip()
     rng = (args.get("range") or "A1:Z100").strip()
     if not sid:
-        return "> _Need a `spreadsheet_id` to read._", None
+        return "> _Need a `spreadsheet_id` to read._", None, None
     res = google_sheets.read_range(sid, range=rng)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
-        return (_google_disconnected_msg() if needs else f"> _Sheets read failed: {res['error']}_"), needs
+        return (_google_disconnected_msg() if needs else f"> _Sheets read failed: {res['error']}_"), needs, api
     values = res.get("values") or []
     if not values:
-        return f"> _No data in `{rng}`._", None
+        return f"> _No data in `{rng}`._", None, None
     # Render up to first 20 rows × 6 cols as a markdown table.
     head = values[0] if values else []
     rows = values[1:21] if len(values) > 1 else []
@@ -2461,23 +2475,25 @@ def _read_google_sheets_read(args: dict) -> tuple[str, Optional[dict]]:
         md.append("| " + " | ".join((r + [""] * cols)[:cols]) + " |")
     if len(values) > 21:
         md.append(f"_…and {len(values) - 21} more rows._")
-    return f"**{res.get('range') or rng}**\n" + "\n".join(md), None
+    return f"**{res.get('range') or rng}**\n" + "\n".join(md), None, None
 
 
-def _read_google_docs_get(args: dict) -> tuple[str, Optional[dict]]:
+def _read_google_docs_get(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     did = (args.get("doc_id") or "").strip()
     if not did:
-        return "> _Need a `doc_id` to read._", None
+        return "> _Need a `doc_id` to read._", None, None
     res = google_docs.get_doc(did)
     needs = res.get("needs_setup")
+    api = res.get("needs_api_enable")
     if res.get("error"):
-        return (_google_disconnected_msg() if needs else f"> _Docs read failed: {res['error']}_"), needs
+        return (_google_disconnected_msg() if needs else f"> _Docs read failed: {res['error']}_"), needs, api
     content = (res.get("content") or "").strip()
     if len(content) > 1500:
         content = content[:1500] + "\n…(truncated)"
     return (
         f"**{res.get('title') or '(untitled)'}**\n\n{content or '_(empty doc)_'}",
         None,
+    None,
     )
 
 
@@ -2500,26 +2516,30 @@ def _extract_and_register_actions(
     reply: str,
     conv_uuid: Optional[str],
     cur: sqlite3.Cursor,
-) -> tuple[str, Optional[dict]]:
+) -> tuple[str, Optional[dict], Optional[dict]]:
     """Walk Jackson's reply, dispatch each ```action:<type>``` block.
 
     Read-only types (`ghl.search_contacts`, `ghl.list_*`) execute inline and
     are replaced with a markdown summary. Write types create a pending_actions
     row and become `[[action-card:<token>]]`.
 
-    Returns `(rewritten_reply, needs_setup_or_None)`. When any read handler
-    detects missing credentials, the first such signal is bubbled up so the
-    /chat endpoint can echo it back and the frontend can pop SetupModal.
+    Returns `(rewritten_reply, needs_setup, needs_api_enable)`. Either signal
+    can be present independently — needs_setup means OAuth/credentials aren't
+    configured (pop SetupModal); needs_api_enable means OAuth worked but the
+    specific Google API isn't enabled in Cloud Console (show inline banner
+    with activation link). They're mutually exclusive in practice but the
+    parser doesn't enforce that.
 
     Invalid JSON or unknown type → marker stays in place (no row created).
     This keeps hallucinations harmless: without a row, the UI can't render
     a card and Adam can't confirm a ghost action."""
     if not reply or "```action:" not in reply:
-        return reply, None
+        return reply, None, None
 
     _expire_old_pending_actions(cur)
 
     needs_setup_signals: list[dict] = []
+    needs_api_enable_signals: list[dict] = []
 
     def replace(match: re.Match) -> str:
         action_type = match.group(1).strip()
@@ -2537,11 +2557,13 @@ def _extract_and_register_actions(
         read_handler = _READ_ACTION_HANDLERS.get(action_type)
         if read_handler:
             try:
-                text, needs = read_handler(data)
+                text, needs, api_enable = read_handler(data)
             except Exception as exc:  # noqa: BLE001
                 return f"> _GHL read failed: {exc}_"
             if needs:
                 needs_setup_signals.append(needs)
+            if api_enable:
+                needs_api_enable_signals.append(api_enable)
             return text
 
         validator = _ACTION_VALIDATORS.get(action_type)
@@ -2563,7 +2585,11 @@ def _extract_and_register_actions(
 
     rewritten = _ACTION_MARKER_RE.sub(replace, reply)
     needs_setup = _merge_needs_setup(needs_setup_signals) if needs_setup_signals else None
-    return rewritten, needs_setup
+    # Multiple read actions hitting different disabled APIs in one reply is
+    # vanishingly rare — surface the first one. The user enables, retries,
+    # and (if a second was missing) gets the same banner for the next API.
+    needs_api_enable = needs_api_enable_signals[0] if needs_api_enable_signals else None
+    return rewritten, needs_setup, needs_api_enable
 
 
 def _merge_needs_setup(signals: list[dict]) -> Optional[dict]:
@@ -2870,12 +2896,15 @@ def _ghl_view_link(contact_id: Optional[str]) -> Optional[str]:
 
 
 def _failure(result: dict, fallback: str) -> dict:
-    """Build a uniform executor failure dict. Forwards `needs_setup` from
-    the integration client when present so /tools/execute can pop SetupModal
-    instead of just showing the raw error string."""
+    """Build a uniform executor failure dict. Forwards `needs_setup` and
+    `needs_api_enable` from the integration client when present so
+    /tools/execute can either pop SetupModal (credentials missing) or render
+    an inline activation banner (API not enabled)."""
     out = {"error": result.get("error") or fallback}
     if result.get("needs_setup"):
         out["needs_setup"] = result["needs_setup"]
+    if result.get("needs_api_enable"):
+        out["needs_api_enable"] = result["needs_api_enable"]
     return out
 
 
@@ -3149,10 +3178,15 @@ def tools_execute(payload: ExecutePayload):
         "error": result.get("error") if not success else None,
         "audit_id": audit_id,
     }
-    # `needs_setup` only appears on credential-missing failures — the frontend
-    # uses it to auto-open SetupModal in place of the generic error message.
-    if not success and isinstance(result, dict) and result.get("needs_setup"):
-        response["needs_setup"] = result["needs_setup"]
+    # `needs_setup` and `needs_api_enable` are mutually exclusive surfaces:
+    # the first pops SetupModal (credentials missing); the second renders an
+    # inline activation banner (API not enabled). Either may be present on
+    # a non-success result; neither appears on success.
+    if not success and isinstance(result, dict):
+        if result.get("needs_setup"):
+            response["needs_setup"] = result["needs_setup"]
+        if result.get("needs_api_enable"):
+            response["needs_api_enable"] = result["needs_api_enable"]
     return response
 
 
