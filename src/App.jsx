@@ -215,7 +215,7 @@ function App() {
   const screenLabel =
     screen === "dashboard" ? "Dashboard" :
     screen === "mission" ? "Mission control" :
-    Data.assistants[assistantKey].name;
+    (Data.assistants[assistantKey]?.name || assistantKey);
 
   // While we're still talking to /onboarding/status, render nothing — the
   // backend takes up to 30s to go healthy on a cold packaged launch and the
@@ -256,6 +256,13 @@ function App() {
         <Dashboard
           onOpenAssistant={handleOpenAssistant}
           onOpenSettings={() => { setMissionReturn("dashboard"); setScreen("mission"); }}
+          onOpenAgentsTab={() => {
+            // Land on the Agents tab inside Mission Control via URL hash;
+            // MissionControl reads this on mount to set the initial tab.
+            try { window.location.hash = "#agents"; } catch { /* ignore */ }
+            setMissionReturn("dashboard");
+            setScreen("mission");
+          }}
           dark={dark}
           setDark={setDark}
         />

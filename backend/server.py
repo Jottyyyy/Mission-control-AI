@@ -592,7 +592,12 @@ def health():
     return {"status": "ok", "local": True, "workspace": str(WORKSPACE)}
 
 
-def _invoke_openclaw(prefixed: str, brain: str, session_id: Optional[str]) -> subprocess.CompletedProcess:
+def _invoke_openclaw(
+    prefixed: str,
+    brain: str,
+    session_id: Optional[str],
+    model_override: Optional[str] = None,
+) -> subprocess.CompletedProcess:
     """Run the main OpenClaw agent. Threads session_id through so each Mission
     Control conversation maps to a dedicated OpenClaw session (fresh system
     prompt on first turn, continuity across later turns in the same chat).
@@ -600,7 +605,10 @@ def _invoke_openclaw(prefixed: str, brain: str, session_id: Optional[str]) -> su
     For the deep brain we pass --thinking high and set ANTHROPIC_MODEL in the
     subprocess env so the gateway picks Opus if it honours the override. If
     OpenClaw ignores both (model pinned in openclaw.json), the reply still
-    goes through — it just uses the configured primary."""
+    goes through — it just uses the configured primary.
+
+    `model_override`, when set, takes precedence over the deep/fast routing —
+    used for custom agents where Adam picked a specific model at create time."""
     cmd = [OPENCLAW_BIN, "agent", "--agent", "main", "--message", prefixed]
     if session_id:
         cmd.extend(["--session-id", session_id])
@@ -608,6 +616,8 @@ def _invoke_openclaw(prefixed: str, brain: str, session_id: Optional[str]) -> su
     if brain == "deep":
         cmd.extend(["--thinking", "high"])
         env["ANTHROPIC_MODEL"] = "anthropic/claude-opus-4-7"
+    if model_override:
+        env["ANTHROPIC_MODEL"] = model_override
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
 
 
@@ -649,26 +659,73 @@ def chat(req: ChatRequest):
     )
     conn.commit()
 
-    # Prefix for the main agent's routing.
+    # Prefix for the main agent's routing. Built-in modes get the legacy
+    # short prefixes the workspace AGENTS.md already understands. Custom
+    # agents get an explicit "[custom-agent:<slug>]" prefix plus a SOUL.md
+    # preamble so the main router has everything it needs to adopt the
+    # custom persona without us touching workspace AGENTS.md per agent.
+    custom_agent = None
     if effective_mode == "marketing":
         prefixed = "[marketing] " + message
     elif effective_mode == "setup":
         prefixed = "[setup] " + message
-    else:
+    elif effective_mode == "personal":
         prefixed = "[personal] " + message
+    elif _is_custom_agent_slug(effective_mode):
+        custom_agent = _read_agent(effective_mode)
+        soul_md = (custom_agent or {}).get("soul_md") or ""
+        # Embed the persona inline so the main agent can adopt it without
+        # needing AGENTS.md routing rules updated for each new custom agent.
+        prefixed = (
+            f"[custom-agent:{effective_mode}] You are now operating as the "
+            f"'{custom_agent['name']}' specialist. Adopt the persona, capabilities, "
+            "and tool list from the SOUL.md below verbatim — it is the source of "
+            "truth for this conversation.\n\n"
+            "---\n"
+            f"{soul_md}\n"
+            "---\n\n"
+            f"Adam's message: {message}"
+        )
+    else:
+        # Unknown slug — fall back to personal so chat still works rather
+        # than 500ing. The agent won't have the bespoke persona, but Adam
+        # can still get a reply and route the issue.
+        prefixed = "[personal] " + message
+        effective_mode = "personal"
 
     # Setup mode is always FAST — credential walk-throughs don't benefit
     # from deep reasoning and the latency matters for a step-by-step flow.
+    # Custom agents use whatever model was picked at create time.
     if effective_mode == "setup":
         brain = "fast"
+    elif custom_agent:
+        # Custom agent's chosen model is authoritative; we still report a
+        # sensible model_used label by mapping the model key onto our two
+        # broad buckets (opus → deep, anything else → fast).
+        brain = "deep" if custom_agent.get("model") == "opus-4-7" else "fast"
     else:
         brain = route_to_brain(message, effective_mode)
     model_used = "opus" if brain == "deep" else "sonnet"
 
+    model_override: Optional[str] = None
+    if custom_agent:
+        model_key = custom_agent.get("model") or AGENT_DEFAULT_MODEL
+        model_override = AGENT_MODEL_CATALOGUE.get(model_key, {}).get("anthropic")
+        # Surface the precise model in the response so the UI's BrainPill can
+        # show "haiku" / "sonnet" / "opus" instead of forcing it into two buckets.
+        if model_key.startswith("haiku"):
+            model_used = "haiku"
+        elif model_key.startswith("opus"):
+            model_used = "opus"
+        else:
+            model_used = "sonnet"
+
     try:
-        result = _invoke_openclaw(prefixed, brain, conv_uuid)
-        if result.returncode != 0 and brain == "deep":
+        result = _invoke_openclaw(prefixed, brain, conv_uuid, model_override=model_override)
+        if result.returncode != 0 and brain == "deep" and not custom_agent:
             # Deep failed — one retry on fast before giving up.
+            # Custom agents skip this retry: their model is intentional, not a
+            # heuristic, so silently downgrading would surprise Adam.
             brain = "fast"
             model_used = "sonnet"
             result = _invoke_openclaw(prefixed, brain, conv_uuid)
@@ -722,7 +779,13 @@ def chat(req: ChatRequest):
 # ---------------------------------------------------------------------------
 
 @app.get("/conversations")
-def conversations_list(mode: Optional[Literal["personal", "marketing"]] = Query(None)):
+def conversations_list(mode: Optional[str] = Query(None)):
+    # Accept any slug (built-in `personal` / `marketing` plus any custom-agent
+    # slug created via /agents/create). The slug regex below blocks anything
+    # that isn't a valid identifier — protects against SQL via Pydantic-style
+    # input even though we already use a parameterised query.
+    if mode is not None and not re.match(r"^[a-z0-9][a-z0-9\-]{0,49}$", mode):
+        raise HTTPException(status_code=400, detail="Invalid mode.")
     conn = _db()
     if mode:
         rows = conn.execute(
@@ -3211,3 +3274,389 @@ def man_upload_spreadsheet(payload: ManSpreadsheetPayload):
         "count": len(leads),
         "has_zint_candidate": has_candidate,
     }
+
+
+# ---------------------------------------------------------------------------
+# Custom agents — CRUD over ~/.openclaw/workspace/agents/<slug>/.
+# ---------------------------------------------------------------------------
+#
+# Built-in agents (personal, marketing, setup) are scaffolded by the workspace
+# template installer and are read-only here — you can list them but you can't
+# edit, delete, or recreate them through this surface.
+#
+# Custom agents live alongside the built-ins under the same agents/ folder.
+# Each has:
+#   SOUL.md          — generated from Adam's free-text answers (persona +
+#                      capabilities + tools + model).
+#   AGENTS.md        — short descriptor that the routing layer can read.
+#   config.json      — model preference, tool whitelist, created_at, schema_v.
+#   skills/          — empty directory; reserved for future per-agent skills.
+#
+# Slug rules: lowercased, words separated by `-`, no leading dot, no path
+# separators. The reserved set blocks built-ins so a custom create can't
+# overwrite them. Slugs round-trip 1:1 through filesystem and HTTP paths.
+
+AGENT_BUILTIN_SLUGS = {"personal", "marketing", "setup"}
+AGENT_BUILTIN_META = {
+    "personal":  {"name": "Personal assistant",  "description": "Calendar, inbox, briefings, meeting prep, notes."},
+    "marketing": {"name": "Marketing assistant", "description": "Leads, MAN identification, enrichment, pipeline."},
+    "setup":     {"name": "Setup specialist",    "description": "Tool integrations and credential walk-throughs."},
+}
+
+# Wider model catalogue — Anthropic releases regularly, so the dict is the
+# single place that knows the gateway-prefixed name and the friendly label.
+# Keys are persisted in config.json; renames here don't break existing agents
+# as long as the key stays stable.
+AGENT_MODEL_CATALOGUE = {
+    "sonnet-4-6": {"label": "Sonnet 4.6 — fast and balanced",      "anthropic": "anthropic/claude-sonnet-4-6"},
+    "opus-4-7":   {"label": "Opus 4.7 — deepest thinking, slower", "anthropic": "anthropic/claude-opus-4-7"},
+    "haiku-4-5":  {"label": "Haiku 4.5 — fastest and cheapest",    "anthropic": "anthropic/claude-haiku-4-5"},
+}
+AGENT_DEFAULT_MODEL = "sonnet-4-6"
+
+# Tool catalogue surfaced through GET /agents/tools. UI checkboxes read from
+# this so the descriptions stay in lockstep with what the backend actually
+# wires up. Adding a future tool here doesn't auto-grant access — the agent's
+# config.json captures Adam's selection at create-time.
+AGENT_TOOL_CATALOGUE = {
+    "google_workspace": "Calendar, Docs, Sheets, Drive, and Email",
+    "hubspot":          "CRM contacts, deals, and companies",
+    "ghl":              "GoHighLevel marketing CRM (contacts, conversations, opportunities)",
+    "pomanda":          "UK Companies House data and shareholder lookup",
+    "cognism":          "Email and mobile enrichment (primary)",
+    "lusha":            "Email and mobile enrichment (fallback)",
+}
+
+AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _\-]{1,49}$")
+AGENT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,49}$")
+
+
+def _slugify_agent_name(name: str) -> str:
+    """Best-effort, deterministic slug from a free-text agent name.
+
+    Lowercases, replaces runs of non-alphanumerics with `-`, trims leading
+    and trailing dashes, and caps at 50 chars. Returns "" for unusable input
+    so the caller can reject with a clear 400."""
+    s = (name or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    return s[:50]
+
+
+def _agent_dir(slug: str) -> Path:
+    """Resolve a custom agent's workspace directory and refuse to escape.
+
+    Without this guard, `slug = "../../etc"` would resolve to outside the
+    workspace and we'd happily delete arbitrary files in DELETE /agents/<slug>.
+    The slug regex already rejects `..` and `/`, but we double-check via
+    Path.relative_to so even a future regex bug can't turn into RCE."""
+    base = (WORKSPACE / "agents" / slug).resolve()
+    try:
+        base.relative_to(WORKSPACE.resolve())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid agent slug.") from e
+    return base
+
+
+def _build_agent_soul(
+    name: str,
+    soul_text: str,
+    skills: list[str],
+    tools: list[str],
+    model_key: str,
+) -> str:
+    """Render the SOUL.md a custom agent ships with.
+
+    Format mirrors the built-in agents at a high level (Identity / Capabilities
+    / Tools / Model / Conversational style) so the main router agent can read
+    them with the same heuristics."""
+    skills = [s for s in (skills or []) if isinstance(s, str) and s.strip()]
+    tools = [t for t in (tools or []) if t in AGENT_TOOL_CATALOGUE]
+    skill_block = "\n".join(f"- {s.strip()}" for s in skills) if skills else "_None specified yet._"
+    tool_block = (
+        "\n".join(f"- **{tid}** — {AGENT_TOOL_CATALOGUE[tid]}" for tid in tools)
+        if tools
+        else "_No external tools selected._"
+    )
+    model_label = AGENT_MODEL_CATALOGUE.get(model_key, {}).get("label") or model_key
+    return (
+        f"# {name}\n\n"
+        f"## Identity\n\n{soul_text.strip() or 'Custom agent.'}\n\n"
+        f"## Capabilities\n\n{skill_block}\n\n"
+        f"## Available tools\n\n{tool_block}\n\n"
+        f"## Model\n\nThis agent uses **{model_label}** for responses.\n\n"
+        "## Conversational style\n\n"
+        "- Address the user as Adam.\n"
+        "- Maintain the personality described above.\n"
+        "- When unsure, ask Adam rather than guessing.\n"
+        "- For tool actions, follow the golden rule: confirmation card before any external write.\n"
+    )
+
+
+def _build_agent_summary(name: str, skills: list[str], tools: list[str]) -> str:
+    """Render the slim AGENTS.md companion file. Intentionally short — it
+    exists so the main routing agent can scan a one-paragraph summary instead
+    of loading the full SOUL.md on every turn."""
+    skill_line = ", ".join(s.strip() for s in (skills or []) if isinstance(s, str) and s.strip()) or "(no skills declared)"
+    tool_line = ", ".join(t for t in (tools or []) if t in AGENT_TOOL_CATALOGUE) or "(no tools)"
+    return (
+        f"# {name}\n\n"
+        f"Custom agent created via Mission Control's Agents page.\n\n"
+        f"**Skills:** {skill_line}\n\n"
+        f"**Tools:** {tool_line}\n\n"
+        "See `SOUL.md` for the full persona and `config.json` for model selection.\n"
+    )
+
+
+def _read_agent(slug: str) -> Optional[dict]:
+    """Reads a custom agent's persisted state. Returns None when missing or
+    when config.json can't be parsed — callers translate to 404."""
+    d = _agent_dir(slug)
+    cfg_path = d / "config.json"
+    soul_path = d / "SOUL.md"
+    if not cfg_path.exists() or not soul_path.exists():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    try:
+        soul = soul_path.read_text(encoding="utf-8")
+    except OSError:
+        soul = ""
+    return {
+        "slug": slug,
+        "name": cfg.get("name") or slug,
+        "soul": cfg.get("soul") or "",
+        "soul_md": soul,
+        "skills": cfg.get("skills") or [],
+        "tools": cfg.get("tools") or [],
+        "model": cfg.get("model") or AGENT_DEFAULT_MODEL,
+        "created_at": cfg.get("created_at"),
+        "updated_at": cfg.get("updated_at"),
+    }
+
+
+def _is_custom_agent_slug(slug: str) -> bool:
+    """Cheap path check used by /chat to decide whether to load a custom
+    agent's SOUL.md as a system-prompt preamble. Doesn't validate config.json
+    contents — the chat path tolerates a missing file by falling back to the
+    plain prefix routing."""
+    if slug in AGENT_BUILTIN_SLUGS or slug in ("personal", "marketing", "setup"):
+        return False
+    if not AGENT_SLUG_RE.match(slug or ""):
+        return False
+    cfg = (WORKSPACE / "agents" / slug / "config.json")
+    return cfg.exists()
+
+
+class AgentCreatePayload(BaseModel):
+    name: str
+    soul: Optional[str] = ""
+    skills: Optional[list[str]] = None
+    tools: Optional[list[str]] = None
+    model: Optional[str] = AGENT_DEFAULT_MODEL
+
+
+class AgentUpdatePayload(BaseModel):
+    name: Optional[str] = None
+    soul: Optional[str] = None
+    skills: Optional[list[str]] = None
+    tools: Optional[list[str]] = None
+    model: Optional[str] = None
+
+
+@app.get("/agents/tools")
+def agents_tool_catalogue():
+    """Stable list of tool keys + friendly descriptions for the UI picker."""
+    return {"tools": [{"id": k, "description": v} for k, v in AGENT_TOOL_CATALOGUE.items()]}
+
+
+@app.get("/agents/models")
+def agents_model_catalogue():
+    """Stable list of model keys + friendly labels for the UI dropdown."""
+    return {
+        "default": AGENT_DEFAULT_MODEL,
+        "models": [{"id": k, "label": v["label"]} for k, v in AGENT_MODEL_CATALOGUE.items()],
+    }
+
+
+@app.get("/agents/list")
+def agents_list():
+    """Enumerate built-in + custom agents.
+
+    Built-ins come from a fixed dict; custom ones come from scanning
+    workspace/agents/* for directories that aren't in AGENT_BUILTIN_SLUGS and
+    have a config.json. Anything else (e.g. hand-edited specialist folders)
+    is ignored — keeps the list grounded to what was created via this UI."""
+    builtin = []
+    for slug, meta in AGENT_BUILTIN_META.items():
+        soul_path = WORKSPACE / "agents" / slug / "SOUL.md"
+        builtin.append({
+            "slug": slug,
+            "name": meta["name"],
+            "description": meta["description"],
+            "exists": soul_path.exists(),
+            "builtin": True,
+        })
+
+    custom: list[dict] = []
+    agents_root = WORKSPACE / "agents"
+    if agents_root.exists():
+        for entry in sorted(agents_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            slug = entry.name
+            if slug in AGENT_BUILTIN_SLUGS:
+                continue
+            data = _read_agent(slug)
+            if not data:
+                continue
+            data["builtin"] = False
+            data.pop("soul_md", None)  # keep list payload small; full SOUL.md loaded on detail
+            custom.append(data)
+
+    return {"builtin": builtin, "custom": custom}
+
+
+@app.get("/agents/{slug}")
+def agents_get(slug: str):
+    if not AGENT_SLUG_RE.match(slug or ""):
+        raise HTTPException(status_code=400, detail="Invalid slug.")
+    if slug in AGENT_BUILTIN_SLUGS:
+        meta = AGENT_BUILTIN_META[slug]
+        soul_path = WORKSPACE / "agents" / slug / "SOUL.md"
+        soul_md = soul_path.read_text(encoding="utf-8") if soul_path.exists() else ""
+        return {
+            "slug": slug,
+            "name": meta["name"],
+            "description": meta["description"],
+            "soul_md": soul_md,
+            "builtin": True,
+        }
+    data = _read_agent(slug)
+    if not data:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    data["builtin"] = False
+    return data
+
+
+@app.post("/agents/create")
+def agents_create(payload: AgentCreatePayload):
+    """Create a new custom agent. Idempotency is intentional — duplicate names
+    return 409 rather than silently overwriting an existing config.json (which
+    would lose Adam's prior soul / skills / model selection)."""
+    name = (payload.name or "").strip()
+    if not name or not AGENT_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Name must be 2–50 alphanumerics, spaces, hyphens, or underscores.")
+    slug = _slugify_agent_name(name)
+    if not slug or not AGENT_SLUG_RE.match(slug):
+        raise HTTPException(status_code=400, detail="Could not derive a valid slug from that name.")
+    if slug in AGENT_BUILTIN_SLUGS:
+        raise HTTPException(status_code=409, detail=f"'{slug}' is a built-in agent.")
+
+    model = payload.model or AGENT_DEFAULT_MODEL
+    if model not in AGENT_MODEL_CATALOGUE:
+        raise HTTPException(status_code=400, detail=f"Unknown model '{model}'.")
+
+    tools = [t for t in (payload.tools or []) if t in AGENT_TOOL_CATALOGUE]
+
+    skills_raw = payload.skills or []
+    if isinstance(skills_raw, str):
+        # Frontend may send skills as a single newline/comma blob — normalise
+        # both shapes to a list of trimmed non-empty entries.
+        skills_raw = re.split(r"[\n,]+", skills_raw)
+    skills = [s.strip() for s in skills_raw if isinstance(s, str) and s.strip()]
+
+    soul_text = (payload.soul or "").strip()
+
+    d = _agent_dir(slug)
+    if d.exists():
+        raise HTTPException(status_code=409, detail=f"Agent '{slug}' already exists.")
+
+    d.mkdir(parents=True, exist_ok=False)
+    (d / "skills").mkdir(parents=True, exist_ok=True)
+
+    now_iso = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+    cfg = {
+        "schema_v": 1,
+        "slug": slug,
+        "name": name,
+        "soul": soul_text,
+        "skills": skills,
+        "tools": tools,
+        "model": model,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    (d / "config.json").write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    (d / "SOUL.md").write_text(_build_agent_soul(name, soul_text, skills, tools, model), encoding="utf-8")
+    (d / "AGENTS.md").write_text(_build_agent_summary(name, skills, tools), encoding="utf-8")
+
+    return {"success": True, "slug": slug, "agent": _read_agent(slug)}
+
+
+@app.put("/agents/{slug}")
+def agents_update(slug: str, payload: AgentUpdatePayload):
+    if not AGENT_SLUG_RE.match(slug or ""):
+        raise HTTPException(status_code=400, detail="Invalid slug.")
+    if slug in AGENT_BUILTIN_SLUGS:
+        raise HTTPException(status_code=403, detail="Cannot edit built-in agents.")
+    existing = _read_agent(slug)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    name = (payload.name or existing["name"]).strip()
+    if not AGENT_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Invalid name.")
+
+    model = payload.model or existing["model"]
+    if model not in AGENT_MODEL_CATALOGUE:
+        raise HTTPException(status_code=400, detail=f"Unknown model '{model}'.")
+
+    tools_in = payload.tools if payload.tools is not None else existing["tools"]
+    tools = [t for t in (tools_in or []) if t in AGENT_TOOL_CATALOGUE]
+
+    skills_in = payload.skills if payload.skills is not None else existing["skills"]
+    if isinstance(skills_in, str):
+        skills_in = re.split(r"[\n,]+", skills_in)
+    skills = [s.strip() for s in (skills_in or []) if isinstance(s, str) and s.strip()]
+
+    soul_text = (payload.soul if payload.soul is not None else existing["soul"]).strip()
+
+    now_iso = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+    cfg = {
+        "schema_v": 1,
+        "slug": slug,
+        "name": name,
+        "soul": soul_text,
+        "skills": skills,
+        "tools": tools,
+        "model": model,
+        "created_at": existing.get("created_at") or now_iso,
+        "updated_at": now_iso,
+    }
+
+    d = _agent_dir(slug)
+    (d / "config.json").write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    (d / "SOUL.md").write_text(_build_agent_soul(name, soul_text, skills, tools, model), encoding="utf-8")
+    (d / "AGENTS.md").write_text(_build_agent_summary(name, skills, tools), encoding="utf-8")
+
+    return {"success": True, "slug": slug, "agent": _read_agent(slug)}
+
+
+@app.delete("/agents/{slug}")
+def agents_delete(slug: str):
+    if not AGENT_SLUG_RE.match(slug or ""):
+        raise HTTPException(status_code=400, detail="Invalid slug.")
+    if slug in AGENT_BUILTIN_SLUGS:
+        raise HTTPException(status_code=403, detail="Cannot delete built-in agents.")
+    d = _agent_dir(slug)
+    if not d.exists():
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    # shutil.rmtree is fine here — _agent_dir already verified the path lives
+    # inside WORKSPACE so we can't walk out via a malicious slug.
+    import shutil
+    shutil.rmtree(d)
+    return {"success": True, "slug": slug}

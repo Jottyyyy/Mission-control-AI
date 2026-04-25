@@ -1,11 +1,26 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import Data from './data.jsx';
 import Icon from './icons.jsx';
+import { API_BASE } from './SettingsEditor.jsx';
 
 // Landing dashboard: overview + two assistant cards
-function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
+function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark, onOpenAgentsTab }) {
   const pa = Data.assistants.personal;
   const ma = Data.assistants.marketing;
+  const [customAgents, setCustomAgents] = useState([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/agents/list`);
+        if (!r.ok) return;
+        const data = await r.json();
+        if (!cancelled) setCustomAgents(data.custom || []);
+      } catch { /* offline / not running yet — no custom agents render */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const AssistantCard = ({ a, tint }) => (
     <button
@@ -145,6 +160,26 @@ function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
             <AssistantCard a={ma} tint="var(--accent-soft)" />
           </div>
 
+          {/* Custom agents — Adam's hand-rolled specialists. Rendered below the
+              built-in pair so they don't visually overpower Personal/Marketing
+              for new users with zero customs configured. The "+ Create" tile is
+              always last so the row never feels empty. */}
+          <div className="mt-6 sm:mt-8">
+            <div style={{ fontSize: 12, color: "var(--fg-faint)", marginBottom: 12 }}>
+              Custom agents
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {customAgents.map((a) => (
+                <CustomAgentCard
+                  key={a.slug}
+                  agent={a}
+                  onOpen={() => onOpenAssistant(a.slug)}
+                />
+              ))}
+              <CreateAgentCard onClick={() => onOpenAgentsTab?.()} />
+            </div>
+          </div>
+
           {/* Quick actions */}
           <div className="mt-8 sm:mt-10">
             <div style={{ fontSize: 12, color: "var(--fg-faint)", marginBottom: 12 }}>Quick actions</div>
@@ -190,6 +225,75 @@ function Dashboard({ onOpenAssistant, onOpenSettings, dark, setDark }) {
         </div>
       </div>
     </div>
+  );
+}
+
+function CustomAgentCard({ agent, onOpen }) {
+  const initial = (agent.name || agent.slug || "?").charAt(0).toUpperCase();
+  const blurb = (agent.soul || "").trim().slice(0, 80);
+  return (
+    <button
+      onClick={onOpen}
+      className="card text-left p-4 flex flex-col"
+      style={{ minHeight: 140, transition: "border-color 150ms ease", cursor: "pointer" }}
+      onMouseEnter={(e) => (e.currentTarget.style.borderColor = "var(--border-strong)")}
+      onMouseLeave={(e) => (e.currentTarget.style.borderColor = "var(--border)")}
+      title={agent.soul || agent.name}
+    >
+      <div className="flex items-center gap-3" style={{ marginBottom: 8 }}>
+        <div
+          aria-hidden
+          style={{
+            width: 28, height: 28, borderRadius: 8,
+            background: "var(--bg-elev)", border: "1px solid var(--border)",
+            color: "var(--fg)", fontSize: 14, fontWeight: 600,
+            display: "inline-flex", alignItems: "center", justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          {initial}
+        </div>
+        <div className="min-w-0">
+          <div className="truncate" style={{ fontSize: 14, fontWeight: 500, color: "var(--fg)" }}>{agent.name}</div>
+          <div className="truncate" style={{ fontSize: 11, color: "var(--fg-faint)" }}>{agent.model || "sonnet-4-6"}</div>
+        </div>
+      </div>
+      <div style={{ fontSize: 12, color: "var(--fg-muted)", lineHeight: 1.5 }}>
+        {blurb || "Custom agent."}
+      </div>
+      <div className="mt-auto pt-3 flex items-center justify-end" style={{ fontSize: 12, color: "var(--accent)" }}>
+        Open chat <Icon.ChevronRight className="lucide-xs" />
+      </div>
+    </button>
+  );
+}
+
+function CreateAgentCard({ onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className="text-left p-4"
+      style={{
+        minHeight: 140,
+        border: "1px dashed var(--border-strong)",
+        borderRadius: 10,
+        background: "transparent",
+        color: "var(--fg-muted)",
+        cursor: "pointer",
+        display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: "center", gap: 6,
+        transition: "border-color 150ms ease, color 150ms ease",
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.color = "var(--fg)"; }}
+      onMouseLeave={(e) => { e.currentTarget.style.borderColor = "var(--border-strong)"; e.currentTarget.style.color = "var(--fg-muted)"; }}
+    >
+      <div className="flex items-center gap-2" style={{ fontSize: 14, fontWeight: 500 }}>
+        <Icon.Plus className="lucide-sm" />
+        Create new agent
+      </div>
+      <div style={{ fontSize: 12, lineHeight: 1.5 }}>
+        Hand-rolled assistants — pick a personality, skills, tools, and model.
+      </div>
+    </button>
   );
 }
 

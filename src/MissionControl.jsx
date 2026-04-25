@@ -10,10 +10,23 @@ import {
   NewSkillModal,
 } from './SettingsEditor.jsx';
 import Connections from './Connections.jsx';
+import Agents from './Agents.jsx';
 import Workflows from './Workflows.jsx';
 
 function MissionControl({ onBack, onOpenChatPrefilled }) {
-  const [tab, setTab] = useState("connections"); // connections | workflows | skills | soul | rules | aboutyou | memory | workspace | activity
+  const [tab, setTab] = useState(() => {
+    // Honour a `#<tab>` hash so the Dashboard's "+ Create new agent" tile
+    // can deep-link straight to the Agents tab. Falls back to connections.
+    try {
+      const h = (window.location.hash || "").replace(/^#/, "");
+      if (h && ["connections","agents","workflows","skills","soul","rules","aboutyou","memory","workspace","activity"].includes(h)) {
+        // Clear the hash so a later soft reload doesn't reopen the same tab.
+        try { history.replaceState(null, "", window.location.pathname + window.location.search); } catch { /* ignore */ }
+        return h;
+      }
+    } catch { /* ignore */ }
+    return "connections";
+  });
 
   const Header = () => (
     <div
@@ -36,6 +49,7 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
   const TabRail = () => {
     const tabs = [
       { id: "connections", label: "Connections",  icon: "Plug" },
+      { id: "agents",      label: "Agents",       icon: "Users" },
       { id: "workflows",   label: "Workflows",    icon: "Layers" },
       { id: "skills",      label: "Skills",       icon: "Sparkles" },
       { id: "soul",        label: "Soul",         icon: "Brain" },
@@ -540,6 +554,9 @@ function MissionControl({ onBack, onOpenChatPrefilled }) {
         <TabRail />
         <div className="flex-1 flex min-w-0">
           {tab === "connections" && <Connections />}
+          {tab === "agents" && (
+            <Agents onOpenChat={(slug) => onOpenChatPrefilled?.(slug, "")} />
+          )}
           {tab === "workflows" && <Workflows />}
           {tab === "skills" && <Skills />}
           {tab === "soul" && <SoulSection />}

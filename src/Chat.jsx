@@ -123,7 +123,7 @@ function FileCard({ card, onProcess, onDownload }) {
 }
 
 function Chat({
-  assistantKey,                 // "personal" | "marketing"
+  assistantKey,                 // "personal" | "marketing" | custom agent slug
   mode,                         // "empty-first" | "empty-recurring" | "active"
   setMode,
   onTriggerPipeline,
@@ -134,7 +134,37 @@ function Chat({
   activeConversationUuid,       // null for new, otherwise uuid
   setActiveConversationUuid,    // (uuid | null) => void
 }) {
-  const a = Data.assistants[assistantKey];
+  // Custom agent metadata isn't in Data.assistants — fetch on mount when the
+  // slug isn't a built-in. Falls through to a synthesised stub so all the
+  // existing `a.name`, `a.chips`, `a.icon` references keep working.
+  const builtinKey = (assistantKey === "marketing" || assistantKey === "personal") ? assistantKey : null;
+  const [customAgent, setCustomAgent] = useState(null);
+  useEffect(() => {
+    if (builtinKey) { setCustomAgent(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/agents/${encodeURIComponent(assistantKey)}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (!cancelled) setCustomAgent(data);
+      } catch { /* keep stub a; chat still works against /chat */ }
+    })();
+    return () => { cancelled = true; };
+  }, [assistantKey, builtinKey]);
+
+  const a = builtinKey
+    ? Data.assistants[builtinKey]
+    : {
+        key: assistantKey,
+        name: customAgent?.name || assistantKey,
+        blurb: (customAgent?.soul || "").slice(0, 80) || "Custom agent",
+        icon: "Sparkles",
+        chips: [],
+        emptyGreetingBlurb: customAgent?.soul || "Custom agent.",
+        activityToday: 0,
+        recent: [],
+      };
   const chips = a.chips;
 
   const [input, setInput] = useState(prefill || "");
@@ -279,7 +309,12 @@ function Chat({
     setThinking(true);
     if (isPipeline) onTriggerPipeline();
 
-    const backendMode = assistantKey === "marketing" ? "marketing" : "personal";
+    // Built-in slugs route via the legacy modes; custom agents pass their
+    // slug through verbatim and the backend's /chat resolves it via
+    // _is_custom_agent_slug → SOUL.md preamble.
+    const backendMode = (assistantKey === "marketing" || assistantKey === "personal")
+      ? assistantKey
+      : assistantKey;
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 60000);

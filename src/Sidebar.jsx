@@ -48,7 +48,14 @@ function Sidebar({
   onOpenSettings,
   onBackToDashboard,
 }) {
-  const a = Data.assistants[assistantKey];
+  // Custom agent slugs aren't in Data.assistants — synthesise a minimal stub
+  // so the existing template references (a.name, a.icon) keep rendering.
+  const a = Data.assistants[assistantKey] || {
+    key: assistantKey,
+    name: assistantKey,
+    icon: "Sparkles",
+    chips: [],
+  };
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
