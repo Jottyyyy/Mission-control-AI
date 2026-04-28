@@ -155,9 +155,20 @@ function startBackend({ onUnexpectedExit } = {}) {
   // redirect writable paths (SQLite, etc.) to ~/Library/Application Support.
   // Without this, Path(__file__).parent.parent resolves inside Resources/app/
   // which macOS refuses to let us write to.
-  const backendEnv = app.isPackaged
-    ? { ...process.env, PYTHONUNBUFFERED: '1', MC_PACKAGED: '1' }
-    : { ...process.env, PYTHONUNBUFFERED: '1' };
+  //
+  // PATH augmentation: GUI-launched Electron processes inherit a stripped PATH
+  // (/usr/bin:/bin:/usr/sbin:/sbin). The backend shells out to openclaw, whose
+  // shebang is `#!/usr/bin/env node`, so without /opt/homebrew/bin on PATH the
+  // /chat call dies with "env: node: No such file or directory". Prepend the
+  // standard Homebrew bin dirs before spawning.
+  const homebrewBins = ['/opt/homebrew/bin', '/usr/local/bin'];
+  const inheritedPath = (process.env.PATH || '').split(':');
+  const augmentedPath = [
+    ...homebrewBins.filter((p) => !inheritedPath.includes(p)),
+    ...inheritedPath,
+  ].join(':');
+  const baseEnv = { ...process.env, PATH: augmentedPath, PYTHONUNBUFFERED: '1' };
+  const backendEnv = app.isPackaged ? { ...baseEnv, MC_PACKAGED: '1' } : baseEnv;
 
   child = spawn(
     python,
