@@ -17,4 +17,4 @@ Capture a quick thought, decision, or follow-up into the right place without int
 
 ## Status
 
-Scaffold only — implementation pending. Required tools/credentials to activate: write access to `memory/` and `MEMORY.md` (already available). Optional note-app bridges — `memo` for Apple Notes, `grizzly` for Bear, `obsidian-cli` — not required for v1.
+Live. Notes write directly into the workspace — `memory/YYYY-MM-DD.md` for the running daily log, `MEMORY.md` for curated long-term keepers (main sessions only). For notes Adam wants in Google Docs, emit `action:google.docs_create` for confirmation via the action card.

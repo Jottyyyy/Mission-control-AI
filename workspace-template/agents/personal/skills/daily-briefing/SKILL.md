@@ -18,4 +18,4 @@ Produce Adam's morning readout. Runs on request, or as the first step of a heart
 
 ## Status
 
-Scaffold only — implementation pending. Required tools/credentials to activate: Google Workspace CLI (`gog`) or himalaya + calendar read access; authenticated session for whichever source is chosen. Also needs `calendar-check` and `email-triage` as dependencies.
+Live. The dependencies — `calendar-check` (via `action:google.calendar_list_events`) and `email-triage` (via `action:google.gmail_list_messages`) — are both wired through the Google Workspace integration (v1.20). Build the briefing by emitting those read markers; the results are spliced inline so the briefing can quote them.

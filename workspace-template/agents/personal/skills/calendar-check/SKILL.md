@@ -17,4 +17,4 @@ Answer calendar questions — "am I free Thursday afternoon?", "what conflicts w
 
 ## Status
 
-Scaffold only — implementation pending. Required tools/credentials to activate: authenticated calendar API (Google Calendar via `gog`, or equivalent). No auto-accept / auto-decline — Adam always confirms.
+Live. The `google.calendar_list_events` and `google.calendar_create_event` actions are wired through Mission Control's Google Workspace integration (v1.20). For any calendar question, emit `action:google.calendar_list_events` and read the spliced result. For new events or moves, emit `action:google.calendar_create_event` for Adam to confirm via the action card. No auto-accept / auto-decline.

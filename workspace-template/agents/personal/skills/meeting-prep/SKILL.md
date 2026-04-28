@@ -17,4 +17,4 @@ Produce a pre-meeting brief: who Adam is meeting, recent relevant context, the l
 
 ## Status
 
-Scaffold only — implementation pending. Required tools/credentials to activate: calendar read access, email-history access, and a query path into the marketing specialist's contact store (HubSpot API, or a shared workspace-side file).
+Live. Calendar context comes from `action:google.calendar_list_events`; email history from `action:google.gmail_list_messages` (Gmail search syntax — e.g. `from:<attendee> newer_than:30d`); CRM context from `action:ghl.search_contacts`. Compose the brief by emitting those read markers and summarising the spliced results.

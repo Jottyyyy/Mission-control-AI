@@ -17,4 +17,4 @@ Process Adam's inbox and return the handful he actually needs to see. Runs on re
 
 ## Status
 
-Scaffold only — implementation pending. Required tools/credentials to activate: himalaya configured with IMAP creds, or `gog` with Gmail read scope. Sending is out of scope for this skill — drafting replies belongs elsewhere and always needs Adam's approval.
+Live. `action:google.gmail_list_messages` and `action:google.gmail_get_message` are wired through the Google Workspace integration (v1.20). Use a Gmail search query (e.g. `is:inbox newer_than:2d`, `is:unread label:^starred`) to scope the triage. Sending replies stays out of scope here — drafting outgoing email goes via `action:google.gmail_send` and always needs Adam's confirmation on the action card.

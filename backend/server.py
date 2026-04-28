@@ -76,6 +76,20 @@ OPENCLAW_BIN = "/opt/homebrew/bin/openclaw"
 OPENCLAW_CONFIG_PATH = HOME / ".openclaw" / "openclaw.json"
 GATEWAY_PORT = 18789
 
+# Electron-on-macOS launches GUI apps with a stripped PATH (typically
+# /usr/bin:/bin:/usr/sbin:/sbin). The openclaw CLI is a Node script with
+# `#!/usr/bin/env node`, so without /opt/homebrew/bin on PATH `env` cannot
+# resolve `node` and every /chat call returns 500 "env: node: No such file
+# or directory". Prepend the standard Homebrew bin dirs once at startup so
+# every subprocess we spawn (openclaw, gcloud, etc.) inherits a usable PATH.
+_HOMEBREW_BINS = ("/opt/homebrew/bin", "/usr/local/bin")
+_existing_path = os.environ.get("PATH", "")
+_path_parts = _existing_path.split(os.pathsep) if _existing_path else []
+for _bin in reversed(_HOMEBREW_BINS):
+    if _bin not in _path_parts:
+        _path_parts.insert(0, _bin)
+os.environ["PATH"] = os.pathsep.join(_path_parts)
+
 # Hydrate ANTHROPIC_API_KEY from the Keychain early so the router (Haiku) and
 # every openclaw subprocess inherits it. The onboarding flow writes the key
 # under service="mission-control-ai", account="anthropic:api_key" (the same
@@ -2355,6 +2369,23 @@ def _google_disconnected_msg() -> str:
     return "> _Google isn't connected yet — I'll show you how to set it up._"
 
 
+def _google_fence(tag: str, payload: dict) -> str:
+    """Wrap a structured payload in a fenced JSON block. v1.23 frontend
+    (markdown.jsx → GoogleRenderers.jsx) detects the tag and renders the
+    appropriate React card. ASCII-safe JSON keeps the output stable across
+    transports; pretty-print is fine since the renderer parses it back."""
+    body = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    return f"```{tag}\n{body}\n```"
+
+
+def _is_all_day_event(start: Optional[str]) -> bool:
+    """Date-only ISO strings (YYYY-MM-DD) come from Google for all-day events;
+    timed events return full RFC 3339 datetimes."""
+    if not start or not isinstance(start, str):
+        return False
+    return len(start) == 10 and start[4] == "-" and start[7] == "-"
+
+
 def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
     res = google_calendar.list_events(
         time_min=args.get("time_min"),
@@ -2366,13 +2397,23 @@ def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict], 
     if res.get("error"):
         return (_google_disconnected_msg() if needs else f"> _Calendar lookup failed: {res['error']}_"), needs, api
     events = res.get("events") or []
-    if not events:
-        return "> _No upcoming events found._", None, None
-    lines = [f"**Calendar events** ({len(events)}):"]
-    for e in events:
-        when = " → ".join(filter(None, [e.get("start"), e.get("end")]))
-        lines.append(f"- **{e.get('summary') or '(untitled)'}** — {when or '_no time_'} `id:{e.get('id')}`")
-    return "\n".join(lines), None, None
+    payload = {
+        "events": [
+            {
+                "id": e.get("id"),
+                "summary": e.get("summary"),
+                "start": e.get("start"),
+                "end": e.get("end"),
+                "all_day": _is_all_day_event(e.get("start")),
+                "attendees": e.get("attendees") or [],
+                "location": e.get("location"),
+                "html_link": e.get("html_link"),
+                "timezone": e.get("timezone"),
+            }
+            for e in events
+        ]
+    }
+    return _google_fence("google-calendar-events", payload), None, None
 
 
 def _read_google_gmail_list_messages(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
@@ -2384,14 +2425,23 @@ def _read_google_gmail_list_messages(args: dict) -> tuple[str, Optional[dict], O
     if res.get("error"):
         return (_google_disconnected_msg() if needs else f"> _Gmail lookup failed: {res['error']}_"), needs, api
     msgs = res.get("messages") or []
-    if not msgs:
-        return f"> _No messages match `{query}`._", None, None
-    lines = [f"**Gmail — `{query}`** ({len(msgs)}):"]
-    for m in msgs:
-        sender = (m.get("from") or "").split("<")[0].strip() or m.get("from") or "(unknown)"
-        snippet = (m.get("snippet") or "").strip().replace("\n", " ")[:100]
-        lines.append(f"- **{m.get('subject') or '(no subject)'}** — {sender}: {snippet} `id:{m.get('id')}`")
-    return "\n".join(lines), None, None
+    payload = {
+        "query": query,
+        "messages": [
+            {
+                "id": m.get("id"),
+                "from": m.get("from"),
+                "to": m.get("to"),
+                "subject": m.get("subject"),
+                "snippet": m.get("snippet"),
+                "date": m.get("date"),
+                "unread": "UNREAD" in (m.get("label_ids") or []),
+                "labels": m.get("label_ids") or [],
+            }
+            for m in msgs
+        ],
+    }
+    return _google_fence("google-gmail-messages", payload), None, None
 
 
 def _read_google_gmail_get_message(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
@@ -2405,14 +2455,43 @@ def _read_google_gmail_get_message(args: dict) -> tuple[str, Optional[dict], Opt
         return (_google_disconnected_msg() if needs else f"> _Gmail fetch failed: {res['error']}_"), needs, api
     m = res.get("message") or {}
     body = (m.get("body_text") or "").strip()
-    if len(body) > 1500:
-        body = body[:1500] + "\n…(truncated)"
-    return (
-        f"**{m.get('subject') or '(no subject)'}**\n"
-        f"From: {m.get('from')}\nDate: {m.get('date')}\n\n{body or '_(no plain-text body)_'}",
-        None,
-        None,
-    )  # text, needs_setup, needs_api_enable
+    # Cap inline detail at 4 KB so the chat reply stays light; the "Open in
+    # Gmail" link in the card lets Adam read the full thread.
+    if len(body) > 4000:
+        body = body[:4000] + "\n…(truncated — open in Gmail for the full message)"
+    payload = {
+        "id": m.get("id"),
+        "from": m.get("from"),
+        "to": m.get("to"),
+        "cc": m.get("cc"),
+        "subject": m.get("subject"),
+        "date": m.get("date"),
+        "body_text": body,
+        "labels": m.get("label_ids") or [],
+    }
+    return _google_fence("google-gmail-message", payload), None, None
+
+
+def _drive_payload(files: list, query: Optional[str]) -> dict:
+    return {
+        "query": query,
+        "files": [
+            {
+                "id": f.get("id"),
+                "name": f.get("name"),
+                "mime_type": f.get("mime_type"),
+                "modified": f.get("modified_time"),
+                "size": int(f["size"]) if str(f.get("size") or "").isdigit() else None,
+                "owners": (
+                    [{"name": f.get("owner_name"), "email": f.get("owner_email")}]
+                    if f.get("owner_name") or f.get("owner_email")
+                    else []
+                ),
+                "web_view_link": f.get("web_link"),
+            }
+            for f in files
+        ],
+    }
 
 
 def _read_google_drive_list_files(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
@@ -2424,13 +2503,7 @@ def _read_google_drive_list_files(args: dict) -> tuple[str, Optional[dict], Opti
     if res.get("error"):
         return (_google_disconnected_msg() if needs else f"> _Drive lookup failed: {res['error']}_"), needs, api
     files = res.get("files") or []
-    if not files:
-        return "> _No matching Drive files._", None, None
-    lines = [f"**Drive files** ({len(files)}):"]
-    for f in files:
-        kind = (f.get("mime_type") or "").split(".")[-1].split("/")[-1]
-        lines.append(f"- **{f.get('name') or '(unnamed)'}** ({kind}) — modified {f.get('modified_time') or '?'} `id:{f.get('id')}`")
-    return "\n".join(lines), None, None
+    return _google_fence("google-drive-files", _drive_payload(files, query)), None, None
 
 
 def _read_google_drive_search(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
@@ -2443,12 +2516,7 @@ def _read_google_drive_search(args: dict) -> tuple[str, Optional[dict], Optional
     if res.get("error"):
         return (_google_disconnected_msg() if needs else f"> _Drive search failed: {res['error']}_"), needs, api
     files = res.get("files") or []
-    if not files:
-        return f"> _No Drive files match `{name}`._", None, None
-    lines = [f"**Drive search `{name}`** ({len(files)}):"]
-    for f in files:
-        lines.append(f"- **{f.get('name') or '(unnamed)'}** — `id:{f.get('id')}`")
-    return "\n".join(lines), None, None
+    return _google_fence("google-drive-files", _drive_payload(files, name)), None, None
 
 
 def _read_google_sheets_read(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
@@ -2462,20 +2530,17 @@ def _read_google_sheets_read(args: dict) -> tuple[str, Optional[dict], Optional[
     if res.get("error"):
         return (_google_disconnected_msg() if needs else f"> _Sheets read failed: {res['error']}_"), needs, api
     values = res.get("values") or []
-    if not values:
-        return f"> _No data in `{rng}`._", None, None
-    # Render up to first 20 rows × 6 cols as a markdown table.
-    head = values[0] if values else []
-    rows = values[1:21] if len(values) > 1 else []
-    cols = max(len(r) for r in values[:21])
-    cols = min(cols, 6)
-    md = ["| " + " | ".join((head + [""] * cols)[:cols] or [""] * cols) + " |"]
-    md.append("| " + " | ".join(["---"] * cols) + " |")
-    for r in rows:
-        md.append("| " + " | ".join((r + [""] * cols)[:cols]) + " |")
-    if len(values) > 21:
-        md.append(f"_…and {len(values) - 21} more rows._")
-    return f"**{res.get('range') or rng}**\n" + "\n".join(md), None, None
+    # Cap at 50 rows × 12 cols inline so a runaway sheet doesn't bloat the
+    # chat reply. Adam can open the sheet for the rest.
+    capped = [list(r)[:12] for r in values[:50]]
+    payload = {
+        "spreadsheet_id": sid,
+        "range": res.get("range") or rng,
+        "values": capped,
+        "truncated": len(values) > 50 or any(len(r) > 12 for r in values),
+        "total_rows": len(values),
+    }
+    return _google_fence("google-sheets-data", payload), None, None
 
 
 def _read_google_docs_get(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
@@ -2488,13 +2553,21 @@ def _read_google_docs_get(args: dict) -> tuple[str, Optional[dict], Optional[dic
     if res.get("error"):
         return (_google_disconnected_msg() if needs else f"> _Docs read failed: {res['error']}_"), needs, api
     content = (res.get("content") or "").strip()
-    if len(content) > 1500:
-        content = content[:1500] + "\n…(truncated)"
-    return (
-        f"**{res.get('title') or '(untitled)'}**\n\n{content or '_(empty doc)_'}",
-        None,
-    None,
-    )
+    truncated = False
+    if len(content) > 4000:
+        content = content[:4000] + "\n…(truncated — open in Google Docs for the full content)"
+        truncated = True
+    word_count = len(content.split()) if content else 0
+    payload = {
+        "id": res.get("doc_id"),
+        "title": res.get("title"),
+        "content": content,
+        "word_count": word_count,
+        "truncated": truncated,
+        "url": res.get("url"),
+        "modified": res.get("modified_time"),
+    }
+    return _google_fence("google-docs-content", payload), None, None
 
 
 _READ_ACTION_HANDLERS = {

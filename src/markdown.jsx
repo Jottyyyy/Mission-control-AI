@@ -1,12 +1,15 @@
 import React from 'react';
+import { GOOGLE_FENCE_RENDERERS } from './GoogleRenderers.jsx';
 
 // Minimal markdown → React-element renderer.
 //
 // Scope: **bold**, *italic*, `inline code`, [label](url), ordered + unordered
-// lists, ATX headings (# … ######), paragraphs with line breaks, and horizontal
-// rules. Deliberately narrow — no tables, no block code fences, no nested
-// lists. We never use dangerouslySetInnerHTML, so the output is XSS-safe by
-// construction.
+// lists, ATX headings (# … ######), paragraphs with line breaks, horizontal
+// rules, and triple-backtick code fences. Fences whose language tag matches
+// a `google-*` renderer (v1.23) are dispatched to a custom React component;
+// other fences fall back to a styled <pre><code>. Deliberately narrow — no
+// tables, no nested lists. We never use dangerouslySetInnerHTML, so the
+// output is XSS-safe by construction.
 
 const CODE_STYLE = {
   fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
@@ -70,10 +73,16 @@ function parseInline(text, keyPrefix = "") {
 // --- Block pass ------------------------------------------------------------
 // Line-oriented: walk once, grouping contiguous list lines together and
 // flushing on a type change or blank separator.
+//
+// Fences (``` ... ```) are matched as a single block — the opener carries the
+// optional language tag (e.g. ```google-calendar-events) and content lines are
+// captured verbatim until the closing ``` is seen. Unterminated fences swallow
+// the rest of the message rather than corrupting downstream blocks.
 function groupBlocks(text) {
   const lines = String(text || "").split("\n");
   const blocks = [];
   let current = null;
+  let fence = null; // { lang, body[] }
 
   const flush = () => {
     if (current) {
@@ -83,6 +92,23 @@ function groupBlocks(text) {
   };
 
   for (const line of lines) {
+    if (fence) {
+      // Inside a fence: only the closing ``` ends it. Whitespace-only lines
+      // are kept as-is so the JSON payload's pretty-printing survives.
+      if (/^```\s*$/.test(line)) {
+        blocks.push({ type: "fence", lang: fence.lang, body: fence.body.join("\n") });
+        fence = null;
+      } else {
+        fence.body.push(line);
+      }
+      continue;
+    }
+    const fenceOpen = /^```([\w-]*)\s*$/.exec(line);
+    if (fenceOpen) {
+      flush();
+      fence = { lang: fenceOpen[1] || "", body: [] };
+      continue;
+    }
     if (!line.trim()) {
       flush();
       continue;
@@ -108,6 +134,11 @@ function groupBlocks(text) {
       current.lines.push(line);
     }
   }
+  if (fence) {
+    // Unterminated fence — treat what we have as a plain code block so the
+    // user still sees the content rather than nothing.
+    blocks.push({ type: "fence", lang: fence.lang, body: fence.body.join("\n") });
+  }
   flush();
   return blocks;
 }
@@ -126,11 +157,45 @@ const UL_STYLE = { margin: "6px 0 6px 22px", padding: 0, listStyle: "disc", line
 const OL_STYLE = { margin: "6px 0 6px 22px", padding: 0, listStyle: "decimal", lineHeight: 1.6, color: "var(--fg)" };
 const HR_STYLE = { border: 0, borderTop: "1px solid var(--border)", margin: "14px 0" };
 
+const PRE_STYLE = {
+  margin: "8px 0",
+  padding: "10px 12px",
+  background: "var(--bg-soft)",
+  border: "1px solid var(--border)",
+  borderRadius: 6,
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  fontSize: 12.5,
+  lineHeight: 1.5,
+  color: "var(--fg)",
+  overflowX: "auto",
+  whiteSpace: "pre",
+};
+
+function renderFence(block, key) {
+  const { lang, body } = block;
+  const Renderer = GOOGLE_FENCE_RENDERERS[lang];
+  if (Renderer) {
+    try {
+      const data = JSON.parse(body);
+      return <Renderer key={key} data={data} />;
+    } catch {
+      // Malformed JSON — fall through to plain code rendering rather than
+      // throwing in the chat surface.
+    }
+  }
+  return (
+    <pre key={key} style={PRE_STYLE}>
+      <code>{body}</code>
+    </pre>
+  );
+}
+
 export function renderMarkdown(text, keyPrefix = "md") {
   const blocks = groupBlocks(text);
   return blocks.map((b, bi) => {
     const bk = `${keyPrefix}-${bi}`;
     if (b.type === "hr") return <hr key={bk} style={HR_STYLE} />;
+    if (b.type === "fence") return renderFence(b, bk);
     if (b.type === "heading") {
       const Tag = `h${b.level}`;
       return (
