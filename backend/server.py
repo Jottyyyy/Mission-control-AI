@@ -636,6 +636,112 @@ def health():
     return {"status": "ok", "local": True, "workspace": str(WORKSPACE)}
 
 
+# --- v1.28 chain: read-then-write in one /chat round -----------------------
+#
+# Without this, Jackson can only emit ONE class of action per /chat call
+# (read XOR write). A request like "delete the gmeet with earl tomorrow"
+# requires both: list_events first to find the right ID, then delete_event
+# with that ID. Pre-v1.28 this stalled — Jackson narrated intent and waited
+# for the user's next turn, which then needed a third turn to actually
+# delete. The chain below re-invokes openclaw up to CHAIN_MAX_HOPS times,
+# feeding the read result back as the synthesised user message, so the
+# whole flow completes in one /chat response.
+
+CHAIN_MAX_HOPS = 3
+
+# Verbs that imply Jackson should take a destructive or outbound action
+# after looking up data. We chain only when the user used one of these AND
+# Jackson's first reply contains a read-result fence but no action card.
+_WRITE_INTENT_RE = re.compile(
+    r"\b(?:delete|cancel|remove|drop|trash|kill|"
+    r"send|reply|forward|"
+    r"update|edit|change|move|reschedule|rename|"
+    r"add\s+(?:to|note))\b",
+    re.IGNORECASE,
+)
+
+_RESULT_FENCE_RE = re.compile(r"```google-[\w-]+\n.*?\n```", re.S)
+
+
+def _user_has_write_intent(message: Optional[str]) -> bool:
+    return bool(_WRITE_INTENT_RE.search(message or ""))
+
+
+def _chain_for_write_intent(
+    *,
+    user_message: str,
+    reply: str,
+    brain: str,
+    conv_uuid: Optional[str],
+    cur,
+    model_override: Optional[str],
+    hops_left: int,
+) -> tuple[str, Optional[dict], Optional[dict]]:
+    """If the user asked for a write but Jackson only completed a read,
+    re-invoke openclaw with the read result inlined so he can finish the job.
+
+    Returns the (possibly extended) reply plus any needs_setup /
+    needs_api_enable signals the continuation produced. Stops when:
+    - hop budget runs out
+    - user message had no write intent
+    - reply already contains an action card (write was emitted)
+    - reply has no read result to chain on
+    - openclaw returns nothing useful
+
+    The synthesised continuation prompt includes the FIRST read fence
+    verbatim so Jackson actually sees the events / messages / etc. — his
+    own session log only contains his action marker, not the spliced
+    result, so without this inlining the second turn would be blind."""
+    if hops_left <= 0:
+        return reply, None, None
+    if not _user_has_write_intent(user_message):
+        return reply, None, None
+    if "[[action-card:" in reply:
+        return reply, None, None
+    fence = _RESULT_FENCE_RE.search(reply)
+    if not fence:
+        return reply, None, None
+
+    # Build the continuation message. The fence carries the structured
+    # result Jackson needs; the trailing nudge tells him to act, not to
+    # narrate. Banned phrases are reinforced in SOUL.md but echoed here
+    # so the continuation prompt itself doesn't invite stalling.
+    cont_message = (
+        "Result of your previous lookup:\n\n"
+        f"{fence.group(0)}\n\n"
+        "Now finish the original request — emit the next action marker "
+        "(or ask one specific clarifying question if the data is genuinely "
+        "ambiguous). Do not narrate intent. Do not say 'let me' or "
+        "'once I see'. Take the next step now."
+    )
+
+    try:
+        result = _invoke_openclaw(cont_message, brain, conv_uuid, model_override=model_override)
+    except subprocess.TimeoutExpired:
+        return reply, None, None
+    if result.returncode != 0:
+        return reply, None, None
+    cont_reply = (result.stdout or "").strip()
+    if not cont_reply:
+        return reply, None, None
+
+    cont_reply, needs_setup, needs_api = _extract_and_register_actions(cont_reply, conv_uuid, cur)
+    combined = (reply + "\n\n" + cont_reply).strip()
+
+    # Recurse — the continuation might itself trigger another (e.g. read →
+    # search → write). Hop budget guards against runaway loops.
+    final, more_setup, more_api = _chain_for_write_intent(
+        user_message=user_message,
+        reply=combined,
+        brain=brain,
+        conv_uuid=conv_uuid,
+        cur=cur,
+        model_override=model_override,
+        hops_left=hops_left - 1,
+    )
+    return final, needs_setup or more_setup, needs_api or more_api
+
+
 def _invoke_openclaw(
     prefixed: str,
     brain: str,
@@ -787,6 +893,21 @@ def chat(req: ChatRequest):
         needs_api_enable: Optional[dict] = None
         if effective_mode != "setup":
             reply, needs_setup, needs_api_enable = _extract_and_register_actions(reply, conv_uuid, cur)
+            # v1.28 chain: if the user asked for a write action ("delete the
+            # gmeet with earl") but Jackson only emitted a read (calendar list)
+            # and stopped, re-invoke with the read result so he can take the
+            # next step in the same /chat round. Capped at 3 continuations.
+            reply, c_needs_setup, c_needs_api = _chain_for_write_intent(
+                user_message=message,
+                reply=reply,
+                brain=brain,
+                conv_uuid=conv_uuid,
+                cur=cur,
+                model_override=model_override,
+                hops_left=CHAIN_MAX_HOPS,
+            )
+            needs_setup = needs_setup or c_needs_setup
+            needs_api_enable = needs_api_enable or c_needs_api
 
         cur.execute(
             "INSERT INTO messages (conversation_id, role, content, model_used) VALUES (?, ?, ?, ?)",
