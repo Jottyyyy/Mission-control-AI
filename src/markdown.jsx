@@ -171,13 +171,40 @@ const PRE_STYLE = {
   whiteSpace: "pre",
 };
 
+// Cache JSON.parse results by the raw body string so identical payloads
+// produce identical object references across re-renders. Without this,
+// every parent re-render (e.g. on chat keystroke) produces a fresh data
+// object, which defeats the React.memo'd renderers and causes flicker.
+const FENCE_PARSE_CACHE = new Map();
+
+function parseFenceBody(body) {
+  if (FENCE_PARSE_CACHE.has(body)) return FENCE_PARSE_CACHE.get(body);
+  const parsed = JSON.parse(body);
+  // Bound the cache so a long-running session can't grow it without limit.
+  if (FENCE_PARSE_CACHE.size > 256) {
+    const firstKey = FENCE_PARSE_CACHE.keys().next().value;
+    FENCE_PARSE_CACHE.delete(firstKey);
+  }
+  FENCE_PARSE_CACHE.set(body, parsed);
+  return parsed;
+}
+
+function FenceRenderer({ Renderer, body }) {
+  // useMemo is belt-and-braces over the module-level cache: it pins the
+  // parsed reference for this component instance even if the cache evicts.
+  const data = React.useMemo(() => parseFenceBody(body), [body]);
+  return <Renderer data={data} />;
+}
+
 function renderFence(block, key) {
   const { lang, body } = block;
   const Renderer = GOOGLE_FENCE_RENDERERS[lang];
   if (Renderer) {
     try {
-      const data = JSON.parse(body);
-      return <Renderer key={key} data={data} />;
+      // Validate parseability before mounting, so a bad payload falls back
+      // to <pre><code> instead of throwing inside the renderer.
+      parseFenceBody(body);
+      return <FenceRenderer key={key} Renderer={Renderer} body={body} />;
     } catch {
       // Malformed JSON — fall through to plain code rendering rather than
       // throwing in the chat surface.

@@ -107,3 +107,89 @@ export function formatTimeOnly(input) {
   if (!d) return input ? String(input) : "";
   return TIME_FMT.format(d);
 }
+
+// "5h 30m" / "45m" / "2h" — duration between two ISO timestamps, with no
+// leading zero on the minute and no "0h" prefix. Returns "" if either end
+// is unparseable; less than a minute clamps to "<1m" so the row still has
+// some signal rather than a mysterious blank.
+export function formatDuration(start, end) {
+  const s = parseDate(start);
+  const e = parseDate(end);
+  if (!s || !e) return "";
+  const ms = e.getTime() - s.getTime();
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const totalMin = Math.floor(ms / 60000);
+  if (totalMin < 1) return "<1m";
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h && m) return `${h}h ${m}m`;
+  if (h) return `${h}h`;
+  return `${m}m`;
+}
+
+// Period of day used for table/list section dividers. Boundaries match the
+// v1.25 spec: 05:00–11:59 morning, 12:00–16:59 afternoon, 17:00–21:59
+// evening, 22:00–04:59 late night. Single source of truth — both LIST and
+// TABLE views use this so they stay aligned.
+export const PERIOD_DEFS = [
+  { key: "morning",   label: "Morning",    range: "05:00–11:59" },
+  { key: "afternoon", label: "Afternoon",  range: "12:00–16:59" },
+  { key: "evening",   label: "Evening",    range: "17:00–21:59" },
+  { key: "late",      label: "Late Night", range: "22:00–04:59" },
+  { key: "allday",    label: "All day",    range: "" },
+];
+
+export function periodKey(ev) {
+  if (!ev) return "morning";
+  if (ev.all_day) return "allday";
+  const d = parseDate(ev.start);
+  if (!d) return "morning";
+  const h = d.getHours();
+  if (h >= 22 || h < 5) return "late";
+  if (h < 12) return "morning";
+  if (h < 17) return "afternoon";
+  return "evening";
+}
+
+// Group events by period in canonical order, dropping empty periods. The
+// caller passes already-sorted events; this just bucketises.
+export function groupByPeriod(events) {
+  const buckets = new Map();
+  for (const ev of events || []) {
+    const key = periodKey(ev);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(ev);
+  }
+  // All-day on top, then chronological periods.
+  const order = ["allday", "morning", "afternoon", "evening", "late"];
+  return order
+    .filter((k) => buckets.has(k))
+    .map((k) => ({ ...PERIOD_DEFS.find((p) => p.key === k), events: buckets.get(k) }));
+}
+
+// "Today" / "Tomorrow" / "Yesterday" / "Mon May 4". Used by the day-header
+// strip above the table/list. Returns null if the input is unparseable so
+// the caller can omit the strip rather than render a broken header.
+const FULL_HEADER_FMT = new Intl.DateTimeFormat(undefined, {
+  weekday: "short", month: "short", day: "numeric",
+});
+
+export function dayHeaderLabel(input) {
+  const d = parseDate(input);
+  if (!d) return null;
+  const now = new Date();
+  const diff = Math.round((startOfDay(d) - startOfDay(now)) / DAY_MS);
+  if (diff === 0) return { primary: "Today", secondary: FULL_HEADER_FMT.format(d) };
+  if (diff === 1) return { primary: "Tomorrow", secondary: FULL_HEADER_FMT.format(d) };
+  if (diff === -1) return { primary: "Yesterday", secondary: FULL_HEADER_FMT.format(d) };
+  return { primary: FULL_HEADER_FMT.format(d), secondary: null };
+}
+
+// Equality check for "is this date the user's local today?" — used by the
+// card to decide whether to apply Now-pill / dimmed-past treatment, which
+// we only want on today's view.
+export function isLocalToday(input) {
+  const d = parseDate(input);
+  if (!d) return false;
+  return startOfDay(d) === startOfDay(new Date());
+}

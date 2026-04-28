@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, memo } from 'react';
 import {
   formatFriendlyTime,
   formatFriendlyDate,
@@ -6,7 +6,18 @@ import {
   formatFileSize,
   dayBucket,
   formatTimeOnly,
+  formatDuration,
+  groupByPeriod,
+  dayHeaderLabel,
+  isLocalToday,
 } from './utils/datetime.js';
+
+// All exported card components are wrapped in React.memo at the bottom of
+// this file. Combined with the JSON.parse cache in markdown.jsx, that
+// short-circuits re-renders triggered by unrelated parent state changes
+// (typing in chat, scroll position, etc.) — the previous v1.24 behaviour
+// rebuilt every grouping bucket on every keystroke, which read as flicker
+// even though the final DOM was unchanged.
 
 // v1.23 — inline rendering for Google Workspace read actions.
 //
@@ -177,26 +188,13 @@ function nameFromAttendee(a) {
     .join(" ") || e;
 }
 
-// Time-of-day buckets used when all events are on the same calendar day.
-// Boundaries match the spec (00:00–11:59 morning, 12:00–16:59 afternoon,
-// 17:00+ evening). All-day events get their own bucket so the day row
-// header still appears even with no timed events.
-function timeOfDayBucket(ev) {
-  if (ev.all_day) return "All day";
-  const d = new Date(ev.start);
-  if (Number.isNaN(d.getTime())) return "Unscheduled";
-  const h = d.getHours();
-  if (h < 12) return "Morning";
-  if (h < 17) return "Afternoon";
-  return "Evening";
-}
-
-const TIME_BUCKET_ORDER = ["All day", "Morning", "Afternoon", "Evening", "Unscheduled"];
-
 // Lifecycle relative to "now": past events get dimmed, current events get
-// a 🔴 Now badge, future events render normally.
+// a 🔴 Now badge, future events render normally. v1.25 only applies the
+// dim/now treatment when the event is on today's local date — for tomorrow
+// or future days, "past" doesn't make sense yet, so leave them un-dimmed.
 function eventStatus(ev) {
-  if (ev.all_day) return "future"; // treat all-day as upcoming for visual purposes
+  if (ev.all_day) return "future";
+  if (!isLocalToday(ev.start)) return "future";
   const start = new Date(ev.start).getTime();
   const end = new Date(ev.end).getTime();
   if (!Number.isFinite(start) || !Number.isFinite(end)) return "future";
@@ -204,6 +202,24 @@ function eventStatus(ev) {
   if (now < start) return "future";
   if (now >= start && now <= end) return "now";
   return "past";
+}
+
+const NOW_PILL_STYLE = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 3,
+  fontSize: 10,
+  fontWeight: 700,
+  letterSpacing: "0.06em",
+  padding: "1px 6px",
+  borderRadius: 999,
+  background: "var(--danger)",
+  color: "white",
+  textTransform: "uppercase",
+};
+
+function NowPill() {
+  return <span style={NOW_PILL_STYLE}>● Now</span>;
 }
 
 function CalendarEventRow({ ev, compact }) {
@@ -245,21 +261,7 @@ function CalendarEventRow({ ev, compact }) {
       }}
     >
       <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-        {status === "now" && (
-          <span style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 3,
-            fontSize: 10,
-            fontWeight: 700,
-            letterSpacing: "0.06em",
-            padding: "1px 6px",
-            borderRadius: 999,
-            background: "var(--danger)",
-            color: "white",
-            textTransform: "uppercase",
-          }}>● Now</span>
-        )}
+        {status === "now" && <NowPill />}
         <div style={{
           fontWeight: 600,
           fontSize: 13.5,
@@ -269,7 +271,13 @@ function CalendarEventRow({ ev, compact }) {
         }}>
           {ev.summary || "(untitled event)"}
         </div>
-        <div style={MUTED_STYLE}>{timeLabel}</div>
+        <div style={MUTED_STYLE}>
+          {timeLabel}
+          {!ev.all_day && (() => {
+            const dur = formatDuration(ev.start, ev.end);
+            return dur ? <span style={{ marginLeft: 6, color: "var(--fg-faint)" }}>· {dur}</span> : null;
+          })()}
+        </div>
         <FaintId id={ev.id} hover={hover} />
       </div>
       {!compact && (
@@ -291,7 +299,77 @@ function CalendarEventRow({ ev, compact }) {
   );
 }
 
-function CalendarTableView({ events }) {
+const TH_STYLE = {
+  textAlign: "left",
+  padding: "6px 8px",
+  background: "var(--bg-soft)",
+  borderBottom: "1px solid var(--border-strong)",
+  color: "var(--fg)",
+  fontWeight: 600,
+  whiteSpace: "nowrap",
+  position: "sticky",
+  top: 0,
+  zIndex: 1,
+};
+
+const TD_STYLE = {
+  padding: "6px 8px",
+  borderBottom: "1px solid var(--border)",
+  color: "var(--fg)",
+  verticalAlign: "top",
+};
+
+function CalendarTableRow({ ev, striped }) {
+  const [hover, setHover] = useState(false);
+  const status = eventStatus(ev);
+  const dim = status === "past" ? 0.5 : 1;
+  const open = () => ev.html_link && window.open(ev.html_link, "_blank", "noopener,noreferrer");
+  // Now-row gets the accent-soft background even when striped, so the
+  // current event stands out without competing with the zebra stripes.
+  const baseBg = status === "now"
+    ? "var(--accent-soft)"
+    : (striped ? "var(--bg-soft)" : "transparent");
+  const bg = hover && ev.html_link
+    ? "var(--accent-soft)"
+    : baseBg;
+  const dur = !ev.all_day ? formatDuration(ev.start, ev.end) : "";
+  return (
+    <tr
+      onClick={open}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onKeyDown={(e) => {
+        if (ev.html_link && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); }
+      }}
+      tabIndex={ev.html_link ? 0 : -1}
+      style={{
+        opacity: dim,
+        cursor: ev.html_link ? "pointer" : "default",
+        background: bg,
+        transition: "background 100ms ease",
+      }}
+    >
+      <td style={{ ...TD_STYLE, whiteSpace: "nowrap", width: 140 }}>
+        <div>{ev.all_day ? "All day" : `${formatTimeOnly(ev.start)} – ${formatTimeOnly(ev.end)}`}</div>
+        {dur && <div style={{ fontSize: 11, color: "var(--fg-faint)", marginTop: 2 }}>{dur}</div>}
+      </td>
+      <td style={TD_STYLE}>
+        {status === "now" && <span style={{ ...NOW_PILL_STYLE, marginRight: 6 }}>● Now</span>}
+        <span style={{
+          fontWeight: 600,
+          textDecoration: status === "past" ? "line-through" : "none",
+        }}>
+          {ev.summary || "(untitled event)"}
+        </span>
+        {ev.location && <span style={{ ...MUTED_STYLE, marginLeft: 8 }}>· {ev.location}</span>}
+      </td>
+    </tr>
+  );
+}
+
+function CalendarTableView({ events, periods }) {
+  // Single source of truth for period dividers — `periods` comes from
+  // groupByPeriod() so LIST and TABLE views stay aligned.
   return (
     <table style={{
       borderCollapse: "collapse",
@@ -301,83 +379,43 @@ function CalendarTableView({ events }) {
     }}>
       <thead>
         <tr>
-          <th style={{
-            textAlign: "left",
-            padding: "6px 8px",
-            background: "var(--bg-soft)",
-            borderBottom: "1px solid var(--border-strong)",
-            color: "var(--fg)",
-            fontWeight: 600,
-            whiteSpace: "nowrap",
-            width: 140,
-          }}>Time</th>
-          <th style={{
-            textAlign: "left",
-            padding: "6px 8px",
-            background: "var(--bg-soft)",
-            borderBottom: "1px solid var(--border-strong)",
-            color: "var(--fg)",
-            fontWeight: 600,
-          }}>Event</th>
+          <th style={TH_STYLE}>Time</th>
+          <th style={TH_STYLE}>Event</th>
         </tr>
       </thead>
       <tbody>
-        {events.map((ev, i) => {
-          const status = eventStatus(ev);
-          const dim = status === "past" ? 0.6 : 1;
-          const open = () => ev.html_link && window.open(ev.html_link, "_blank", "noopener,noreferrer");
-          return (
-            <tr
-              key={ev.id || i}
-              onClick={open}
-              onKeyDown={(e) => {
-                if (ev.html_link && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); }
-              }}
-              tabIndex={ev.html_link ? 0 : -1}
-              style={{
-                opacity: dim,
-                cursor: ev.html_link ? "pointer" : "default",
-                background: i % 2 === 0 ? "transparent" : "var(--bg-soft)",
-              }}
-            >
-              <td style={{
+        {periods.map((period) => {
+          const rows = [];
+          rows.push(
+            <tr key={`hdr-${period.key}`} style={{ background: "var(--bg-soft)" }}>
+              <td colSpan={2} style={{
                 padding: "6px 8px",
+                borderTop: "1px solid var(--border)",
                 borderBottom: "1px solid var(--border)",
-                color: "var(--fg)",
-                whiteSpace: "nowrap",
-                verticalAlign: "top",
+                color: "var(--fg-muted)",
+                fontSize: 11,
+                fontWeight: 600,
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
               }}>
-                {ev.all_day ? "All day" : `${formatTimeOnly(ev.start)} – ${formatTimeOnly(ev.end)}`}
-              </td>
-              <td style={{
-                padding: "6px 8px",
-                borderBottom: "1px solid var(--border)",
-                color: "var(--fg)",
-                verticalAlign: "top",
-              }}>
-                {status === "now" && (
-                  <span style={{
-                    display: "inline-block",
-                    fontSize: 10,
-                    fontWeight: 700,
-                    padding: "0 5px",
-                    marginRight: 6,
-                    borderRadius: 999,
-                    background: "var(--danger)",
-                    color: "white",
-                    textTransform: "uppercase",
-                  }}>● Now</span>
-                )}
-                <span style={{
-                  fontWeight: 600,
-                  textDecoration: status === "past" ? "line-through" : "none",
-                }}>
-                  {ev.summary || "(untitled event)"}
+                {period.label}
+                {period.range && <span style={{ color: "var(--fg-faint)", fontWeight: 500, marginLeft: 8 }}>{period.range}</span>}
+                <span style={{ color: "var(--fg-faint)", fontWeight: 500, marginLeft: 8 }}>
+                  · {period.events.length} event{period.events.length === 1 ? "" : "s"}
                 </span>
-                {ev.location && <span style={{ ...MUTED_STYLE, marginLeft: 8 }}>· {ev.location}</span>}
               </td>
             </tr>
           );
+          period.events.forEach((ev, i) => {
+            rows.push(
+              <CalendarTableRow
+                key={ev.id || `${period.key}-${ev.start}-${i}`}
+                ev={ev}
+                striped={i % 2 === 1}
+              />
+            );
+          });
+          return rows;
         })}
       </tbody>
     </table>
@@ -416,90 +454,142 @@ function ViewToggle({ value, onChange }) {
   );
 }
 
-export function GoogleCalendarEventsCard({ data }) {
+function DayHeaderStrip({ dateInput, count }) {
+  const label = dayHeaderLabel(dateInput);
+  if (!label) return null;
+  return (
+    <div style={{
+      display: "flex",
+      alignItems: "baseline",
+      justifyContent: "space-between",
+      gap: 10,
+      padding: "0 0 8px",
+      marginBottom: 4,
+      borderBottom: "1px dashed var(--border)",
+    }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <span style={{ fontSize: 14, fontWeight: 600, color: "var(--fg)" }}>{label.primary}</span>
+        {label.secondary && (
+          <span style={{ fontSize: 12, color: "var(--fg-muted)" }}>· {label.secondary}</span>
+        )}
+      </div>
+      <span style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+        {count} event{count === 1 ? "" : "s"}
+      </span>
+    </div>
+  );
+}
+
+function GoogleCalendarEventsCardImpl({ data }) {
   const [view, setView] = useState("list");
   const events = Array.isArray(data?.events) ? data.events : [];
-  // Always render in chronological order so morning > afternoon > evening
-  // and earlier days come first.
+  // Always render chronologically so period buckets and day groups read
+  // correctly regardless of input order.
   const sorted = useMemo(
     () => [...events].sort((a, b) => String(a.start || "").localeCompare(String(b.start || ""))),
     [events],
   );
 
-  // Single-day mode kicks in when every event maps to the same day bucket
-  // (e.g. all on "Today"). Otherwise we keep v1.23 multi-day grouping.
+  // Single-day kicks in when every event lands in the same dayBucket label
+  // ("Today", "Tomorrow", a weekday name, or a full date). Multi-day keeps
+  // the v1.23 day-grouped flow.
   const singleDay = useMemo(() => {
-    if (sorted.length < 2) return sorted.length === 1;
+    if (sorted.length === 0) return true;
+    if (sorted.length === 1) return true;
     const first = dayBucket(sorted[0].start);
     return sorted.every((ev) => dayBucket(ev.start) === first);
   }, [sorted]);
 
-  const dayLabel = sorted.length ? dayBucket(sorted[0].start) : null;
+  const targetDate = sorted.length ? sorted[0].start : null;
 
-  // For single-day list view: bucket by morning/afternoon/evening.
-  const todBuckets = useMemo(() => {
-    if (!singleDay) return null;
-    const map = new Map();
-    for (const ev of sorted) {
-      const key = timeOfDayBucket(ev);
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(ev);
-    }
-    // Preserve canonical order regardless of insertion order.
-    return TIME_BUCKET_ORDER.filter((k) => map.has(k)).map((k) => [k, map.get(k)]);
-  }, [singleDay, sorted]);
+  // Single source of truth for both list and table sections.
+  const periods = useMemo(
+    () => (singleDay ? groupByPeriod(sorted) : []),
+    [singleDay, sorted],
+  );
 
-  // Multi-day list view: group by day bucket as v1.23 did.
+  // Multi-day list grouping (v1.23 behaviour preserved).
   const dayGroups = useMemo(() => {
-    if (singleDay) return null;
+    if (singleDay) return [];
     const map = new Map();
     for (const ev of sorted) {
-      const key = ev.all_day ? dayBucket(ev.start) : dayBucket(ev.start);
+      const key = dayBucket(ev.start);
       if (!map.has(key)) map.set(key, []);
       map.get(key).push(ev);
     }
     return Array.from(map.entries());
   }, [singleDay, sorted]);
 
-  const sectionHeader = (text) => (
+  const titleSummary = singleDay && targetDate
+    ? `📅 ${dayBucket(targetDate)}`
+    : "📅 Your calendar";
+
+  const sectionHeader = (label, range, count) => (
     <div style={{
       ...FAINT_STYLE,
       textTransform: "uppercase",
       letterSpacing: "0.06em",
       padding: "8px 0 2px",
+      display: "flex",
+      gap: 8,
+      alignItems: "baseline",
     }}>
-      {text}
+      <span>{label}</span>
+      {range && <span style={{ color: "var(--fg-faint)" }}>{range}</span>}
+      {typeof count === "number" && (
+        <span style={{ color: "var(--fg-faint)" }}>
+          · {count} event{count === 1 ? "" : "s"}
+        </span>
+      )}
     </div>
   );
 
   return (
     <CardShell
-      title={singleDay && dayLabel ? `📅 ${dayLabel}` : "📅 Your calendar"}
+      title={titleSummary}
       count={events.length}
       action={events.length > 1 ? <ViewToggle value={view} onChange={setView} /> : null}
     >
       {events.length === 0 ? (
         <EmptyState icon="📅" message="No events on the calendar." />
-      ) : view === "table" ? (
-        <CalendarTableView events={sorted} />
-      ) : singleDay ? (
-        todBuckets.map(([bucket, evs]) => (
-          <div key={bucket}>
-            {sectionHeader(bucket)}
-            {evs.map((ev, i) => <CalendarEventRow key={ev.id || i} ev={ev} />)}
-          </div>
-        ))
       ) : (
-        dayGroups.map(([day, evs]) => (
-          <div key={day} style={{ marginBottom: 4 }}>
-            {sectionHeader(day)}
-            {evs.map((ev, i) => <CalendarEventRow key={ev.id || i} ev={ev} />)}
-          </div>
-        ))
+        <>
+          {singleDay && <DayHeaderStrip dateInput={targetDate} count={events.length} />}
+          {view === "table" ? (
+            <div style={{ overflowY: "auto", maxHeight: 420, marginLeft: -6, marginRight: -6 }}>
+              <CalendarTableView
+                events={sorted}
+                periods={singleDay
+                  ? periods
+                  : [{ key: "all", label: "Events", range: "", events: sorted }]}
+              />
+            </div>
+          ) : singleDay ? (
+            periods.map((period) => (
+              <div key={period.key}>
+                {sectionHeader(period.label, period.range, period.events.length)}
+                {period.events.map((ev, i) => (
+                  <CalendarEventRow key={ev.id || `${period.key}-${ev.start}-${i}`} ev={ev} />
+                ))}
+              </div>
+            ))
+          ) : (
+            dayGroups.map(([day, evs]) => (
+              <div key={day} style={{ marginBottom: 4 }}>
+                {sectionHeader(day, "", evs.length)}
+                {evs.map((ev, i) => (
+                  <CalendarEventRow key={ev.id || `${day}-${ev.start}-${i}`} ev={ev} />
+                ))}
+              </div>
+            ))
+          )}
+        </>
       )}
     </CardShell>
   );
 }
+
+export const GoogleCalendarEventsCard = memo(GoogleCalendarEventsCardImpl);
 
 // --- Gmail list -----------------------------------------------------------
 
@@ -610,22 +700,23 @@ function GmailMessageRow({ msg }) {
   );
 }
 
-export function GoogleGmailMessagesCard({ data }) {
+function GoogleGmailMessagesCardImpl({ data }) {
   const messages = Array.isArray(data?.messages) ? data.messages : [];
   return (
     <CardShell title="📧 Inbox" count={messages.length}>
       {messages.length === 0 ? (
         <EmptyState icon="📭" message="Inbox is clear." />
       ) : (
-        messages.map((m, i) => <GmailMessageRow key={m.id || i} msg={m} />)
+        messages.map((m, i) => <GmailMessageRow key={m.id || `${m.date}-${i}`} msg={m} />)
       )}
     </CardShell>
   );
 }
+export const GoogleGmailMessagesCard = memo(GoogleGmailMessagesCardImpl);
 
 // --- Gmail detail ---------------------------------------------------------
 
-export function GoogleGmailMessageDetail({ data }) {
+function GoogleGmailMessageDetailImpl({ data }) {
   const sender = senderParts(data?.from);
   const href = data?.id ? `https://mail.google.com/mail/u/0/#inbox/${data.id}` : null;
   const headerRow = (label, value) => value ? (
@@ -763,7 +854,7 @@ function DriveFileRow({ file }) {
   );
 }
 
-export function GoogleDriveFilesCard({ data }) {
+function GoogleDriveFilesCardImpl({ data }) {
   const files = Array.isArray(data?.files) ? data.files : [];
   const titleSuffix = data?.query ? ` matching "${data.query}"` : "";
   return (
@@ -771,15 +862,16 @@ export function GoogleDriveFilesCard({ data }) {
       {files.length === 0 ? (
         <EmptyState icon="📁" message="No matching files." />
       ) : (
-        files.map((f, i) => <DriveFileRow key={f.id || i} file={f} />)
+        files.map((f, i) => <DriveFileRow key={f.id || `${f.name}-${i}`} file={f} />)
       )}
     </CardShell>
   );
 }
+export const GoogleDriveFilesCard = memo(GoogleDriveFilesCardImpl);
 
 // --- Sheets ---------------------------------------------------------------
 
-export function GoogleSheetsDataCard({ data }) {
+function GoogleSheetsDataCardImpl({ data }) {
   const values = Array.isArray(data?.values) ? data.values : [];
   const range = data?.range || "(no range)";
   const sid = data?.spreadsheet_id;
@@ -850,7 +942,7 @@ export function GoogleSheetsDataCard({ data }) {
 
 // --- Docs -----------------------------------------------------------------
 
-export function GoogleDocsContentCard({ data }) {
+function GoogleDocsContentCardImpl({ data }) {
   const id = data?.id || data?.doc_id;
   const href = id ? `https://docs.google.com/document/d/${id}/edit` : (data?.url || null);
   const wordCount = typeof data?.word_count === "number"
@@ -896,6 +988,10 @@ export function GoogleDocsContentCard({ data }) {
     </CardShell>
   );
 }
+
+export const GoogleSheetsDataCard = memo(GoogleSheetsDataCardImpl);
+export const GoogleDocsContentCard = memo(GoogleDocsContentCardImpl);
+export const GoogleGmailMessageDetail = memo(GoogleGmailMessageDetailImpl);
 
 // --- Fence dispatch -------------------------------------------------------
 
