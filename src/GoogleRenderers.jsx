@@ -177,8 +177,38 @@ function nameFromAttendee(a) {
     .join(" ") || e;
 }
 
-function CalendarEventRow({ ev }) {
+// Time-of-day buckets used when all events are on the same calendar day.
+// Boundaries match the spec (00:00–11:59 morning, 12:00–16:59 afternoon,
+// 17:00+ evening). All-day events get their own bucket so the day row
+// header still appears even with no timed events.
+function timeOfDayBucket(ev) {
+  if (ev.all_day) return "All day";
+  const d = new Date(ev.start);
+  if (Number.isNaN(d.getTime())) return "Unscheduled";
+  const h = d.getHours();
+  if (h < 12) return "Morning";
+  if (h < 17) return "Afternoon";
+  return "Evening";
+}
+
+const TIME_BUCKET_ORDER = ["All day", "Morning", "Afternoon", "Evening", "Unscheduled"];
+
+// Lifecycle relative to "now": past events get dimmed, current events get
+// a 🔴 Now badge, future events render normally.
+function eventStatus(ev) {
+  if (ev.all_day) return "future"; // treat all-day as upcoming for visual purposes
+  const start = new Date(ev.start).getTime();
+  const end = new Date(ev.end).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return "future";
+  const now = Date.now();
+  if (now < start) return "future";
+  if (now >= start && now <= end) return "now";
+  return "past";
+}
+
+function CalendarEventRow({ ev, compact }) {
   const [hover, setHover] = useState(false);
+  const status = eventStatus(ev);
   const attendees = Array.isArray(ev.attendees) ? ev.attendees : [];
   const visible = attendees.slice(0, 3);
   const extra = attendees.length - visible.length;
@@ -186,14 +216,11 @@ function CalendarEventRow({ ev }) {
   const timeLabel = ev.all_day
     ? "All day"
     : `${formatTimeOnly(ev.start)} – ${formatTimeOnly(ev.end)}`;
+  const dim = status === "past" ? 0.6 : 1;
+  const open = () => ev.html_link && window.open(ev.html_link, "_blank", "noopener,noreferrer");
   return (
     <div
-      onClick={(e) => {
-        if (ev.html_link) {
-          e.preventDefault();
-          window.open(ev.html_link, "_blank", "noopener,noreferrer");
-        }
-      }}
+      onClick={open}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       tabIndex={ev.html_link ? 0 : -1}
@@ -201,11 +228,12 @@ function CalendarEventRow({ ev }) {
       onKeyDown={(e) => {
         if (ev.html_link && (e.key === "Enter" || e.key === " ")) {
           e.preventDefault();
-          window.open(ev.html_link, "_blank", "noopener,noreferrer");
+          open();
         }
       }}
       style={{
         ...ROW_STYLE,
+        opacity: dim,
         cursor: ev.html_link ? "pointer" : "default",
         background: hover && ev.html_link ? "var(--accent-soft)" : "transparent",
         borderRadius: 6,
@@ -217,56 +245,254 @@ function CalendarEventRow({ ev }) {
       }}
     >
       <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-        <div style={{ fontWeight: 600, fontSize: 13.5, color: "var(--fg)" }}>
+        {status === "now" && (
+          <span style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 3,
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: "0.06em",
+            padding: "1px 6px",
+            borderRadius: 999,
+            background: "var(--danger)",
+            color: "white",
+            textTransform: "uppercase",
+          }}>● Now</span>
+        )}
+        <div style={{
+          fontWeight: 600,
+          fontSize: 13.5,
+          color: "var(--fg)",
+          textDecoration: status === "past" ? "line-through" : "none",
+          textDecorationThickness: 1,
+        }}>
           {ev.summary || "(untitled event)"}
         </div>
         <div style={MUTED_STYLE}>{timeLabel}</div>
         <FaintId id={ev.id} hover={hover} />
       </div>
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 3, flexWrap: "wrap" }}>
-        {ev.location && (
-          <span style={{ ...PILL_STYLE, background: "var(--accent-soft)", color: "var(--accent)" }}>
-            📍 {ev.location}
-          </span>
-        )}
-        {visible.length > 0 && (
-          <span style={MUTED_STYLE} title={tooltip}>
-            with {visible.map(nameFromAttendee).filter(Boolean).join(", ")}
-            {extra > 0 ? ` + ${extra} other${extra === 1 ? "" : "s"}` : ""}
-          </span>
-        )}
-      </div>
+      {!compact && (
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 3, flexWrap: "wrap" }}>
+          {ev.location && (
+            <span style={{ ...PILL_STYLE, background: "var(--accent-soft)", color: "var(--accent)" }}>
+              📍 {ev.location}
+            </span>
+          )}
+          {visible.length > 0 && (
+            <span style={MUTED_STYLE} title={tooltip}>
+              with {visible.map(nameFromAttendee).filter(Boolean).join(", ")}
+              {extra > 0 ? ` + ${extra} other${extra === 1 ? "" : "s"}` : ""}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
+function CalendarTableView({ events }) {
+  return (
+    <table style={{
+      borderCollapse: "collapse",
+      width: "100%",
+      fontSize: 12.5,
+      tableLayout: "auto",
+    }}>
+      <thead>
+        <tr>
+          <th style={{
+            textAlign: "left",
+            padding: "6px 8px",
+            background: "var(--bg-soft)",
+            borderBottom: "1px solid var(--border-strong)",
+            color: "var(--fg)",
+            fontWeight: 600,
+            whiteSpace: "nowrap",
+            width: 140,
+          }}>Time</th>
+          <th style={{
+            textAlign: "left",
+            padding: "6px 8px",
+            background: "var(--bg-soft)",
+            borderBottom: "1px solid var(--border-strong)",
+            color: "var(--fg)",
+            fontWeight: 600,
+          }}>Event</th>
+        </tr>
+      </thead>
+      <tbody>
+        {events.map((ev, i) => {
+          const status = eventStatus(ev);
+          const dim = status === "past" ? 0.6 : 1;
+          const open = () => ev.html_link && window.open(ev.html_link, "_blank", "noopener,noreferrer");
+          return (
+            <tr
+              key={ev.id || i}
+              onClick={open}
+              onKeyDown={(e) => {
+                if (ev.html_link && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); }
+              }}
+              tabIndex={ev.html_link ? 0 : -1}
+              style={{
+                opacity: dim,
+                cursor: ev.html_link ? "pointer" : "default",
+                background: i % 2 === 0 ? "transparent" : "var(--bg-soft)",
+              }}
+            >
+              <td style={{
+                padding: "6px 8px",
+                borderBottom: "1px solid var(--border)",
+                color: "var(--fg)",
+                whiteSpace: "nowrap",
+                verticalAlign: "top",
+              }}>
+                {ev.all_day ? "All day" : `${formatTimeOnly(ev.start)} – ${formatTimeOnly(ev.end)}`}
+              </td>
+              <td style={{
+                padding: "6px 8px",
+                borderBottom: "1px solid var(--border)",
+                color: "var(--fg)",
+                verticalAlign: "top",
+              }}>
+                {status === "now" && (
+                  <span style={{
+                    display: "inline-block",
+                    fontSize: 10,
+                    fontWeight: 700,
+                    padding: "0 5px",
+                    marginRight: 6,
+                    borderRadius: 999,
+                    background: "var(--danger)",
+                    color: "white",
+                    textTransform: "uppercase",
+                  }}>● Now</span>
+                )}
+                <span style={{
+                  fontWeight: 600,
+                  textDecoration: status === "past" ? "line-through" : "none",
+                }}>
+                  {ev.summary || "(untitled event)"}
+                </span>
+                {ev.location && <span style={{ ...MUTED_STYLE, marginLeft: 8 }}>· {ev.location}</span>}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function ViewToggle({ value, onChange }) {
+  const btn = (key, label) => {
+    const active = value === key;
+    return (
+      <button
+        type="button"
+        onClick={() => onChange(key)}
+        style={{
+          fontSize: 11,
+          padding: "2px 8px",
+          background: active ? "var(--accent-soft)" : "transparent",
+          border: `1px solid ${active ? "var(--accent-line)" : "var(--border)"}`,
+          color: active ? "var(--accent)" : "var(--fg-muted)",
+          fontWeight: active ? 600 : 500,
+          cursor: "pointer",
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+        }}
+        aria-pressed={active}
+      >
+        {label}
+      </button>
+    );
+  };
+  return (
+    <span style={{ display: "inline-flex", gap: 0, borderRadius: 6, overflow: "hidden" }}>
+      {btn("list", "List")}
+      {btn("table", "Table")}
+    </span>
+  );
+}
+
 export function GoogleCalendarEventsCard({ data }) {
+  const [view, setView] = useState("list");
   const events = Array.isArray(data?.events) ? data.events : [];
-  const groups = useMemo(() => {
-    const buckets = new Map();
-    for (const ev of events) {
-      const key = ev.all_day ? dayBucket(ev.start || ev.start_date) : dayBucket(ev.start);
-      if (!buckets.has(key)) buckets.set(key, []);
-      buckets.get(key).push(ev);
+  // Always render in chronological order so morning > afternoon > evening
+  // and earlier days come first.
+  const sorted = useMemo(
+    () => [...events].sort((a, b) => String(a.start || "").localeCompare(String(b.start || ""))),
+    [events],
+  );
+
+  // Single-day mode kicks in when every event maps to the same day bucket
+  // (e.g. all on "Today"). Otherwise we keep v1.23 multi-day grouping.
+  const singleDay = useMemo(() => {
+    if (sorted.length < 2) return sorted.length === 1;
+    const first = dayBucket(sorted[0].start);
+    return sorted.every((ev) => dayBucket(ev.start) === first);
+  }, [sorted]);
+
+  const dayLabel = sorted.length ? dayBucket(sorted[0].start) : null;
+
+  // For single-day list view: bucket by morning/afternoon/evening.
+  const todBuckets = useMemo(() => {
+    if (!singleDay) return null;
+    const map = new Map();
+    for (const ev of sorted) {
+      const key = timeOfDayBucket(ev);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(ev);
     }
-    return Array.from(buckets.entries());
-  }, [events]);
+    // Preserve canonical order regardless of insertion order.
+    return TIME_BUCKET_ORDER.filter((k) => map.has(k)).map((k) => [k, map.get(k)]);
+  }, [singleDay, sorted]);
+
+  // Multi-day list view: group by day bucket as v1.23 did.
+  const dayGroups = useMemo(() => {
+    if (singleDay) return null;
+    const map = new Map();
+    for (const ev of sorted) {
+      const key = ev.all_day ? dayBucket(ev.start) : dayBucket(ev.start);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(ev);
+    }
+    return Array.from(map.entries());
+  }, [singleDay, sorted]);
+
+  const sectionHeader = (text) => (
+    <div style={{
+      ...FAINT_STYLE,
+      textTransform: "uppercase",
+      letterSpacing: "0.06em",
+      padding: "8px 0 2px",
+    }}>
+      {text}
+    </div>
+  );
 
   return (
-    <CardShell title={`📅 Your calendar`} count={events.length}>
+    <CardShell
+      title={singleDay && dayLabel ? `📅 ${dayLabel}` : "📅 Your calendar"}
+      count={events.length}
+      action={events.length > 1 ? <ViewToggle value={view} onChange={setView} /> : null}
+    >
       {events.length === 0 ? (
         <EmptyState icon="📅" message="No events on the calendar." />
+      ) : view === "table" ? (
+        <CalendarTableView events={sorted} />
+      ) : singleDay ? (
+        todBuckets.map(([bucket, evs]) => (
+          <div key={bucket}>
+            {sectionHeader(bucket)}
+            {evs.map((ev, i) => <CalendarEventRow key={ev.id || i} ev={ev} />)}
+          </div>
+        ))
       ) : (
-        groups.map(([day, evs]) => (
+        dayGroups.map(([day, evs]) => (
           <div key={day} style={{ marginBottom: 4 }}>
-            <div style={{
-              ...FAINT_STYLE,
-              textTransform: "uppercase",
-              letterSpacing: "0.06em",
-              padding: "6px 0 2px",
-            }}>
-              {day}
-            </div>
+            {sectionHeader(day)}
             {evs.map((ev, i) => <CalendarEventRow key={ev.id || i} ev={ev} />)}
           </div>
         ))

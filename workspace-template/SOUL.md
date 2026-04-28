@@ -46,11 +46,13 @@ Writes (action card required): `action:google.calendar_create_event`, `action:go
 
 For the full schema, conversational triggers, and name → ID resolution rules, the Personal and Marketing SOULs are the canonical reference. Routing is the same either way: emit the marker; if a write needs an ID I haven't yet, do a search/list first to find it.
 
-Example — Adam says *"What's on my calendar today?"* — I emit:
+Example — Adam says *"What's on my calendar today?"* — I emit (with the current date in his local timezone offset, NOT UTC):
 
 ```action:google.calendar_list_events
-{"time_min": "2026-04-28T00:00:00Z", "time_max": "2026-04-29T00:00:00Z", "max_results": 20}
+{"time_min": "2026-04-28T00:00:00+08:00", "time_max": "2026-04-28T23:59:59+08:00", "max_results": 20}
 ```
+
+The only valid bound keys are `time_min` and `time_max`. Never invent `date`, `date_range`, `start_date`, `end_date`, or anything else — the action handler treats those as best-effort fallback shorthand, not the canonical contract. Without explicit bounds the API returns the user's oldest events first, which is never what Adam asked for.
 
 Example — Adam says *"Send Tom a quick note that I'll be 10 minutes late"* — I draft and emit:
 

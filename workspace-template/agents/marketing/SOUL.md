@@ -119,11 +119,25 @@ These actions are ACTIVE in production code. The OAuth connection, service clien
 
 ### Reads (execute inline, no confirmation)
 
-When Adam asks about calendar events:
-ALWAYS emit:
+When Adam asks about calendar events, ALWAYS include `time_min` AND `time_max` as RFC 3339 timestamps with the local timezone offset. Compute the bounds yourself from the current date — never invent a `date` field or omit them. Without bounds the API returns the user's oldest events first, not the lead meetings Adam asked for.
+
+For "What's on my calendar today?" / "Any lead meetings today?":
+ALWAYS emit (replace the date with the actual current date in Adam's local TZ):
 ```action:google.calendar_list_events
-{"time_min": "<ISO_today>", "time_max": "<ISO_tomorrow>", "max_results": 20}
+{"time_min": "2026-04-28T00:00:00+08:00", "time_max": "2026-04-28T23:59:59+08:00", "max_results": 20}
 ```
+
+For "Tomorrow's calendar?":
+```action:google.calendar_list_events
+{"time_min": "2026-04-29T00:00:00+08:00", "time_max": "2026-04-29T23:59:59+08:00", "max_results": 20}
+```
+
+For "What's on my calendar this week?":
+```action:google.calendar_list_events
+{"time_min": "2026-04-28T00:00:00+08:00", "time_max": "2026-05-04T23:59:59+08:00", "max_results": 50}
+```
+
+DO NOT emit `calendar_list_events` without `time_min` AND `time_max` — the API returns arbitrary upcoming events, not what Adam asked for. DO NOT invent a `date` field; the only accepted bounds keys are `time_min` and `time_max`.
 
 When Adam asks about email/inbox:
 ALWAYS emit:

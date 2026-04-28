@@ -2386,10 +2386,85 @@ def _is_all_day_event(start: Optional[str]) -> bool:
     return len(start) == 10 and start[4] == "-" and start[7] == "-"
 
 
+def _calendar_bounds_today_local() -> tuple[str, str]:
+    """Return (time_min, time_max) as RFC 3339 strings covering today in the
+    machine's local timezone. Used as a fallback when Jackson emits
+    `calendar_list_events` without bounds — without this, the Google API
+    returns the user's oldest events first, making "today's calendar" useless.
+
+    .astimezone() with no argument promotes a naive datetime to local TZ via
+    the OS, which is the right answer on Adam's Mac Mini."""
+    now_local = datetime.now().astimezone()
+    start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1) - timedelta(microseconds=1)
+    return start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")
+
+
+def _local_day_bounds(date_str: str) -> Optional[tuple[str, str]]:
+    """Return (00:00, 23:59:59) in local TZ for a YYYY-MM-DD string, or None
+    if the string isn't a valid date."""
+    if not isinstance(date_str, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str.strip()):
+        return None
+    try:
+        d0 = datetime.fromisoformat(date_str.strip()).astimezone()
+    except ValueError:
+        return None
+    d1 = d0 + timedelta(days=1) - timedelta(microseconds=1)
+    return d0.isoformat(timespec="seconds"), d1.isoformat(timespec="seconds")
+
+
+def _resolve_calendar_bounds(args: dict) -> tuple[Optional[str], Optional[str]]:
+    """Coerce Jackson's args into (time_min, time_max).
+
+    Accepts several shapes — Jackson is Sonnet under the hood and will
+    sometimes invent field names rather than the canonical ones, so we're
+    Postel about input. Without this, "What's on my calendar?" without
+    explicit bounds returns the user's oldest events first (Google's
+    default sort with no timeMin filter), which is the v1.24 bug we're
+    fixing. Recognised inputs:
+
+    - {"time_min": ISO, "time_max": ISO}            — pass through (canonical)
+    - {"date": "YYYY-MM-DD"}                        — single-day bounds
+    - {"start_date": "YYYY-MM-DD", "end_date": ...} — multi-day shorthand
+    - {"date_range": {"start": ..., "end": ...}}    — nested shorthand
+    - {} or partial                                 — fall back to today
+
+    A bound is treated as missing if it's None, empty, or non-string. We
+    don't try to validate the ISO string itself — Google's API will reject
+    a malformed timestamp clearly enough."""
+    tmin = args.get("time_min")
+    tmax = args.get("time_max")
+    if not isinstance(tmin, str) or not tmin.strip():
+        tmin = None
+    if not isinstance(tmax, str) or not tmax.strip():
+        tmax = None
+    if tmin and tmax:
+        return tmin, tmax
+
+    # Single-day shorthand.
+    bounds = _local_day_bounds(args.get("date"))
+    if bounds:
+        return bounds
+
+    # Multi-day shorthand — honour either flat or nested.
+    start_key = args.get("start_date") or (args.get("date_range") or {}).get("start") if isinstance(args.get("date_range"), dict) else args.get("start_date")
+    end_key = args.get("end_date") or (args.get("date_range") or {}).get("end") if isinstance(args.get("date_range"), dict) else args.get("end_date")
+    range_start = _local_day_bounds(start_key) if isinstance(start_key, str) else None
+    range_end = _local_day_bounds(end_key) if isinstance(end_key, str) else None
+    if range_start and range_end:
+        return range_start[0], range_end[1]
+    if range_start and not tmax:
+        return range_start[0], range_start[1]
+
+    today_min, today_max = _calendar_bounds_today_local()
+    return tmin or today_min, tmax or today_max
+
+
 def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
+    tmin, tmax = _resolve_calendar_bounds(args)
     res = google_calendar.list_events(
-        time_min=args.get("time_min"),
-        time_max=args.get("time_max"),
+        time_min=tmin,
+        time_max=tmax,
         max_results=args.get("max_results") or 20,
     )
     needs = res.get("needs_setup")
@@ -2398,6 +2473,8 @@ def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict], 
         return (_google_disconnected_msg() if needs else f"> _Calendar lookup failed: {res['error']}_"), needs, api
     events = res.get("events") or []
     payload = {
+        "time_min": tmin,
+        "time_max": tmax,
         "events": [
             {
                 "id": e.get("id"),
@@ -2411,7 +2488,7 @@ def _read_google_calendar_list_events(args: dict) -> tuple[str, Optional[dict], 
                 "timezone": e.get("timezone"),
             }
             for e in events
-        ]
+        ],
     }
     return _google_fence("google-calendar-events", payload), None, None
 
