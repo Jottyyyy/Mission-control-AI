@@ -325,12 +325,24 @@ function Chat({
     }
   }, [mode, assistantKey, prefill]);
 
-  // Scroll to bottom on message change.
+  // Scroll to bottom only when a new message arrives or the last message's
+  // text actually changes (covers streamed assistant updates). Re-renders
+  // triggered by unrelated state — typing in the input, hover transitions —
+  // must NOT yank the scroll position. v1.25's flicker symptom turned out
+  // to be physical layout movement from this effect firing on every
+  // keystroke; gating on growth/last-text-change is the actual fix.
+  const scrollSnapshotRef = useRef({ len: 0, lastText: "" });
   useEffect(() => {
-    if (scrollRef.current) {
+    const last = messages[messages.length - 1];
+    const lastText = (last && (last.text || last.state || "")) || "";
+    const prev = scrollSnapshotRef.current;
+    const grew = messages.length > prev.len;
+    const lastChanged = messages.length === prev.len && lastText !== prev.lastText;
+    scrollSnapshotRef.current = { len: messages.length, lastText };
+    if ((grew || lastChanged) && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, thinking, mode]);
+  }, [messages]);
 
   const updateUrl = (uuid) => {
     try {

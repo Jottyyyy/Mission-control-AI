@@ -189,12 +189,17 @@ function parseFenceBody(body) {
   return parsed;
 }
 
-function FenceRenderer({ Renderer, body }) {
+// React.memo on FenceRenderer itself: with the JSON.parse cache, identical
+// body strings already short-circuit at the data layer, but memoizing the
+// outer wrapper avoids even running this function body on parent re-renders
+// (e.g. Chat re-rendering on every keystroke). Defense-in-depth — the inner
+// Renderer is also memo'd in GoogleRenderers.
+const FenceRenderer = React.memo(function FenceRenderer({ Renderer, body }) {
   // useMemo is belt-and-braces over the module-level cache: it pins the
   // parsed reference for this component instance even if the cache evicts.
   const data = React.useMemo(() => parseFenceBody(body), [body]);
   return <Renderer data={data} />;
-}
+});
 
 function renderFence(block, key) {
   const { lang, body } = block;

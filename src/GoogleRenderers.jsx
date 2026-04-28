@@ -73,14 +73,6 @@ const LINK_STYLE = {
   textDecoration: "none",
 };
 
-const ID_STYLE = {
-  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-  fontSize: 10,
-  color: "var(--fg-faint)",
-  opacity: 0,
-  transition: "opacity 120ms",
-};
-
 function CardShell({ title, count, action, children }) {
   return (
     <div style={CARD_STYLE}>
@@ -161,19 +153,6 @@ function HoverableRow({ href, children, ariaLabel }) {
   );
 }
 
-function FaintId({ id, hover }) {
-  if (!id) return null;
-  return (
-    <span style={{
-      ...ID_STYLE,
-      opacity: hover ? 0.7 : 0,
-      marginLeft: 6,
-    }}>
-      {String(id).slice(0, 8)}
-    </span>
-  );
-}
-
 // --- Calendar -------------------------------------------------------------
 
 function nameFromAttendee(a) {
@@ -232,7 +211,7 @@ function CalendarEventRow({ ev, compact }) {
   const timeLabel = ev.all_day
     ? "All day"
     : `${formatTimeOnly(ev.start)} – ${formatTimeOnly(ev.end)}`;
-  const dim = status === "past" ? 0.6 : 1;
+  const dim = status === "past" ? 0.5 : 1;
   const open = () => ev.html_link && window.open(ev.html_link, "_blank", "noopener,noreferrer");
   return (
     <div
@@ -266,8 +245,6 @@ function CalendarEventRow({ ev, compact }) {
           fontWeight: 600,
           fontSize: 13.5,
           color: "var(--fg)",
-          textDecoration: status === "past" ? "line-through" : "none",
-          textDecorationThickness: 1,
         }}>
           {ev.summary || "(untitled event)"}
         </div>
@@ -278,7 +255,6 @@ function CalendarEventRow({ ev, compact }) {
             return dur ? <span style={{ marginLeft: 6, color: "var(--fg-faint)" }}>· {dur}</span> : null;
           })()}
         </div>
-        <FaintId id={ev.id} hover={hover} />
       </div>
       {!compact && (
         <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 3, flexWrap: "wrap" }}>
@@ -357,7 +333,6 @@ function CalendarTableRow({ ev, striped }) {
         {status === "now" && <span style={{ ...NOW_PILL_STYLE, marginRight: 6 }}>● Now</span>}
         <span style={{
           fontWeight: 600,
-          textDecoration: status === "past" ? "line-through" : "none",
         }}>
           {ev.summary || "(untitled event)"}
         </span>
@@ -694,7 +669,6 @@ function GmailMessageRow({ msg }) {
             </div>
           )}
         </div>
-        <FaintId id={msg.id} hover={hover} />
       </div>
     </div>
   );
@@ -849,7 +823,6 @@ function DriveFileRow({ file }) {
           {ownerLabel && <span>· {ownerLabel}</span>}
         </div>
       </div>
-      <FaintId id={file.id} hover={hover} />
     </div>
   );
 }
