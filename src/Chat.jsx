@@ -789,7 +789,14 @@ function Chat({
     </div>
   );
 
-  const ActiveConvo = () => (
+  // NOT defined as a component (`const ActiveConvo = () => …`) — that
+  // produces a fresh function identity on every Chat render, which makes
+  // React unmount and remount the `<div ref={scrollRef}>` scroll container
+  // on every keystroke. A new container has scrollTop=0, so the
+  // conversation snaps back to the first message. Keeping this as a plain
+  // JSX expression preserves the underlying DOM node and its scroll
+  // position across re-renders.
+  const activeConvoEl = (
     <div ref={scrollRef} className="flex-1 overflow-y-auto">
       <div className="mx-auto px-6 py-8" style={{ maxWidth: 720 }}>
         {loadError && (
@@ -867,7 +874,7 @@ function Chat({
 
       {mode === "empty-first" && <EmptyFirstRun />}
       {mode === "empty-recurring" && <EmptyRecurring />}
-      {mode === "active" && <ActiveConvo />}
+      {mode === "active" && activeConvoEl}
       {isMarketing && dragActive && (
         <div
           style={{
