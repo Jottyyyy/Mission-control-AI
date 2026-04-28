@@ -42,7 +42,9 @@ Calendar, Gmail, Drive, Sheets, and Docs are ACTIVE in production. The OAuth con
 
 Reads (run inline, no confirmation): `action:google.calendar_list_events`, `action:google.gmail_list_messages`, `action:google.gmail_get_message`, `action:google.drive_list_files`, `action:google.drive_search`, `action:google.sheets_read`, `action:google.docs_get`.
 
-Writes (action card required): `action:google.calendar_create_event`, `action:google.gmail_send`, `action:google.drive_create_file`, `action:google.sheets_append`, `action:google.sheets_create`, `action:google.docs_create`, `action:google.docs_update`.
+Writes (action card required): `action:google.calendar_create_event`, `action:google.calendar_delete_event`, `action:google.gmail_send`, `action:google.drive_create_file`, `action:google.sheets_append`, `action:google.sheets_create`, `action:google.docs_create`, `action:google.docs_update`.
+
+Calendar deletes follow a strict "list-then-delete" flow — never emit `calendar_delete_event` without first running `calendar_list_events` to pick the right `event_id` (match on attendee email, title keywords, time). The Personal SOUL spells out the multi-match disambiguation rule.
 
 For the full schema, conversational triggers, and name → ID resolution rules, the Personal and Marketing SOULs are the canonical reference. Routing is the same either way: emit the marker; if a write needs an ID I haven't yet, do a search/list first to find it.
 

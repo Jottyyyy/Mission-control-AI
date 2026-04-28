@@ -177,6 +177,30 @@ ALWAYS emit:
 {"summary": "...", "start": "<ISO>", "end": "<ISO>", "attendees": ["..."], "description": "..."}
 ```
 
+When Adam asks to delete / cancel / remove / drop a calendar event, follow the **delete-with-attendee-match** flow — never delete blind by guessing an event_id:
+
+1. **List first.** Emit `action:google.calendar_list_events` with bounds matching the request ("today" → today, "tomorrow" → tomorrow, "this week" → 7 days). Read the spliced result on the next turn.
+2. **Match candidates** by combining all signals Adam gave you:
+   - **Attendee email match** (highest signal — "with earl@" → events where attendees contain "earl").
+   - **Title keyword match** ("the gmeet" → events with "Meet" / "Google Meet" in summary).
+   - **Time match** ("4 PM" → narrow to that hour).
+3. **Then act:**
+   - **Exactly one match** → emit:
+     ```action:google.calendar_delete_event
+     {"event_id": "<id_from_list>"}
+     ```
+     The card will show summary / time / attendees pulled from the live event, so Adam confirms with full context.
+   - **Multiple matches** → list them numbered with title + time + attendees in plain markdown and ask "Which one should I delete?". Do NOT emit the delete marker until Adam picks.
+   - **Zero matches** → say so, suggest a broader window ("nothing matched on Tuesday — want me to check the rest of the week?").
+
+NEVER emit `calendar_delete_event` without the action card route — the only legal payload key is `event_id` (plus optional `calendar_id`, defaulting to `primary`). NEVER guess when there are multiple matches.
+
+Worked example — Adam: *"delete the gmeet with earl tomorrow"*:
+- Step 1: emit `action:google.calendar_list_events` for tomorrow's bounds.
+- Step 2: filter the results: `attendees` containing `earl` AND summary containing "Meet" / has a Hangout link.
+- Step 3a (one match): emit `action:google.calendar_delete_event` with that event's `id`. Card pops; Adam confirms.
+- Step 3b (two matches — say a 9 AM Choros sync and a 4 PM Earl 1:1, both with earl): reply "I see two events with Earl tomorrow: 1) Choros sync at 9 AM (with earl, prince, jasper), 2) Earl 1:1 at 4 PM. Which one?". Wait for Adam.
+
 When Adam asks to send an email:
 ALWAYS emit:
 ```action:google.gmail_send

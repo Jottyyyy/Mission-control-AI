@@ -2100,6 +2100,46 @@ def _validate_google_calendar_create_event(data: dict) -> tuple[Optional[dict], 
     return out, None
 
 
+def _validate_google_calendar_delete_event(data: dict) -> tuple[Optional[dict], Optional[str]]:
+    """Pre-flight a delete by enriching the action_data with the event's
+    current summary / start / end / attendees, so the action card can show
+    "Delete <summary> on <date> with <attendees>" instead of a bare ID.
+
+    Pulling the event details at validate-time also catches "wrong ID" up
+    front — better than letting the user click Confirm and then erroring."""
+    eid = (data.get("event_id") or "").strip()
+    if not eid:
+        return None, "Missing 'event_id'."
+    cal = (data.get("calendar_id") or "primary").strip() or "primary"
+
+    # Best-effort enrichment. If get_event fails (auth, 404, transient), we
+    # still let the action through with just the ID so Adam can confirm —
+    # the executor will surface the same error if it persists.
+    try:
+        details = google_calendar.get_event(eid)
+    except Exception:  # pragma: no cover — defensive against integration bugs
+        details = {}
+    ev = (details or {}).get("event") or {}
+    attendees = ev.get("attendees") or []
+    # _normalise_event returns attendees as [{email, response}]; flatten to
+    # [str] so the existing GoogleCalendarEventBody renderer (which calls
+    # attendees.join(", ")) can display them without changes.
+    attendee_emails = [a.get("email") for a in attendees if isinstance(a, dict) and a.get("email")]
+
+    out: dict = {
+        "event_id": eid,
+        "calendar_id": cal,
+        "summary": ev.get("summary") or "(untitled event)",
+        "start": ev.get("start") or "",
+        "end": ev.get("end") or "",
+        "attendees": attendee_emails,
+        "location": ev.get("location") or None,
+        "timezone": ev.get("timezone") or None,
+        "html_link": ev.get("html_link") or None,
+    }
+    return out, None
+
+
 def _validate_google_gmail_send(data: dict) -> tuple[Optional[dict], Optional[str]]:
     to = (data.get("to") or "").strip()
     subject = (data.get("subject") or "").strip()
@@ -2190,6 +2230,7 @@ _ACTION_VALIDATORS = {
     "contacts.create": _validate_contacts_create,
     "ghl.create_contact": _validate_ghl_create_contact,
     "google.calendar_create_event": _validate_google_calendar_create_event,
+    "google.calendar_delete_event": _validate_google_calendar_delete_event,
     "google.gmail_send":             _validate_google_gmail_send,
     "google.drive_create_file":      _validate_google_drive_create_file,
     "google.sheets_append":          _validate_google_sheets_append,
@@ -3123,6 +3164,24 @@ def _execute_google_calendar_create_event(action_data: dict) -> tuple[bool, dict
     return False, _failure(res, "Google Calendar create_event failed.")
 
 
+def _execute_google_calendar_delete_event(action_data: dict) -> tuple[bool, dict]:
+    """Confirmed delete. Returns the deleted event's summary/start so the
+    chat surface can render a clean "Deleted '...' on Tue Apr 29" line
+    even after the row is gone from Google."""
+    eid = action_data.get("event_id")
+    cal = action_data.get("calendar_id") or "primary"
+    res = google_calendar.delete_event(eid, calendar_id=cal)
+    if res.get("success"):
+        return True, {
+            "ok": True,
+            "event_id": eid,
+            "deleted_summary": action_data.get("summary"),
+            "deleted_start": action_data.get("start"),
+            "already_gone": bool(res.get("already_gone")),
+        }
+    return False, _failure(res, "Calendar delete failed.")
+
+
 def _execute_google_gmail_send(action_data: dict) -> tuple[bool, dict]:
     res = google_gmail.send_message(
         to=action_data["to"],
@@ -3216,6 +3275,7 @@ _EXECUTORS = {
     "ghl.send_message": _execute_ghl_send_message,
     "ghl.add_note": _execute_ghl_add_note,
     "google.calendar_create_event": _execute_google_calendar_create_event,
+    "google.calendar_delete_event": _execute_google_calendar_delete_event,
     "google.gmail_send":             _execute_google_gmail_send,
     "google.drive_create_file":      _execute_google_drive_create_file,
     "google.sheets_append":          _execute_google_sheets_append,

@@ -192,3 +192,31 @@ def create_event(
         "summary": body.get("summary"),
         "error": None,
     }
+
+
+def delete_event(event_id: str, calendar_id: str = "primary") -> dict:
+    """Delete an event by ID from the given calendar (default: primary).
+
+    Google's DELETE returns 204 (No Content) on success and 410 if the event
+    is already cancelled — both treated as success here so a double-confirm
+    doesn't surface as an error. 404 means the event was never there or
+    already removed by another client; we surface that distinctly so the
+    chat layer can tell Adam plainly."""
+    if not event_id:
+        return {"success": False, "event_id": None, "error": "Missing event_id"}
+    cal = (calendar_id or "primary").strip() or "primary"
+    status, body, needs = _authed_request(
+        "DELETE",
+        f"/calendars/{cal}/events/{event_id}",
+        context="to delete a calendar event",
+    )
+    if needs:
+        return {"success": False, "event_id": event_id,
+                "error": "Google not connected", "needs_setup": needs}
+    if status in (200, 204, 410):
+        # 410 Gone == already cancelled; treat as a clean delete.
+        return {"success": True, "event_id": event_id, "already_gone": status == 410, "error": None}
+    if status == 404:
+        return {"success": False, "event_id": event_id,
+                "error": "Event not found (already deleted, or wrong calendar)."}
+    return _failure({"success": False, "event_id": event_id}, status, body)

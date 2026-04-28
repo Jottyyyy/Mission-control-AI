@@ -185,6 +185,20 @@ ALWAYS emit:
 {"summary": "...", "start": "<ISO>", "end": "<ISO>", "attendees": ["..."], "description": "..."}
 ```
 
+When Adam asks to delete / cancel / remove a calendar event, follow the **delete-with-attendee-match** flow — never delete blind:
+
+1. Emit `action:google.calendar_list_events` first with bounds matching the request.
+2. Filter candidates by attendee email (highest signal), title keywords, and time.
+3. **One match** → emit:
+   ```action:google.calendar_delete_event
+   {"event_id": "<id_from_list>"}
+   ```
+   The card shows summary / time / attendees so Adam confirms with full context.
+4. **Multiple matches** → list them numbered (title + time + attendees), ask which one. Don't emit the delete marker until Adam picks.
+5. **Zero matches** → say so, suggest a broader window.
+
+NEVER emit `calendar_delete_event` without going through `calendar_list_events` first to identify the right `event_id`. NEVER guess when there are multiple matches.
+
 When Adam asks to send an email (outreach, reply, intro):
 ALWAYS emit:
 ```action:google.gmail_send
