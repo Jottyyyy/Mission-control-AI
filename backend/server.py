@@ -636,6 +636,71 @@ def health():
     return {"status": "ok", "local": True, "workspace": str(WORKSPACE)}
 
 
+# --- Action registry hint (live source of truth) --------------------------
+#
+# v1.28 fixed Jackson hallucinating a stale "supported action types" list
+# (he kept reciting the pre-v1.27 four-marker enumeration even though the
+# backend had moved on). The fix: SOUL.md no longer hardcodes any list,
+# and the runtime instead injects a live registry hint on every chat turn,
+# so Jackson always sees what's actually wired right now. _EXECUTORS is
+# the source of truth — that's what /tools/execute will accept.
+
+def _action_registry_hint() -> str:
+    """Two-line note listing every action marker the backend will accept,
+    split into reads (executed inline) and writes (action-card confirm),
+    pulled from the live _READ_ACTION_HANDLERS and _EXECUTORS dicts.
+    Prepended to every /chat user message so Jackson can't drift onto a
+    stale enumeration. Including reads is critical — without them
+    Jackson treats list_events / search_contacts / etc. as unsupported
+    and asks the user to fetch the data manually."""
+    reads = sorted(set(_READ_ACTION_HANDLERS.keys()))
+    writes = sorted(set(_EXECUTORS.keys()))
+    # Include the full `action:` prefix in each entry so Jackson copies the
+    # right fence syntax (he sometimes drops the prefix when the hint shows
+    # bare names, producing un-routable fences like ```google.calendar_list_events).
+    reads_pref = [f"action:{r}" for r in reads]
+    writes_pref = [f"action:{w}" for w in writes]
+    return (
+        "[runtime: available READ markers (execute inline, no confirmation needed) — "
+        + ", ".join(reads_pref)
+        + "]\n[runtime: available WRITE markers (action-card confirm) — "
+        + ", ".join(writes_pref)
+        + "]\n[runtime: emit them as fenced JSON blocks — \"```action:<name>\\n{...}\\n```\" — exactly that prefix; the registry is the source of truth, not your memory.]"
+    )
+
+
+# --- SOUL.md drift sentinel ------------------------------------------------
+#
+# Compare the SHA of the live workspace SOUL.md(s) against the templates
+# bundled in the repo. A mismatch isn't necessarily wrong (Adam can edit
+# his live workspace freely) but it's worth flagging in the logs so a
+# stale-after-update bug like the one fixed here is easy to spot.
+
+def _check_soul_md_drift() -> None:
+    import hashlib
+    pairs = [
+        ("SOUL.md", WORKSPACE / "SOUL.md"),
+        ("agents/personal/SOUL.md", WORKSPACE / "agents" / "personal" / "SOUL.md"),
+        ("agents/marketing/SOUL.md", WORKSPACE / "agents" / "marketing" / "SOUL.md"),
+    ]
+    template_root = Path(__file__).resolve().parent.parent / "workspace-template"
+    if not template_root.exists():
+        return  # packaged install — template lives elsewhere; skip silently
+    for rel, live_path in pairs:
+        tpl_path = template_root / rel
+        if not tpl_path.exists() or not live_path.exists():
+            continue
+        live = hashlib.sha256(live_path.read_bytes()).hexdigest()[:12]
+        tpl = hashlib.sha256(tpl_path.read_bytes()).hexdigest()[:12]
+        if live != tpl:
+            print(
+                f"[soul-drift] {rel}: live={live} template={tpl} — "
+                "live workspace differs from repo template (this may be "
+                "intentional; flagging for visibility)",
+                flush=True,
+            )
+
+
 # --- v1.28 chain: read-then-write in one /chat round -----------------------
 #
 # Without this, Jackson can only emit ONE class of action per /chat call
@@ -842,6 +907,15 @@ def chat(req: ChatRequest):
         # can still get a reply and route the issue.
         prefixed = "[personal] " + message
         effective_mode = "personal"
+
+    # Inject the live action registry into the user message so Jackson
+    # can't drift onto a stale enumeration. The hint is bracketed so it
+    # reads as a system note rather than something Adam typed; openclaw
+    # passes the whole prefixed string in as a user turn, which is the
+    # only context-injection surface we have without modifying the CLI.
+    # Setup mode never emits actions, so skip the hint there.
+    if effective_mode != "setup":
+        prefixed = _action_registry_hint() + "\n\n" + prefixed
 
     # Setup mode is always FAST — credential walk-throughs don't benefit
     # from deep reasoning and the latency matters for a step-by-step flow.
@@ -2602,6 +2676,24 @@ def _local_day_bounds(date_str: str) -> Optional[tuple[str, str]]:
     return d0.isoformat(timespec="seconds"), d1.isoformat(timespec="seconds")
 
 
+def _normalise_calendar_bound(s: Optional[str]) -> Optional[str]:
+    """Attach the local TZ offset to a naive ISO datetime so Google's
+    Calendar API accepts it. Without this, Jackson's well-formed-looking
+    `2026-04-29T00:00:00` (no offset) gets rejected with a 400 Bad Request.
+    Strings that already carry an offset (`+08:00`, `Z`) pass through."""
+    if not isinstance(s, str) or not s.strip():
+        return s
+    s = s.strip()
+    if s.endswith("Z") or re.search(r"[+-]\d{2}:?\d{2}$", s):
+        return s
+    try:
+        # Anchor a naive ISO at local TZ via .astimezone() with no arg.
+        dt = datetime.fromisoformat(s).astimezone()
+        return dt.isoformat(timespec="seconds")
+    except ValueError:
+        return s  # let Google reject malformed input directly
+
+
 def _resolve_calendar_bounds(args: dict) -> tuple[Optional[str], Optional[str]]:
     """Coerce Jackson's args into (time_min, time_max).
 
@@ -2628,7 +2720,7 @@ def _resolve_calendar_bounds(args: dict) -> tuple[Optional[str], Optional[str]]:
     if not isinstance(tmax, str) or not tmax.strip():
         tmax = None
     if tmin and tmax:
-        return tmin, tmax
+        return _normalise_calendar_bound(tmin), _normalise_calendar_bound(tmax)
 
     # Single-day shorthand.
     bounds = _local_day_bounds(args.get("date"))
@@ -4552,3 +4644,8 @@ def agents_delete(slug: str):
     import shutil
     shutil.rmtree(d)
     return {"success": True, "slug": slug}
+
+
+# Run the SOUL.md drift sentinel once at module load. Logged as a normal
+# print so it shows up in the Electron backend log on startup.
+_check_soul_md_drift()
