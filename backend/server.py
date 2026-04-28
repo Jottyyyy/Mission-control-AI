@@ -590,9 +590,27 @@ _CRED_PATTERNS = [
     re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     # Generic bearer / API-key lines where the user literally typed the prefix.
     re.compile(r"(?im)^\s*(?:bearer|authorization|api[_-]?key|token|secret)\s*[:=]\s*\S{12,}\s*$"),
-    # Fallback: very long opaque strings that look like secrets (40+ chars, no spaces).
-    re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),
 ]
+
+# Catch-all for "very long opaque alphanumeric blobs" that look like secrets.
+# Run with a callback so we can exempt known-shape resource IDs that Adam
+# legitimately needs to paste back into chat (e.g. Google Calendar recurring
+# event IDs end in `_YYYYMMDDTHHMMSSZ`). Without the exemption, asking
+# Jackson to delete a specific event by ID becomes impossible because the
+# ID gets [redacted] before it ever reaches him. The exemption only covers
+# strings whose shape matches a documented Google ID format — it does not
+# weaken redaction for arbitrary 40-char tokens (AWS secret keys etc.).
+_LONG_OPAQUE_RE = re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")
+_GOOGLE_EVENT_ID_RE = re.compile(r"^[a-z0-9]+_\d{8}T\d{6}Z$")
+
+
+def _is_safe_resource_id(s: str) -> bool:
+    """True for opaque blobs we know are safe to leave in place.
+
+    Currently only Google Calendar recurring event IDs (suffix
+    `_YYYYMMDDTHHMMSSZ`). Add more shapes here as needed — keep each one
+    tight enough that real secrets can't masquerade as them."""
+    return bool(_GOOGLE_EVENT_ID_RE.match(s))
 
 
 def _scrub_credentials(text: str) -> str:
@@ -602,6 +620,10 @@ def _scrub_credentials(text: str) -> str:
     out = text
     for pat in _CRED_PATTERNS:
         out = pat.sub("[redacted]", out)
+    out = _LONG_OPAQUE_RE.sub(
+        lambda m: m.group(0) if _is_safe_resource_id(m.group(0)) else "[redacted]",
+        out,
+    )
     return out
 
 
@@ -2231,6 +2253,11 @@ _ACTION_VALIDATORS = {
     "ghl.create_contact": _validate_ghl_create_contact,
     "google.calendar_create_event": _validate_google_calendar_create_event,
     "google.calendar_delete_event": _validate_google_calendar_delete_event,
+    # Legacy alias — Jackson sometimes mirrors the namespace of the
+    # already-wired `calendar.create_event` legacy marker. Pointing both at
+    # the same validator/executor is safer than counting on Sonnet to pick
+    # the canonical name every time.
+    "calendar.delete_event":        _validate_google_calendar_delete_event,
     "google.gmail_send":             _validate_google_gmail_send,
     "google.drive_create_file":      _validate_google_drive_create_file,
     "google.sheets_append":          _validate_google_sheets_append,
@@ -3276,6 +3303,7 @@ _EXECUTORS = {
     "ghl.add_note": _execute_ghl_add_note,
     "google.calendar_create_event": _execute_google_calendar_create_event,
     "google.calendar_delete_event": _execute_google_calendar_delete_event,
+    "calendar.delete_event":        _execute_google_calendar_delete_event,
     "google.gmail_send":             _execute_google_gmail_send,
     "google.drive_create_file":      _execute_google_drive_create_file,
     "google.sheets_append":          _execute_google_sheets_append,

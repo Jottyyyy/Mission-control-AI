@@ -879,6 +879,26 @@ const ACTION_META = {
       </div>
     ),
   },
+  // Legacy alias — same shape as google.calendar_delete_event. Backend
+  // routes both to the same validator/executor; ACTION_META needs a copy
+  // here too so the card label/icon resolves regardless of which name
+  // Jackson chose to emit.
+  "calendar.delete_event": {
+    icon: Icon.Trash,
+    label: "Delete calendar event",
+    confirmLabel: "Delete event",
+    busyLabel: "Deleting…",
+    editPlaceholder: "Tell Jackson which event to delete instead…",
+    renderBody: (data) => <GoogleCalendarEventBody data={data} />,
+    renderSuccess: (data, result) => (
+      <div style={{ fontSize: 13, color: "var(--green)", marginTop: 8 }}>
+        <Icon.Check className="lucide-xs" style={{ verticalAlign: "-2px", marginRight: 6 }} />
+        {result?.already_gone ? "Already gone" : "Deleted"}
+        {" "}<strong>{result?.deleted_summary || data?.summary || "event"}</strong>
+        {result?.deleted_start && <> — was on {result.deleted_start}</>}.
+      </div>
+    ),
+  },
   "google.gmail_send": {
     icon: Icon.Mail,
     label: "Send email",
@@ -979,6 +999,7 @@ const ACTION_TOOL_REQUIREMENTS = {
   "ghl.add_note":       { tool: "ghl", context: "to attach notes in GHL" },
   "google.calendar_create_event": { tool: "google", context: "to create a calendar event" },
   "google.calendar_delete_event": { tool: "google", context: "to delete a calendar event" },
+  "calendar.delete_event":        { tool: "google", context: "to delete a calendar event" },
   "google.gmail_send":             { tool: "google", context: "to send an email" },
   "google.drive_create_file":      { tool: "google", context: "to create a Drive file" },
   "google.sheets_append":          { tool: "google", context: "to append rows to a spreadsheet" },
