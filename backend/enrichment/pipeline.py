@@ -212,11 +212,19 @@ class EnrichmentPipeline:
     def summarise(
         self,
         results: list[tuple[dict, dict]],
+        original_rows: Optional[list[dict]] = None,
     ) -> dict:
-        """Aggregate per-row results into a chat-friendly summary."""
+        """Aggregate per-row results into a chat-friendly summary.
+
+        When `original_rows` is supplied, also compute `field_fill_counts`
+        — a map of column-name → number of rows where the pipeline added
+        a non-empty value to that column. The success card uses this to
+        show "Directors filled 193 rows" without re-walking the data on
+        the frontend."""
         rows_enriched = 0
         rows_unmatched = 0
         per_row_status: list[dict] = []
+        field_fill_counts: dict[str, int] = {}
 
         for original_idx, (enriched, status) in enumerate(results):
             any_filled = any(s.startswith("enriched") for s in status.values())
@@ -232,10 +240,19 @@ class EnrichmentPipeline:
                 "status": status,
             })
 
-        return {
+            if original_rows is not None and original_idx < len(original_rows):
+                original = original_rows[original_idx] or {}
+                for col, new_val in enriched.items():
+                    if not _is_blank(new_val) and _is_blank(original.get(col)):
+                        field_fill_counts[col] = field_fill_counts.get(col, 0) + 1
+
+        out = {
             "rows_processed": len(results),
             "rows_enriched": rows_enriched,
             "rows_unmatched": rows_unmatched,
             "per_row_status": per_row_status,
             "credits_used": {"companies_house": 0},  # Companies House is free
         }
+        if original_rows is not None:
+            out["field_fill_counts"] = field_fill_counts
+        return out

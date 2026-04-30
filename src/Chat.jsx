@@ -504,9 +504,16 @@ function Chat({
   };
 
   // --------------------------------------------------------------------------
-  // File upload — Marketing chat only. Uploads a Zint CSV to the workflow
-  // backend, inserts a file-card message, and posts an auto-reply from the
-  // assistant with a Process button that runs the batch inline.
+  // File upload — Marketing chat. Routes the CSV through the v1.30 enrichment
+  // pipeline (/enrichment/run, which returns a job_id immediately) and emits
+  // a [[enrichment-progress:<job_id>]] marker that the chat splitter renders
+  // as <EnrichmentProgressCard>. The card polls /enrichment/status/{id} and
+  // swaps to a download link on completion.
+  //
+  // The legacy MAN-cascade path (Pomanda → Cognism → Lusha + SetupModal gate)
+  // still lives in src/Workflows.jsx and uses /workflow/man/upload-spreadsheet
+  // directly — leave processFileCard / _runFileCardBatch / "Process all" UI
+  // intact for that page. The chat surface no longer touches them.
   // --------------------------------------------------------------------------
 
   const handleFilePick = async (file) => {
@@ -531,45 +538,68 @@ function Chat({
       return;
     }
 
-    // Placeholder card while parsing.
-    const cardId = `fc-${Date.now()}`;
-    setMessages((m) => [...m, { from: "file-card", id: cardId, filename: file.name, state: "parsing" }]);
     if (mode !== "active") setMode("active");
+
+    // Show the user's "attachment" as a normal user message so the
+    // conversation history reads naturally on reload.
+    setMessages((m) => [...m, {
+      from: "user",
+      text: `📎 ${file.name}`,
+    }]);
+
+    // Placeholder while we POST — gives instant feedback before the
+    // job_id comes back. Replaced (not appended) with the real assistant
+    // message containing the progress marker.
+    const placeholderId = `enr-${Date.now()}`;
+    setMessages((m) => [...m, {
+      from: "assistant",
+      id: placeholderId,
+      text: "Uploading…",
+    }]);
 
     try {
       const text = await file.text();
-      const res = await fetch(`${API_BASE}/workflow/man/upload-spreadsheet`, {
+      const res = await fetch(`${API_BASE}/enrichment/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name, csv_content: text }),
+        body: JSON.stringify({
+          csv_content: text,
+          filename: file.name,
+          source_type: "csv",
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setMessages((m) => m.map((msg) => msg.id === cardId
-          ? { ...msg, state: "error", error: data?.detail || `Upload failed (HTTP ${res.status}).` }
+        const detail = data?.detail || `Upload failed (HTTP ${res.status}).`;
+        setMessages((m) => m.map((msg) => msg.id === placeholderId
+          ? { from: "assistant", text: detail, error: true }
           : msg
         ));
         return;
       }
-      setMessages((m) => m.map((msg) => msg.id === cardId
-        ? { ...msg, state: "loaded", leads: data.leads || [], column_mapping: data.column_mapping || {}, detected_columns: data.detected_columns || [], extra_columns: data.extra_columns || [] }
+      const jobId = data?.job_id;
+      const total = data?.total || 0;
+      const truncatedNote = data?.truncated
+        ? "\n\n> _Capped at 200 rows — re-run with the rest if needed._"
+        : "";
+      const marker = jobId ? `[[enrichment-progress:${jobId}]]` : "";
+      const reply = [
+        `On it — enriching ${total} row${total === 1 ? "" : "s"}. I'll fill in the missing fields using Companies House first, then any other sources we have wired.`,
+        "",
+        marker,
+      ].join("\n") + truncatedNote;
+      setMessages((m) => m.map((msg) => msg.id === placeholderId
+        ? { from: "assistant", text: reply }
         : msg
       ));
-      // Auto-reply from the assistant.
-      const n = (data.leads || []).length;
-      const reply = [
-        `I found **${n} lead${n === 1 ? "" : "s"}** in that Zint batch.`,
-        "",
-        "For each one I can verify the MAN against Pomanda's shareholders, then fill in any missing email or mobile via Cognism (then Lusha as a fallback). Rows where Zint already has a complete contact will pass through untouched.",
-        "",
-        "Click **Process all** above when you're ready.",
-      ].join("\n");
-      setMessages((m) => [...m, { from: "assistant", text: reply }]);
     } catch (err) {
       const msg = err instanceof TypeError
         ? "Can't reach the local backend. Is it running?"
         : (err?.message || "Upload failed.");
-      setMessages((m) => m.map((mm) => mm.id === cardId ? { ...mm, state: "error", error: msg } : mm));
+      setMessages((m) => m.map((mm) => mm.id === placeholderId
+        ? { from: "assistant", text: msg, error: true }
+        : mm
+      ));
     }
   };
 

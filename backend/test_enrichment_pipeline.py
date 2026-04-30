@@ -128,6 +128,7 @@ def test_3_skipped_when_all_outputs_present():
         row = {
             "Company Name": "Pret A Manger Limited",
             "Company Number": "03836930",
+            "Companies House URL": "https://find-and-update.company-information.service.gov.uk/company/03836930",
             "Status": "Active",
             "Incorporation Date": "1999-09-29",
             "SIC Code": "56102",
@@ -329,6 +330,91 @@ def test_parse_sheets_url():
     sid = eio.parse_sheets_url("https://docs.google.com/spreadsheets/d/1aB-cD/edit#gid=0")
     assert sid == "1aB-cD"
     assert eio.parse_sheets_url("https://example.com/foo") is None
+
+
+# ---------- v1.30.3 — Companies House URL column tests ------------------
+
+def test_url_emitted_with_company_number():
+    """When the lookup resolves a company number, the enricher also
+    emits a clickable Companies House URL pointing at the official
+    record."""
+    original = companies_house.query_companies_house
+    _install_stub()
+    try:
+        enricher = CompaniesHouseEnricher()
+        result = enricher.enrich({"Company Name": "Pret A Manger Limited"})
+        assert "Company Number" in result
+        assert "Companies House URL" in result
+        assert result["Companies House URL"] == (
+            "https://find-and-update.company-information.service.gov.uk/company/03836930"
+        )
+    finally:
+        _uninstall_stub(original)
+
+
+def test_url_format_is_canonical():
+    """No trailing slash, no extra path segments, exact lowercase host
+    matching the public service. We assert against a few realistic
+    inputs to make sure formatting is purely string interpolation —
+    no path normalisation that would munge a real number."""
+    original = companies_house.query_companies_house
+    _install_stub()
+    try:
+        enricher = CompaniesHouseEnricher()
+        result = enricher.enrich({"Company Name": "Pret A Manger Limited"})
+        url = result["Companies House URL"]
+        assert url.startswith("https://find-and-update.company-information.service.gov.uk/company/")
+        assert not url.endswith("/")
+        # Exactly one /company/ segment with the number tail.
+        assert url.count("/company/") == 1
+        assert url.split("/company/")[-1] == "03836930"
+    finally:
+        _uninstall_stub(original)
+
+
+def test_url_not_emitted_on_miss():
+    """Lookup returns no match → no Company Number, therefore no URL.
+    The pipeline skips empty values when filling cells, so the column
+    stays blank in the output CSV (consistent with every other
+    unmatched field)."""
+    # Default stub returns "no match" for anything that isn't Pret.
+    original = companies_house.query_companies_house
+    _install_stub()
+    try:
+        enricher = CompaniesHouseEnricher()
+        result = enricher.enrich({"Company Name": "Definitely-Not-A-Real-Company"})
+        # No company_number → no URL.
+        assert "Company Number" not in result
+        assert "Companies House URL" not in result
+    finally:
+        _uninstall_stub(original)
+
+
+def test_url_column_pinned_after_company_number():
+    """merge_headers places the URL immediately after Company Number
+    no matter where it would otherwise land. Tests both:
+      a) brand-new column in a CSV that already had Company Number
+      b) canonical enricher field order
+    """
+    # (a) Adjacency in merged header.
+    original_header = ["Company Name", "Company Number", "Notes"]
+    enriched_rows = [{
+        "Company Name": "Pret",
+        "Company Number": "03836930",
+        "Notes": "keep me",
+        "Companies House URL": "https://find-and-update.company-information.service.gov.uk/company/03836930",
+        "Status": "Active",
+        "Directors": "X",
+    }]
+    merged = eio.merge_headers(original_header, enriched_rows)
+    num_idx = merged.index("Company Number")
+    url_idx = merged.index("Companies House URL")
+    assert url_idx == num_idx + 1, f"URL not adjacent: header={merged}"
+
+    # (b) Canonical field-order on the enricher itself.
+    enricher = CompaniesHouseEnricher()
+    fields = enricher.enriches_fields
+    assert fields.index("Companies House URL") == fields.index("Company Number") + 1
 
 
 def test_read_csv_strips_bom_and_whitespace():

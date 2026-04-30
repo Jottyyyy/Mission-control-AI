@@ -5093,9 +5093,15 @@ async def _enrichment_run_csv_async(
     polling endpoint sees per-row progress in real time."""
     pipeline = EnrichmentPipeline(ENRICHERS)
     try:
+        # Snapshot originals BEFORE enrichment so summarise() can compute
+        # field_fill_counts (number of rows where each column was newly
+        # filled). enrich_row does its own dict(row) copy, so the input
+        # rows aren't mutated, but we copy here too for symmetry with the
+        # Sheets path and to keep this function's intent obvious.
+        original_rows_copy = [dict(r) for r in rows]
         results = await pipeline.enrich_batch(rows, job_id=job_id)
         enriched_rows = [r for r, _ in results]
-        summary = pipeline.summarise(results)
+        summary = pipeline.summarise(results, original_rows=original_rows_copy)
 
         final_header = enrichment_io.merge_headers(header, enriched_rows)
         _out_path, token = enrichment_io.write_csv(enriched_rows, final_header)
@@ -5103,6 +5109,8 @@ async def _enrichment_run_csv_async(
         # An absolute URL keeps copy-paste behaviour consistent and means the
         # frontend doesn't need to know the API origin to render a download link.
         output_url = f"http://127.0.0.1:8001/enrichment/download/{token}"
+
+        sample_rows = _build_sample_rows(enriched_rows, count=3)
 
         body: dict = {
             "status": "completed",
@@ -5114,6 +5122,8 @@ async def _enrichment_run_csv_async(
             "rows_unmatched": summary["rows_unmatched"],
             "per_row_status": summary["per_row_status"],
             "credits_used": summary["credits_used"],
+            "field_fill_counts": summary.get("field_fill_counts") or {},
+            "sample_rows": sample_rows,
             "truncated": truncated,
         }
         body["summary_markdown"] = _build_enrichment_summary_text(
@@ -5125,6 +5135,9 @@ async def _enrichment_run_csv_async(
             summary=body,
             download_filename=download_filename,
             credits_used=summary["credits_used"],
+            field_fill_counts=summary.get("field_fill_counts") or {},
+            sample_rows=sample_rows,
+            download_token=token,
         )
         return body
     except Exception as exc:  # noqa: BLE001
@@ -5145,7 +5158,7 @@ async def _enrichment_run_sheets_async(
         original_rows_copy = [dict(r) for r in rows]
         results = await pipeline.enrich_batch(rows, job_id=job_id)
         enriched_rows = [r for r, _ in results]
-        summary = pipeline.summarise(results)
+        summary = pipeline.summarise(results, original_rows=original_rows_copy)
 
         write_res = enrichment_io.write_sheet(
             spreadsheet_id, original_rows_copy, enriched_rows, header,
@@ -5163,6 +5176,7 @@ async def _enrichment_run_sheets_async(
             }
 
         output_url = sheets_url
+        sample_rows = _build_sample_rows(enriched_rows, count=3)
         body: dict = {
             "status": "completed",
             "input_type": "sheets",
@@ -5174,6 +5188,8 @@ async def _enrichment_run_sheets_async(
             "rows_unmatched": summary["rows_unmatched"],
             "per_row_status": summary["per_row_status"],
             "credits_used": summary["credits_used"],
+            "field_fill_counts": summary.get("field_fill_counts") or {},
+            "sample_rows": sample_rows,
             "truncated": truncated,
         }
         body["summary_markdown"] = _build_enrichment_summary_text(
@@ -5184,11 +5200,64 @@ async def _enrichment_run_sheets_async(
             output_url=output_url,
             summary=body,
             credits_used=summary["credits_used"],
+            field_fill_counts=summary.get("field_fill_counts") or {},
+            sample_rows=sample_rows,
+            # Sheets writeback doesn't go through write_csv → no token →
+            # preview endpoint won't be available for Sheets jobs (the
+            # source of truth is the live Google Sheet itself).
+            download_token=None,
         )
         return body
     except Exception as exc:  # noqa: BLE001
         enrichment_jobs.fail_job(job_id, str(exc) or "enrichment crashed")
         raise
+
+
+def _build_sample_rows(enriched_rows: list[dict], *, count: int = 3) -> list[dict]:
+    """Build a compact preview of the first N enriched rows for the chat
+    success card. We surface Company Name + Status verbatim plus
+    aggregated counts for Directors / Shareholders so a sales rep can
+    eyeball "did Companies House actually find anything for these?"
+    without scrolling a wide table.
+
+    Falls back gracefully when columns are missing — a row with no
+    Status still renders, just with that field omitted."""
+    out: list[dict] = []
+    for row in enriched_rows[:count]:
+        if not isinstance(row, dict):
+            continue
+        compact: dict = {}
+        # Find the company-name column with the same forgiving alias
+        # match the enricher uses, so a column called "Company" or
+        # "Account Name" still surfaces here.
+        from enrichment.companies_house_enricher import (
+            _COMPANY_NAME_ALIASES,
+            _value_for,
+        )
+        name = _value_for(row, _COMPANY_NAME_ALIASES) or ""
+        if name:
+            compact["Company Name"] = name
+
+        status = (row.get("Status") or "").strip()
+        if status:
+            compact["Status"] = status
+
+        directors_raw = (row.get("Directors") or "").strip()
+        if directors_raw:
+            n_dir = len([p for p in directors_raw.split(",") if p.strip()])
+            compact["Directors_summary"] = f"{n_dir} director{'' if n_dir == 1 else 's'}"
+
+        shareholders_raw = (row.get("Shareholders") or "").strip()
+        if shareholders_raw:
+            n_psc = len([p for p in shareholders_raw.split(",") if p.strip()])
+            compact["Shareholders_summary"] = f"{n_psc} PSC{'' if n_psc == 1 else 's'}"
+
+        # Always include the row, even if every field above was empty —
+        # the UI handles "no data" by showing the company name only,
+        # which is more useful than silently dropping the row.
+        if compact:
+            out.append(compact)
+    return out
 
 
 def _spawn_background_enrichment(coro_factory) -> None:
@@ -5331,6 +5400,52 @@ def enrichment_download(token: str):
         media_type="text/csv",
         filename=path.name,
     )
+
+
+@app.get("/enrichment/preview/{job_id}")
+def enrichment_preview(
+    job_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Paginated view of a completed enrichment's full enriched CSV.
+
+    Backs the success card's "Show all N rows ▾" expansion. We re-parse
+    the saved CSV per request rather than caching the parsed rows in the
+    job — the file is the source of truth (and may have been served via
+    /enrichment/download already), and 200 rows × 12 cols is cheap to
+    re-parse.
+
+    Returns 404 when the job is unknown OR when the job is a Sheets job
+    (no local CSV → preview-via-this-endpoint is N/A; the user opens the
+    sheet directly)."""
+    state = enrichment_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown enrichment job.")
+    token = state.get("download_token")
+    if not token:
+        raise HTTPException(
+            status_code=404,
+            detail="Preview only available for CSV jobs (Sheets jobs return their data in-place).",
+        )
+    path = enrichment_io.resolve_download_path(token)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Enrichment file not found or expired.")
+
+    text = path.read_text(encoding="utf-8")
+    rows, header = enrichment_io.read_csv(text)
+    total = len(rows)
+    # Slice without bounds-check shenanigans — Python list slicing is safe
+    # for offsets past the end (returns []).
+    page = rows[offset : offset + limit]
+    return {
+        "job_id": job_id,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "header": header,
+        "rows": page,
+    }
 
 
 # ---------------------------------------------------------------------------

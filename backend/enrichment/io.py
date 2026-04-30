@@ -104,7 +104,14 @@ def read_sheet(spreadsheet_id: str) -> tuple[list[dict], list[str], dict]:
 def merge_headers(original: list[str], enriched_rows: list[dict]) -> list[str]:
     """Return original headers first (preserving order), then any new
     keys the enrichers added. Stable: a column added in row 1 keeps the
-    same position even if row 5 also adds it."""
+    same position even if row 5 also adds it.
+
+    Adjacency rule: "Companies House URL" is pinned immediately after
+    "Company Number" so a reviewer reads number → click URL. Without
+    this, a CSV that already had "Company Number" would get the URL
+    appended at the end of the header next to other v1.30 additions,
+    which is technically correct but a worse review flow.
+    """
     seen = {h for h in original}
     out = list(original)
     for row in enriched_rows:
@@ -112,6 +119,22 @@ def merge_headers(original: list[str], enriched_rows: list[dict]) -> list[str]:
             if k not in seen:
                 out.append(k)
                 seen.add(k)
+
+    # Pin URL beside Number. Move it only when both are present and not
+    # already adjacent — leaves the column order untouched in any case
+    # the rule doesn't apply (no number column, URL not added, etc.).
+    try:
+        num_idx = out.index("Company Number")
+        url_idx = out.index("Companies House URL")
+    except ValueError:
+        return out
+    if url_idx == num_idx + 1:
+        return out
+    out.pop(url_idx)
+    # If the URL was BEFORE the number, popping shifts the number index.
+    if url_idx < num_idx:
+        num_idx -= 1
+    out.insert(num_idx + 1, "Companies House URL")
     return out
 
 

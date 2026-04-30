@@ -47,6 +47,17 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "company_number",
         "number",
     ),
+    # v1.30.3 — clickable verification link to the official record.
+    # Ordered immediately after Company Number on purpose: the canonical
+    # column order (`enriches_fields`) is derived from this dict's key
+    # order, and `merge_headers` further enforces that the URL sits
+    # adjacent to the number in the output CSV.
+    "Companies House URL": (
+        "Companies House URL",
+        "CH URL",
+        "Companies House Link",
+        "companies_house_url",
+    ),
     "Status": (
         "Status",
         "Company Status",
@@ -219,7 +230,16 @@ class CompaniesHouseEnricher:
         out: dict[str, str] = {}
 
         if res.get("company_number"):
-            out["Company Number"] = str(res["company_number"])
+            number = str(res["company_number"])
+            out["Company Number"] = number
+            # Stable, case-locked URL straight from the public service.
+            # Set immediately after the number so dict-iteration ordering
+            # (and any caller that walks `out.items()` to build columns)
+            # keeps the two side-by-side. The merge_headers post-process
+            # also enforces this for already-existing input columns.
+            out["Companies House URL"] = (
+                f"https://find-and-update.company-information.service.gov.uk/company/{number}"
+            )
         if res.get("status"):
             out["Status"] = str(res["status"])
         if res.get("incorporation_date"):

@@ -258,6 +258,173 @@ def test_12_end_to_end_with_pipeline_progress():
         _uninstall_stub(original)
 
 
+# ---------- v1.30.2 — preview/sample row tests ---------------------------
+
+def test_13_complete_job_records_field_fill_counts():
+    job_manager._reset_for_tests()
+    job_id = job_manager.create_job(3)
+    job_manager.complete_job(
+        job_id,
+        output_url="http://x/abc",
+        summary={"rows_processed": 3},
+        field_fill_counts={"Status": 3, "Directors": 2, "Shareholders": 1},
+        sample_rows=[],
+        download_token="tok-abc",
+    )
+    state = job_manager.get_job(job_id)
+    assert state["field_fill_counts"] == {"Status": 3, "Directors": 2, "Shareholders": 1}
+    assert state["download_token"] == "tok-abc"
+
+
+def test_14_complete_job_stores_sample_rows():
+    job_manager._reset_for_tests()
+    job_id = job_manager.create_job(3)
+    rows = [
+        {"Company Name": "Acme", "Status": "Active", "Directors_summary": "2 directors"},
+        {"Company Name": "Beta", "Status": "Active", "Shareholders_summary": "1 PSC"},
+    ]
+    job_manager.complete_job(
+        job_id, output_url="http://x", summary={}, sample_rows=rows,
+    )
+    state = job_manager.get_job(job_id)
+    assert state["sample_rows"] == rows
+    # Mutating the returned list must not affect the registry — caller
+    # gets a copy. (Otherwise the polling endpoint would silently leak
+    # the registry's internal list.)
+    state["sample_rows"].append({"Company Name": "Gamma"})
+    state2 = job_manager.get_job(job_id)
+    assert len(state2["sample_rows"]) == 2
+
+
+def test_15_status_response_includes_preview_fields_when_completed():
+    from fastapi.testclient import TestClient
+    from server import app
+
+    job_manager._reset_for_tests()
+    original = _install_stub()
+    try:
+        # 2-row CSV — small enough to complete fast in the stub harness.
+        csv = "Company Name\nAcme\nBeta\n"
+        client = TestClient(app)
+        post = client.post("/enrichment/run", json={"csv_content": csv, "filename": "x.csv"})
+        job_id = post.json()["job_id"]
+        deadline = time.monotonic() + 10
+        final = None
+        while time.monotonic() < deadline:
+            r = client.get(f"/enrichment/status/{job_id}")
+            body = r.json()
+            if body["status"] == "completed":
+                final = body
+                break
+            time.sleep(0.2)
+        assert final is not None
+        assert "field_fill_counts" in final
+        assert isinstance(final["field_fill_counts"], dict)
+        assert "sample_rows" in final
+        # Sample rows are bounded to 3 even if rows_processed > 3.
+        assert len(final["sample_rows"]) <= 3
+        # Each sample row at minimum carries the company name.
+        for sr in final["sample_rows"]:
+            assert "Company Name" in sr
+    finally:
+        _uninstall_stub(original)
+
+
+def test_16_status_response_excludes_preview_fields_when_processing():
+    """Mid-flight polls must not include field_fill_counts / sample_rows
+    — they're computed at completion. Spec calls them out as
+    completion-only fields so the UI render code can branch on presence."""
+    job_manager._reset_for_tests()
+    job_id = job_manager.create_job(50)
+    state = job_manager.get_job(job_id)
+    assert state["status"] == "processing"
+    assert "field_fill_counts" not in state
+    assert "sample_rows" not in state
+    assert "download_token" not in state
+
+
+def test_17_preview_endpoint_returns_paginated_rows():
+    from fastapi.testclient import TestClient
+    from server import app
+
+    job_manager._reset_for_tests()
+    original = _install_stub()
+    try:
+        # Build a 7-row CSV so we can exercise pagination cleanly.
+        names = ["Acme", "Beta", "Gamma", "Delta", "Eps", "Zeta", "Eta"]
+        csv = "Company Name\n" + "\n".join(names) + "\n"
+        client = TestClient(app)
+        post = client.post("/enrichment/run", json={"csv_content": csv, "filename": "x.csv"})
+        job_id = post.json()["job_id"]
+        # Wait for completion.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if client.get(f"/enrichment/status/{job_id}").json()["status"] == "completed":
+                break
+            time.sleep(0.2)
+
+        # Default page (offset=0, limit=50) — returns all 7.
+        r = client.get(f"/enrichment/preview/{job_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 7
+        assert body["offset"] == 0
+        assert len(body["rows"]) == 7
+        assert "Company Name" in body["header"]
+        assert body["rows"][0]["Company Name"] == "Acme"
+
+        # Custom slice.
+        r = client.get(f"/enrichment/preview/{job_id}?offset=3&limit=2")
+        body = r.json()
+        assert body["offset"] == 3
+        assert body["limit"] == 2
+        assert len(body["rows"]) == 2
+        assert body["rows"][0]["Company Name"] == "Delta"
+        assert body["rows"][1]["Company Name"] == "Eps"
+    finally:
+        _uninstall_stub(original)
+
+
+def test_18_preview_404_for_unknown_job():
+    from fastapi.testclient import TestClient
+    from server import app
+    client = TestClient(app)
+    r = client.get("/enrichment/preview/not-a-real-job-id")
+    assert r.status_code == 404
+
+
+def test_19_preview_respects_offset_limit_bounds():
+    """offset past end → empty rows; limit clamped server-side via
+    pydantic Query bounds (>200 should 422)."""
+    from fastapi.testclient import TestClient
+    from server import app
+
+    job_manager._reset_for_tests()
+    original = _install_stub()
+    try:
+        csv = "Company Name\nAcme\nBeta\n"
+        client = TestClient(app)
+        post = client.post("/enrichment/run", json={"csv_content": csv, "filename": "x.csv"})
+        job_id = post.json()["job_id"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if client.get(f"/enrichment/status/{job_id}").json()["status"] == "completed":
+                break
+            time.sleep(0.2)
+
+        # offset past end → empty rows but valid 200.
+        r = client.get(f"/enrichment/preview/{job_id}?offset=999&limit=50")
+        assert r.status_code == 200
+        assert r.json()["rows"] == []
+        assert r.json()["total"] == 2
+
+        # limit > 200 → 422 (FastAPI Query validation).
+        r = client.get(f"/enrichment/preview/{job_id}?limit=999")
+        assert r.status_code == 422
+    finally:
+        _uninstall_stub(original)
+
+
 # ---------- Standalone runner --------------------------------------------
 
 if __name__ == "__main__":

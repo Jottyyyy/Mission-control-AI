@@ -108,6 +108,10 @@ def create_job(total: int) -> str:
         "summary": None,
         "credits_used": {},
         "error": None,
+        # v1.30.2 — populated only on complete_job.
+        "field_fill_counts": None,
+        "sample_rows": None,
+        "download_token": None,
         # Internal — not exposed via get_job.
         "_durations": deque(maxlen=ETA_WINDOW_ROWS),
         "_last_row_started_at": now,
@@ -202,6 +206,9 @@ def complete_job(
     summary: dict,
     download_filename: Optional[str] = None,
     credits_used: Optional[dict] = None,
+    field_fill_counts: Optional[dict] = None,
+    sample_rows: Optional[list] = None,
+    download_token: Optional[str] = None,
 ) -> None:
     with _lock:
         job = _jobs.get(job_id)
@@ -214,6 +221,15 @@ def complete_job(
         job["summary"] = summary
         if credits_used is not None:
             job["credits_used"] = credits_used
+        if field_fill_counts is not None:
+            job["field_fill_counts"] = dict(field_fill_counts)
+        if sample_rows is not None:
+            job["sample_rows"] = list(sample_rows)
+        if download_token is not None:
+            # Stashed so GET /enrichment/preview/{job_id} can resolve to
+            # the underlying CSV without the caller passing the token
+            # separately. Sheets jobs leave this None — preview is CSV-only.
+            job["download_token"] = download_token
         # Force progress to total so the UI shows 100% even if the
         # final row's row_done was racy with the complete call.
         job["progress"] = job["total"]
@@ -259,7 +275,7 @@ def _public_view_locked(job: dict) -> dict:
     else:
         eta = 0.0
 
-    return {
+    view = {
         "job_id": job["job_id"],
         "status": job["status"],
         "total": job["total"],
@@ -278,6 +294,18 @@ def _public_view_locked(job: dict) -> dict:
         "elapsed_seconds": _format_eta(elapsed),
         "eta_seconds": _format_eta(eta),
     }
+    # v1.30.2 — preview fields only on completed jobs. Hiding them on
+    # processing/failed jobs keeps the success-card render code simple
+    # ("if state.field_fill_counts:" → render) and avoids tempting the UI
+    # to show empty preview affordances mid-run.
+    if job["status"] == "completed":
+        if job.get("field_fill_counts") is not None:
+            view["field_fill_counts"] = dict(job["field_fill_counts"])
+        if job.get("sample_rows") is not None:
+            view["sample_rows"] = list(job["sample_rows"])
+        if job.get("download_token") is not None:
+            view["download_token"] = job["download_token"]
+    return view
 
 
 def _prune_locked() -> None:
