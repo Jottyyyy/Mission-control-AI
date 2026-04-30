@@ -1,7 +1,13 @@
 node_modules/
 dist/
 dist-electron/
-MissionControl-AdamBuild/
+# MissionControl-AdamBuild/ is the hand-built deploy folder. We track the
+# hand-written source files (install command, README, BUILD_INFO) but
+# ignore the regenerated binaries (.zip, .tgz) and the script that's
+# auto-copied from scripts/ at build time.
+MissionControl-AdamBuild/MissionControl.app.zip
+MissionControl-AdamBuild/workspace-template.tgz
+MissionControl-AdamBuild/verify_bundle_fresh.sh
 .DS_Store
 .env
 

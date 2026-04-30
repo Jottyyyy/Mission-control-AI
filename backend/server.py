@@ -653,6 +653,24 @@ _CRED_PATTERNS = [
     re.compile(r"(?im)^\s*(?:bearer|authorization|api[_-]?key|token|secret)\s*[:=]\s*\S{12,}\s*$"),
 ]
 
+# v1.30.4 — UUID-shape (8-4-4-4-12 hex). Companies House issues keys in this
+# format — they slipped past the 40-char opaque-blob filter because each
+# segment is shorter. Only mask UUIDs adjacent to credential-context keywords
+# to avoid blanket-redacting legitimate IDs (job_id, conversation_id,
+# Google event IDs etc. are themselves UUIDs).
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+_CRED_CONTEXT_RE = re.compile(
+    # Leading \b only — trailing word-boundary trips on compound names
+    # like "companies_house_key". Risk is over-masking near words like
+    # "author" / "monkey", but UUIDs near those are rare and the failure
+    # mode (mask too much) is the safer one for a credential leak.
+    r"(?i)\b(api[_-]?key|key|token|secret|password|credential|"
+    r"companies[ _-]?house|anthropic|ghl|hubspot|cognism|lusha|pomanda|"
+    r"bearer|auth|stored)"
+)
+
 # Catch-all for "very long opaque alphanumeric blobs" that look like secrets.
 # Run with a callback so we can exempt known-shape resource IDs that Adam
 # legitimately needs to paste back into chat (e.g. Google Calendar recurring
@@ -685,7 +703,95 @@ def _scrub_credentials(text: str) -> str:
         lambda m: m.group(0) if _is_safe_resource_id(m.group(0)) else "[redacted]",
         out,
     )
+    # UUID-shape only when adjacent to credential-context keywords. Window
+    # of ±60 chars is enough to catch "Companies House key: <uuid>" and
+    # "Yes — Key: <uuid>" without bleeding into unrelated paragraphs.
+    out = _scrub_uuid_in_credential_context(out)
     return out
+
+
+def _scrub_uuid_in_credential_context(text: str) -> str:
+    if not text:
+        return text
+    pieces: list[str] = []
+    last = 0
+    for m in _UUID_RE.finditer(text):
+        start, end = m.span()
+        window_start = max(0, start - 60)
+        window_end = min(len(text), end + 60)
+        window = text[window_start:start] + text[end:window_end]
+        if _CRED_CONTEXT_RE.search(window):
+            pieces.append(text[last:start])
+            pieces.append("[redacted]")
+            last = end
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+# v1.30.4 — outbound scrubber. Inbound only catches user-pasted keys; this
+# catches the agent echoing a stored value back. We keep a 60-second cache
+# of every Keychain value so we can string-replace any verbatim leak with
+# "•••• stored ✅". Bullet-proof for stored credentials (we only mask
+# values we KNOW are credentials → zero false positives on lookalike data).
+
+_OUTBOUND_CRED_TTL_SECONDS = 60
+_outbound_cred_cache: dict = {"values": [], "fetched_at": 0.0}
+
+
+def _stored_credential_values() -> list[str]:
+    """Return every non-empty credential value currently in the Keychain
+    across all integrations. Cached for 60s so a chatty session doesn't
+    hammer the macOS keychain helper."""
+    now = time.time()
+    if now - _outbound_cred_cache["fetched_at"] < _OUTBOUND_CRED_TTL_SECONDS:
+        return _outbound_cred_cache["values"]
+
+    values: list[str] = []
+    seen: set[str] = set()
+    for tool_id, spec in _INTEGRATIONS.items():
+        for field in spec.get("all_fields", []):
+            v = _kc_get(tool_id, field)
+            if not v or len(v) < 8:
+                # Skip blanks and short values — masking <8 chars would
+                # accidentally catch ordinary words.
+                continue
+            if v in seen:
+                continue
+            seen.add(v)
+            values.append(v)
+    # Anthropic key lives outside _INTEGRATIONS at "anthropic":"api_key".
+    for tool_id, field in (("anthropic", "api_key"),):
+        v = _kc_get(tool_id, field)
+        if v and len(v) >= 8 and v not in seen:
+            seen.add(v)
+            values.append(v)
+    _outbound_cred_cache["values"] = values
+    _outbound_cred_cache["fetched_at"] = now
+    return values
+
+
+def _scrub_outbound(text: str) -> str:
+    """Mask any verbatim Keychain credential value before showing the
+    text to the user (or persisting it). Then run the same pattern-based
+    scrubber as inbound — defence in depth.
+
+    Replacement is "•••• stored ✅" so the agent can still confirm the
+    integration is configured without disclosing the value."""
+    if not text:
+        return text
+    out = text
+    for cred_value in _stored_credential_values():
+        if cred_value in out:
+            out = out.replace(cred_value, "•••• stored ✅")
+    out = _scrub_credentials(out)
+    return out
+
+
+def _invalidate_outbound_cred_cache() -> None:
+    """Force the next _scrub_outbound call to refresh from Keychain.
+    Called after credentials change so a freshly-rotated key is masked
+    immediately."""
+    _outbound_cred_cache["fetched_at"] = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1149,12 @@ def chat(req: ChatRequest):
             )
             needs_setup = needs_setup or c_needs_setup
             needs_api_enable = needs_api_enable or c_needs_api
+
+        # v1.30.4 — outbound scrub: mask any Keychain credential value the
+        # agent may have echoed back ("Yes — Key: <uuid>") before it ever
+        # reaches the user OR the persisted message log. Defence in depth
+        # for the inbound scrubber.
+        reply = _scrub_outbound(reply)
 
         cur.execute(
             "INSERT INTO messages (conversation_id, role, content, model_used) VALUES (?, ?, ?, ?)",
@@ -1897,6 +2009,9 @@ def integration_save(tool_id: str, payload: CredentialsPayload):
         saved_fields.append(field)
     if not saved_fields:
         raise HTTPException(status_code=400, detail="No credential fields supplied.")
+    # v1.30.4 — refresh the outbound-scrubber cache so a freshly-rotated
+    # value is masked on the very next /chat round, not 60 s later.
+    _invalidate_outbound_cred_cache()
     # Never log values. Only field names.
     return {"saved": True, "tool_id": tool_id, "fields_saved": saved_fields}
 
@@ -1906,6 +2021,7 @@ def integration_delete(tool_id: str):
     spec = _require_tool(tool_id)
     for f in spec["all_fields"]:
         _kc_delete(tool_id, f)
+    _invalidate_outbound_cred_cache()
     return {"deleted": True, "tool_id": tool_id}
 
 
@@ -3519,6 +3635,47 @@ def _read_enrichment_run(args: dict) -> tuple[str, Optional[dict], Optional[dict
     )
 
 
+def _read_integration_status(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
+    """v1.30.4 — let the agent verify whether an integration is configured
+    instead of fabricating "yes, already connected".
+
+    Args: {"integration": "<id>"} where id is one of the keys in
+    `_INTEGRATIONS` (e.g. "companies_house", "ghl", "google-workspace").
+    Returns a one-line status the agent can quote verbatim. Never echoes
+    credential values — the outbound scrubber would catch them anyway,
+    but this handler doesn't even fetch them."""
+    tool_id = (args.get("integration") or args.get("tool_id") or args.get("id") or "").strip()
+    if not tool_id:
+        return (
+            "> _Need an `integration` id (e.g. `companies_house`, `ghl`, `google-workspace`)._",
+            None, None,
+        )
+    spec = _INTEGRATIONS.get(tool_id)
+    if not spec:
+        valid = ", ".join(sorted(_INTEGRATIONS.keys()))
+        return (
+            f"> _Unknown integration `{tool_id}`. Valid: {valid}._",
+            None, None,
+        )
+    stored = [f for f in spec["all_fields"] if _kc_get(tool_id, f)]
+    connected = all(f in stored for f in spec["required_fields"])
+    label = spec["label"]
+    if connected:
+        # Mention WHICH fields are stored so the agent can be specific
+        # ("Companies House: connected — api_key stored ✅") without
+        # needing to invent details.
+        fields_str = ", ".join(stored)
+        return (
+            f"> **{label}**: connected — fields stored: {fields_str}.",
+            None, None,
+        )
+    missing = [f for f in spec["required_fields"] if f not in stored]
+    return (
+        f"> **{label}**: NOT connected — missing required field(s): {', '.join(missing)}.",
+        None, None,
+    )
+
+
 _READ_ACTION_HANDLERS = {
     "ghl.search_contacts": _read_ghl_search_contacts,
     "ghl.list_opportunities": _read_ghl_list_opportunities,
@@ -3534,6 +3691,7 @@ _READ_ACTION_HANDLERS = {
     "companies_house.lookup":       _read_companies_house_lookup,
     "companies_house.batch_lookup": _read_companies_house_batch_lookup,
     "enrichment.run":               _read_enrichment_run,
+    "integration.status":           _read_integration_status,
 }
 
 

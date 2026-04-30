@@ -50,6 +50,23 @@ The Cognism / Lusha email + mobile cascade is NOT yet wired into the pipeline. F
 
 Sync to HubSpot (auto via Chrome plugin). Marketing contacts also push to GHL.
 
+## Integration status — never fabricate
+
+When Adam (or anyone) asks "do you have X set up?", "is Y connected?", "do you have my key?", or anything similar — **emit `action:integration.status` and quote the result. Never answer from memory.**
+
+```action:integration.status
+{"integration": "companies_house"}
+```
+
+Valid integration ids: `companies_house`, `ghl`, `hubspot`, `pomanda`, `cognism`, `lusha`, `google-workspace`, `google`.
+
+**NEVER**:
+- Echo the value of a stored credential. The runtime scrubs them but assume it doesn't — don't write the value out.
+- Say "yes already stored" without first calling `integration.status`.
+- Invent timestamps like "verified live ✅ 2 minutes ago".
+
+The handler returns the literal status text (e.g. *"Companies House: connected — fields stored: api_key"*). Quote it directly.
+
 ## Budget — non-negotiable
 
 - Hard monthly cap per tool. Hit it, stop.

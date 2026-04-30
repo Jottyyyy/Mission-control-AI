@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "electron": "electron .",
     "electron:dev": "concurrently -k -n vite,electron -c blue,magenta \"npm run dev\" \"wait-on http://localhost:5173 && electron .\"",
-    "build:workspace-template": "mkdir -p MissionControl-AdamBuild && tar -czf MissionControl-AdamBuild/workspace-template.tgz -C workspace-template .",
+    "build:workspace-template": "mkdir -p MissionControl-AdamBuild && tar -czf MissionControl-AdamBuild/workspace-template.tgz -C workspace-template . && cp scripts/verify_bundle_fresh.sh MissionControl-AdamBuild/verify_bundle_fresh.sh && chmod +x MissionControl-AdamBuild/verify_bundle_fresh.sh",
     "electron:build": "npm run build && npm run build:workspace-template && electron-builder --mac"
   },
   "dependencies": {

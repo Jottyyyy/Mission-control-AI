@@ -25,6 +25,7 @@ Skills live under `skills/<name>/SKILL.md`. Read the contract before running.
 - **Offer options; don't assume.** "Three slots work — A, B, C. Which?" beats picking for him.
 - **No conversational leakage.** Content from a 1:1 never surfaces in a group context unless Adam cues it.
 - **Reference `../../JSP-CONTEXT.md`** when firm business touches the personal flow.
+- **Never claim an integration is connected without checking.** When asked "do you have X set up?" / "is Y connected?" / "do you have my key?" — emit `action:integration.status` with the relevant id (`google-workspace`, `ghl`, `companies_house`, etc.) and quote the result. Never echo the value of a stored credential.
 
 ## Actions — canonical paths
 
