@@ -4,15 +4,20 @@ from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Literal
+import asyncio
 import sqlite3
 import subprocess
 import json
 import os
 import re
+import shutil
+import time
 import uuid
 import base64
 import csv
 import io
+
+from chat_formatter import format_for_whatsapp
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -23,7 +28,7 @@ import keyring  # noqa: E402
 import keyring.errors  # noqa: E402
 
 # MAN workflow clients (read Keychain via the same service/username convention).
-from integrations import pomanda, cognism, lusha, ghl  # noqa: E402
+from integrations import pomanda, cognism, lusha, ghl, companies_house  # noqa: E402
 from integrations import (  # noqa: E402
     google_oauth,
     google_calendar,
@@ -33,6 +38,9 @@ from integrations import (  # noqa: E402
     google_docs,
 )
 from workflows import man_workflow  # noqa: E402
+from enrichment import ENRICHERS, EnrichmentPipeline  # noqa: E402
+from enrichment import io as enrichment_io  # noqa: E402
+from enrichment import job_manager as enrichment_jobs  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -156,6 +164,15 @@ _existing = _cur.execute(
 if _existing:
     _cols = [r["name"] for r in _cur.execute("PRAGMA table_info(conversations)").fetchall()]
     if "uuid" not in _cols:
+        # v1.14 → v1.27 schema migration: the old `conversations` table stored
+        # one row per message; the new schema splits into `conversations` +
+        # `messages`. We rename rather than migrate row-by-row, so old data
+        # survives in `conversations_legacy` but is invisible to the new UI.
+        # Keep a file-level snapshot so the data is recoverable from outside
+        # SQLite if Adam ever needs it.
+        _backup_path = DB_PATH.with_suffix(f".v14backup-{int(time.time())}.db")
+        shutil.copy2(DB_PATH, _backup_path)
+        print(f"[db-migration] pre-rename backup: {_backup_path}", flush=True)
         _cur.execute("ALTER TABLE conversations RENAME TO conversations_legacy")
         _conn.commit()
 _conn.executescript("""
@@ -216,6 +233,23 @@ CREATE INDEX IF NOT EXISTS idx_pending_actions_status
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp
   ON audit_log(timestamp DESC);
 """)
+
+# v1.28 Step 4 — origin metadata on pending_actions so we know which surface
+# (desktop / whatsapp / etc.) raised an action card. Used to route the
+# "✓ Done" echo back to the right channel after Adam approves on his Mac.
+# SQLite doesn't have ADD COLUMN IF NOT EXISTS, so we check PRAGMA first;
+# safe to run on every boot.
+_pending_cols = {
+    r["name"] for r in _conn.execute("PRAGMA table_info(pending_actions)").fetchall()
+}
+for _col, _decl in (
+    ("origin_channel", "TEXT NOT NULL DEFAULT 'desktop'"),
+    ("origin_jid", "TEXT"),
+    ("origin_message_id", "TEXT"),
+):
+    if _col not in _pending_cols:
+        _conn.execute(f"ALTER TABLE pending_actions ADD COLUMN {_col} {_decl}")
+_conn.commit()
 _conn.close()
 
 
@@ -402,6 +436,11 @@ class ChatRequest(BaseModel):
     message: str
     mode: Optional[Literal["personal", "marketing", "setup"]] = None
     conversation_id: Optional[str] = None  # conversation uuid
+    # v1.28 Step 4 — surface the message originated from. "desktop" (default)
+    # is the existing Mission Control web chat; "whatsapp" arrives via the
+    # whatsapp-bridge plugin's before_dispatch hook. Used by the egress
+    # formatter to reshape replies for mobile.
+    channel: Literal["desktop", "whatsapp"] = "desktop"
 
 
 class SavePayload(BaseModel):
@@ -469,6 +508,28 @@ class ManSpreadsheetPayload(BaseModel):
     # and posts the resulting string here.
     filename: Optional[str] = None
     csv_content: str
+
+
+class CompaniesHouseLookupPayload(BaseModel):
+    company: str
+
+
+class CompaniesHouseBatchPayload(BaseModel):
+    companies: Optional[list[str]] = None
+    csv_content: Optional[str] = None
+    filename: Optional[str] = None
+
+
+class EnrichmentRunPayload(BaseModel):
+    """v1.30 — pluggable enrichment pipeline.
+
+    Either `csv_content` (raw CSV string from a client-side FileReader)
+    OR `sheets_url` (https://docs.google.com/spreadsheets/d/...). One
+    is required; if both are sent we prefer csv_content because it
+    needs no Google OAuth round-trip."""
+    csv_content: Optional[str] = None
+    sheets_url: Optional[str] = None
+    filename: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1017,6 +1078,305 @@ def chat(req: ChatRequest):
 
 
 # ---------------------------------------------------------------------------
+# WhatsApp ingress (v1.28 Step 4)
+#
+# The whatsapp-bridge OpenClaw plugin POSTs every inbound WhatsApp message
+# here via its before_dispatch hook (which also returns {handled: true} so
+# OpenClaw's standalone "main" agent stays silent — Mission Control's Jackson
+# is the canonical responder). We accept the payload, validate the sender,
+# fire the existing /chat pipeline in a background task so the hook returns
+# fast, then ship Jackson's reply back via `openclaw message send`.
+# ---------------------------------------------------------------------------
+
+_WA_NAMESPACE = uuid.UUID("4b2a3a7f-8c41-4f5b-9c5d-cafefeed0001")
+_ACTION_CARD_TOKEN_RE = re.compile(r"\[\[action-card:([0-9a-fA-F\-]+)\]\]")
+WHATSAPP_BG_TIMEOUT_S = 90
+WHATSAPP_SEND_TIMEOUT_S = 30
+
+
+def _extract_e164(jid_or_phone: Optional[str]) -> Optional[str]:
+    """Coerce a senderId / JID / raw phone into canonical E.164.
+
+    Accepts: "+639193640226", "+639193640226@s.whatsapp.net",
+    "639193640226@c.us", "639193640226". Returns "+639193640226"
+    or None if the input is not a recognisable phone number."""
+    if not jid_or_phone:
+        return None
+    raw = str(jid_or_phone).split("@", 1)[0].strip()
+    digits = raw[1:] if raw.startswith("+") else raw
+    if not digits.isdigit() or len(digits) < 7:
+        return None
+    return "+" + digits
+
+
+def _get_wa_allowlist() -> set[str]:
+    """Read channels.whatsapp.allowFrom from openclaw.json. Read on every
+    request so live-edits to the config take effect without a backend
+    restart. The file is small (~2 KB) and WA traffic is human-paced."""
+    try:
+        with open(OPENCLAW_CONFIG_PATH, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    raw = (cfg.get("channels") or {}).get("whatsapp", {}).get("allowFrom") or []
+    out: set[str] = set()
+    for entry in raw:
+        e164 = _extract_e164(entry)
+        if e164:
+            out.add(e164)
+    return out
+
+
+def _wa_conversation_uuid_for(e164: str) -> str:
+    """Stable per-peer conversation UUID — same E.164 always maps to the
+    same MC conversation row, so the chat history and OpenClaw session
+    survive across restarts."""
+    return str(uuid.uuid5(_WA_NAMESPACE, e164))
+
+
+def _ensure_wa_conversation(conv_uuid: str, e164: str) -> None:
+    """Insert a conversations row for this WA peer if we haven't yet.
+    Idempotent — second call is a no-op."""
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE uuid = ?", (conv_uuid,)
+        ).fetchone()
+        if row:
+            return
+        conn.execute(
+            "INSERT INTO conversations (uuid, mode, title) VALUES (?, ?, ?)",
+            (conv_uuid, "personal", f"WhatsApp ({e164})"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _summarize_pending_action(action_type: str, data: dict) -> str:
+    """One-line human-readable summary of a pending action, for the
+    'Card waiting on your Mac to confirm — <summary>' line we send to
+    Adam over WhatsApp. Falls back to a humanised action-type slug."""
+    if not isinstance(data, dict):
+        data = {}
+    if action_type == "google.calendar_create_event":
+        title = data.get("summary") or data.get("title") or "event"
+        start = data.get("start") or data.get("start_time") or data.get("when") or "soon"
+        return f"Create event '{title}' at {start}"
+    if action_type == "google.calendar_delete_event":
+        ev = data.get("event_id", "?")
+        return f"Delete calendar event {str(ev)[:8]}"
+    if action_type == "google.gmail_send":
+        to = data.get("to") or "?"
+        subj = data.get("subject") or "(no subject)"
+        return f"Send email to {to} — '{subj}'"
+    if action_type == "google.docs_create":
+        return f"Create Google Doc '{data.get('title') or 'untitled'}'"
+    if action_type == "google.docs_update":
+        return "Update Google Doc"
+    if action_type == "google.drive_create_file":
+        return f"Create Drive file '{data.get('name') or 'untitled'}'"
+    if action_type == "google.sheets_create":
+        return f"Create Google Sheet '{data.get('title') or 'untitled'}'"
+    if action_type == "google.sheets_append":
+        return "Append row to Google Sheet"
+    if action_type.startswith("ghl."):
+        return f"GHL action: {action_type[4:].replace('_', ' ')}"
+    return action_type.replace(".", " › ").replace("_", " ")
+
+
+def _resolve_action_summaries(reply_text: str) -> dict[str, str]:
+    """Look up every [[action-card:UUID]] in the reply and build a map
+    UUID → human summary, by reading pending_actions.action_data_json."""
+    tokens = _ACTION_CARD_TOKEN_RE.findall(reply_text or "")
+    if not tokens:
+        return {}
+    placeholders = ",".join("?" for _ in tokens)
+    conn = _db()
+    try:
+        rows = conn.execute(
+            f"SELECT id, action_type, action_data_json FROM pending_actions WHERE id IN ({placeholders})",
+            tokens,
+        ).fetchall()
+    finally:
+        conn.close()
+    out: dict[str, str] = {}
+    for r in rows:
+        try:
+            data = json.loads(r["action_data_json"])
+        except (TypeError, ValueError):
+            data = {}
+        out[r["id"]] = _summarize_pending_action(r["action_type"], data)
+    return out
+
+
+def _stamp_origin_for_pending(conv_uuid: str, channel: str, jid: Optional[str], message_id: Optional[str]) -> None:
+    """Tag pending_actions rows created in this turn with the originating
+    channel + JID + WhatsApp message_id, so when Adam later approves the
+    card on his Mac we can echo the result back to the right WA chat
+    threaded against his original message. (Echo flow is Step 4.5 / v1.29;
+    we just persist the metadata for now.)"""
+    conn = _db()
+    try:
+        conn.execute(
+            """
+            UPDATE pending_actions
+               SET origin_channel = ?, origin_jid = ?, origin_message_id = ?
+             WHERE conversation_id = ?
+               AND status = 'pending'
+               AND origin_channel = 'desktop'
+               AND created_at >= datetime('now', '-30 seconds')
+            """,
+            (channel, jid, message_id, conv_uuid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _whatsapp_send(target_e164: str, message_text: str, reply_to: Optional[str] = None) -> bool:
+    """Shell out to `openclaw message send` for a WhatsApp egress message.
+    Returns True on rc=0, False otherwise. Never raises — callers shouldn't
+    cascade-fail when the bridge sneezes."""
+    if not message_text or not target_e164:
+        return False
+    cmd = [
+        OPENCLAW_BIN, "message", "send",
+        "--channel", "whatsapp",
+        "--target", target_e164,
+        "--message", message_text,
+    ]
+    if reply_to:
+        cmd.extend(["--reply-to", reply_to])
+    cmd.append("--json")
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=WHATSAPP_SEND_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[whatsapp-egress] timeout sending to {target_e164}", flush=True)
+        return False
+    except FileNotFoundError:
+        print(f"[whatsapp-egress] openclaw binary not at {OPENCLAW_BIN}", flush=True)
+        return False
+    if proc.returncode != 0:
+        # stderr may contain credentials in misconfigured setups, so log
+        # only the first line.
+        first_err = (proc.stderr or "").splitlines()[0] if proc.stderr else "(no stderr)"
+        print(f"[whatsapp-egress] send failed rc={proc.returncode}: {first_err}", flush=True)
+        return False
+    return True
+
+
+async def _process_whatsapp_in_background(
+    *,
+    body: str,
+    target_e164: str,
+    target_jid: str,
+    message_id: Optional[str],
+    conv_uuid: str,
+) -> None:
+    """Fire-and-forget worker that runs Jackson, formats the reply, and
+    delivers it via `openclaw message send`. Wraps the existing sync
+    /chat handler in asyncio.to_thread so the hook handler can return
+    HTTP 200 in milliseconds."""
+    try:
+        req = ChatRequest(
+            message=body,
+            mode="personal",
+            conversation_id=conv_uuid,
+            channel="whatsapp",
+        )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(chat, req), timeout=WHATSAPP_BG_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            print(f"[whatsapp-bg] /chat timed out for {target_e164}; sending placeholder", flush=True)
+            _whatsapp_send(
+                target_e164,
+                "Still working on that — give me a minute.",
+                reply_to=message_id,
+            )
+            return
+
+        reply_raw = (result or {}).get("reply") or ""
+        if not reply_raw.strip():
+            return
+
+        summaries = _resolve_action_summaries(reply_raw)
+        formatted = format_for_whatsapp(reply_raw, action_summaries=summaries)
+        if not formatted:
+            return
+
+        # Persist origin metadata before we send — even if egress fails,
+        # the card on Adam's Mac knows where it came from.
+        if _ACTION_CARD_TOKEN_RE.search(reply_raw):
+            try:
+                _stamp_origin_for_pending(conv_uuid, "whatsapp", target_jid, message_id)
+            except Exception as e:  # noqa: BLE001
+                print(f"[whatsapp-bg] origin stamp failed: {e}", flush=True)
+
+        _whatsapp_send(target_e164, formatted, reply_to=message_id)
+
+    except Exception as e:  # noqa: BLE001
+        # Never let background processing crash silently with no user
+        # feedback. Send a short error and log the exception for debug.
+        print(f"[whatsapp-bg] processing error: {type(e).__name__}: {e}", flush=True)
+        _whatsapp_send(
+            target_e164,
+            "I hit an error processing that — try again?",
+            reply_to=message_id,
+        )
+
+
+@app.post("/whatsapp/event")
+async def whatsapp_event(payload: dict) -> dict:
+    """Inbound WhatsApp message hook from the whatsapp-bridge OpenClaw
+    plugin (`before_dispatch`). Validates the sender, kicks off Jackson
+    processing in a background task, returns 200 immediately so the hook
+    doesn't time out the dispatch loop."""
+    sender_raw = payload.get("senderId") or payload.get("from")
+    e164 = _extract_e164(sender_raw)
+    body = (payload.get("body") or payload.get("bodyForAgent") or payload.get("content") or "").strip()
+    message_id = payload.get("messageId")
+
+    # Group messages aren't part of the v1.28 scope (selfChatMode + DM
+    # allowlist only). Drop silently rather than confuse the user.
+    if payload.get("isGroup"):
+        return {"status": "ignored", "reason": "group"}
+
+    if not e164:
+        return {"status": "ignored", "reason": "no_sender"}
+    if not body:
+        return {"status": "ignored", "reason": "empty_body"}
+
+    allowlist = _get_wa_allowlist()
+    if allowlist and e164 not in allowlist:
+        # Don't even acknowledge — minimises probe surface for non-allowed
+        # numbers. The 👀 reaction has already fired at the channel layer.
+        return {"status": "ignored", "reason": "not_allowed"}
+
+    conv_uuid = _wa_conversation_uuid_for(e164)
+    try:
+        _ensure_wa_conversation(conv_uuid, e164)
+    except Exception as e:  # noqa: BLE001
+        print(f"[whatsapp-event] ensure_conversation failed: {e}", flush=True)
+        # Still continue — chat() will create one if needed.
+
+    asyncio.create_task(
+        _process_whatsapp_in_background(
+            body=body,
+            target_e164=e164,
+            target_jid=str(sender_raw),
+            message_id=message_id,
+            conv_uuid=conv_uuid,
+        )
+    )
+    return {"status": "accepted", "conversation_id": conv_uuid}
+
+
+# ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
 
@@ -1437,6 +1797,12 @@ _INTEGRATIONS: dict[str, dict] = {
         "all_fields": ["api_key"],
         "oauth": False,
     },
+    "companies_house": {
+        "label": "Companies House",
+        "required_fields": ["api_key"],
+        "all_fields": ["api_key"],
+        "oauth": False,
+    },
     "google": {
         "label": "Google Workspace (v2)",
         "required_fields": ["client_id", "client_secret"],
@@ -1758,6 +2124,32 @@ def _test_lusha() -> dict:
     return {"success": False, "error": body.get("message") or body.get("error") or f"HTTP {status}"}
 
 
+def _test_companies_house() -> dict:
+    """Lightweight read-only probe.
+
+    Companies House uses HTTP Basic with the API key as the username and an
+    empty password. /search/companies?q=apple&items_per_page=1 is a cheap
+    call against the public register and does not consume any rate budget
+    beyond a single 600/5min bucket hit."""
+    api_key = _kc_get("companies_house", "api_key")
+    if not api_key:
+        return {"success": False, "error": "No Companies House API key stored."}
+    import base64
+    token = base64.b64encode(f"{api_key}:".encode("utf-8")).decode("ascii")
+    status, body = _http_json(
+        "GET",
+        "https://api.company-information.service.gov.uk/search/companies?q=apple&items_per_page=1",
+        headers={"Authorization": f"Basic {token}", "Accept": "application/json"},
+    )
+    if status == 200:
+        return {"success": True}
+    if status in (401, 403):
+        return {"success": False, "error": f"Companies House rejected the key ({status}). Check the key and that it's a Live (not Test) key."}
+    if status == 0:
+        return {"success": False, "error": "Couldn't reach Companies House."}
+    return {"success": False, "error": body.get("error") or f"HTTP {status}"}
+
+
 _TESTERS = {
     "hubspot": _test_hubspot,
     "ghl": _test_ghl,
@@ -1765,6 +2157,7 @@ _TESTERS = {
     "pomanda": _test_pomanda,
     "cognism": _test_cognism,
     "lusha": _test_lusha,
+    "companies_house": _test_companies_house,
 }
 
 
@@ -2928,6 +3321,204 @@ def _read_google_docs_get(args: dict) -> tuple[str, Optional[dict], Optional[dic
     return _google_fence("google-docs-content", payload), None, None
 
 
+def _format_ch_company(res: dict) -> str:
+    """One company → a markdown card. Used by both single + batch handlers."""
+    if res.get("error"):
+        ident = res.get("company_name") or res.get("company_number") or "(unknown)"
+        return f"- **{ident}** — _{res['error']}_"
+
+    nm = res.get("company_name") or "(no name)"
+    num = res.get("company_number") or ""
+    status = res.get("status") or ""
+    incorp = res.get("incorporation_date") or ""
+    sic = ", ".join(res.get("sic_codes") or [])
+
+    head = f"### {nm}  `{num}`"
+    meta_bits = [f"Status: {status}"] if status else []
+    if incorp:
+        meta_bits.append(f"Incorporated: {incorp}")
+    if sic:
+        meta_bits.append(f"SIC: {sic}")
+    meta = " · ".join(meta_bits)
+
+    holders = res.get("shareholders") or []
+    if holders:
+        holder_lines = ["**Largest shareholders** (Persons with Significant Control):"]
+        for h in holders:
+            kind_tag = {"individual": "person", "company": "company"}.get(h.get("type"), h.get("type") or "")
+            line = f"- {h.get('name') or '(unnamed)'} — _{h.get('percentage') or 'unknown'}_ ({kind_tag})"
+            if h.get("nationality"):
+                line += f" · {h['nationality']}"
+            holder_lines.append(line)
+        holder_block = "\n".join(holder_lines)
+    else:
+        holder_block = "_No PSCs on file (the company hasn't filed any persons-with-significant-control)._"
+
+    officers = res.get("officers") or []
+    if officers:
+        # Cap at 8 officers inline — anything more is just CSV bloat.
+        ofc_lines = ["**Officers:**"]
+        for o in officers[:8]:
+            ofc_lines.append(f"- {o.get('name')} — {o.get('role')}")
+        if len(officers) > 8:
+            ofc_lines.append(f"- _…and {len(officers) - 8} more_")
+        ofc_block = "\n".join(ofc_lines)
+    else:
+        ofc_block = "_No active officers on file._"
+
+    parts = [head]
+    if meta:
+        parts.append(meta)
+    parts.append(holder_block)
+    parts.append(ofc_block)
+    return "\n\n".join(parts)
+
+
+def _read_companies_house_lookup(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
+    """Single-company lookup. Args: {"company": "<name or number>"}."""
+    target = (args.get("company") or args.get("query") or args.get("name") or "").strip()
+    if not target:
+        return "> _Need a `company` (name or Companies House number) to look up._", None, None
+    res = companies_house.query_companies_house(target)
+    if res.get("needs_setup"):
+        return (
+            "> _Companies House isn't connected yet — I'll show you how to set it up._",
+            res["needs_setup"],
+            None,
+        )
+    if res.get("error"):
+        return f"> _Companies House lookup failed for `{target}`: {res['error']}_", None, None
+    return _format_ch_company(res), None, None
+
+
+def _read_companies_house_batch_lookup(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
+    """Batch lookup. Args: {"companies": ["Apple UK Ltd", "12345678", ...]}.
+
+    Each lookup is 3 HTTP calls (profile + officers + PSCs). Sequentially
+    this would blow the frontend's 60s chat timeout for 15+ companies, so
+    we fan out across a thread pool. Companies House permits 600 reqs /
+    5 min = 2/sec sustained; 10 parallel workers stays well inside that
+    budget for any reasonable batch size while completing in ~3–5s.
+
+    Capped at 25 entries per call so a runaway list doesn't burn through
+    the 5-min rate budget in a single chat turn."""
+    raw_list = args.get("companies") or args.get("queries") or args.get("names") or []
+    if isinstance(raw_list, str):
+        # Allow a comma- or newline-separated string for convenience.
+        raw_list = [x.strip() for x in re.split(r"[\n,]+", raw_list) if x.strip()]
+    if not isinstance(raw_list, list) or not raw_list:
+        return "> _Need a `companies` list (names or Companies House numbers).", None, None
+
+    cleaned = [str(x).strip() for x in raw_list if str(x).strip()]
+    truncated = len(cleaned) > 25
+    cleaned = cleaned[:25]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Preserve input order in the output. Pool size of 10 is the sweet spot:
+    # finishes a 25-company batch in ~3s without bursting past the rate cap.
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(companies_house.query_companies_house, cleaned))
+
+    needs_setup_signal: Optional[dict] = None
+    cards: list[str] = []
+    for target, res in zip(cleaned, results):
+        if res.get("needs_setup") and not needs_setup_signal:
+            needs_setup_signal = res["needs_setup"]
+            cards.append(f"- **{target}** — _Companies House not configured_")
+            continue
+        if res.get("error"):
+            cards.append(f"- **{target}** — _{res['error']}_")
+            continue
+        cards.append(_format_ch_company(res))
+
+    header = f"**Companies House lookup** ({len(cards)} of {len(raw_list)} requested):"
+    if truncated:
+        header += " _capped at 25 — re-run with the rest if needed._"
+    body = "\n\n---\n\n".join(cards)
+    return f"{header}\n\n{body}", needs_setup_signal, None
+
+
+def _read_enrichment_run(args: dict) -> tuple[str, Optional[dict], Optional[dict]]:
+    """v1.30 — drive the pluggable enrichment pipeline from chat.
+
+    Args (one of):
+        {"csv_content": "<raw CSV string>", "filename": "leads.csv"}
+        {"sheets_url": "https://docs.google.com/spreadsheets/d/..."}
+        {"file_id": "<id>"}                # not yet wired — see below
+        {"source": "<csv string OR sheets url>"}  # convenience alias
+
+    The frontend's CSV-upload affordance posts the raw text to
+    /enrichment/run directly; this handler exists so a marketing-agent
+    chat reply ("on it — enriching that sheet now") can run the same
+    pipeline with the same output shape.
+    """
+    csv_content = (args.get("csv_content") or "").strip()
+    sheets_url = (args.get("sheets_url") or "").strip()
+    filename = args.get("filename")
+    source = (args.get("source") or "").strip()
+
+    # Heuristic: if a bare `source` came in, decide whether it's a
+    # Sheets URL or raw CSV.
+    if source and not csv_content and not sheets_url:
+        if enrichment_io.parse_sheets_url(source):
+            sheets_url = source
+        elif "," in source or "\n" in source:
+            csv_content = source
+
+    # `file_id` would point at a previously-uploaded file in some
+    # storage layer we don't have today. Surface a friendly error
+    # instead of silently doing nothing.
+    if args.get("file_id") and not csv_content and not sheets_url:
+        return (
+            "> _Enrichment by `file_id` isn't wired in v1.30 — upload via the chat "
+            "input or paste a Google Sheets URL._",
+            None, None,
+        )
+
+    if not csv_content and not sheets_url:
+        return (
+            "> _Need either `csv_content` (raw CSV) or `sheets_url` to enrich._",
+            None, None,
+        )
+
+    payload = EnrichmentRunPayload(
+        csv_content=csv_content or None,
+        sheets_url=sheets_url or None,
+        filename=filename,
+    )
+    # Async dispatch — the heavy work runs in a background task and the
+    # chat reply contains a progress marker. The frontend's chat splitter
+    # turns that marker into <EnrichmentProgressCard>, which polls the
+    # status endpoint every second.
+    try:
+        result = _enrichment_dispatch(payload, mode="async")
+    except HTTPException as exc:
+        return f"> _Enrichment failed: {exc.detail}_", None, None
+    except Exception as exc:  # noqa: BLE001
+        return f"> _Enrichment crashed: {exc}_", None, None
+
+    if result.get("status") == "needs_setup":
+        return (
+            "> _Google Sheets isn't connected yet — I'll show you how to set it up._",
+            result.get("needs_setup"),
+            None,
+        )
+    if result.get("status") == "write_failed":
+        return f"> _Enrichment ran but writing back to the sheet failed: {result.get('error')}_", None, None
+
+    marker = result.get("progress_marker") or ""
+    truncated_note = ""
+    if result.get("truncated"):
+        truncated_note = f"\n\n> _Capped at {enrichment_io.MAX_ROWS} rows — re-run with the rest if needed._"
+    total = result.get("total", 0)
+    return (
+        f"On it — enriching {total} rows now. Progress will update live below.\n\n{marker}{truncated_note}",
+        None,
+        None,
+    )
+
+
 _READ_ACTION_HANDLERS = {
     "ghl.search_contacts": _read_ghl_search_contacts,
     "ghl.list_opportunities": _read_ghl_list_opportunities,
@@ -2940,6 +3531,9 @@ _READ_ACTION_HANDLERS = {
     "google.drive_search":         _read_google_drive_search,
     "google.sheets_read":          _read_google_sheets_read,
     "google.docs_get":             _read_google_docs_get,
+    "companies_house.lookup":       _read_companies_house_lookup,
+    "companies_house.batch_lookup": _read_companies_house_batch_lookup,
+    "enrichment.run":               _read_enrichment_run,
 }
 
 
@@ -4261,6 +4855,485 @@ def man_upload_spreadsheet(payload: ManSpreadsheetPayload):
 
 
 # ---------------------------------------------------------------------------
+# Companies House — single + CSV batch lookups.
+# ---------------------------------------------------------------------------
+# Two surfaces:
+#   POST /companies-house/lookup       single company (name or number)
+#   POST /companies-house/batch-lookup CSV string OR a list of strings
+#
+# Both return raw structured results — formatting for chat happens in the
+# read-action handlers above. The HTTP endpoints exist so the UI can drive a
+# CSV-upload affordance without going through Jackson, and so external
+# scripts can hit the lookup directly.
+
+# Heuristic header detection — accept "company name", "company", "name" for
+# the name column; "company number", "number", "registration" for the number
+# column. Either column alone is enough.
+_CH_NAME_SYNONYMS = ["company name", "company_name", "company", "name"]
+_CH_NUMBER_SYNONYMS = ["company number", "company_number", "number", "registration", "registration number"]
+
+# Public Companies House cap: 600 requests / 5 minutes per key. We do 3
+# requests per company (profile + officers + PSCs) so a 50-company batch is
+# already 150 requests. Cap at 50 to stay well clear of the bucket.
+_CH_BATCH_CAP = 50
+
+
+def _ch_first_present(header: list[str], synonyms: list[str]) -> Optional[str]:
+    lower_to_orig = {h.lower().strip(): h for h in header}
+    for s in synonyms:
+        if s in lower_to_orig:
+            return lower_to_orig[s]
+    return None
+
+
+def _ch_parse_csv(csv_content: str) -> list[str]:
+    """Pull a list of name-or-number identifiers out of a raw CSV string.
+
+    Header detection: "company name" / "name" wins for names, "company number"
+    / "number" / "registration" wins for numbers. If both columns exist, prefer
+    the number (more precise — no name-disambiguation fuzziness).
+
+    Headerless CSVs: assume the first column is the identifier."""
+    text = csv_content or ""
+    if text.startswith("﻿"):
+        text = text.lstrip("﻿")
+    if not text.strip():
+        return []
+
+    # Sniff: does the first row look like a header?
+    sample = text.splitlines()[0] if text.splitlines() else ""
+    has_header = any(s in sample.lower() for s in _CH_NAME_SYNONYMS + _CH_NUMBER_SYNONYMS)
+
+    if has_header:
+        reader = csv.DictReader(io.StringIO(text))
+        header = list(reader.fieldnames or [])
+        num_col = _ch_first_present(header, _CH_NUMBER_SYNONYMS)
+        name_col = _ch_first_present(header, _CH_NAME_SYNONYMS)
+        targets: list[str] = []
+        for row in reader:
+            num = (row.get(num_col) or "").strip() if num_col else ""
+            name = (row.get(name_col) or "").strip() if name_col else ""
+            chosen = num or name
+            if chosen:
+                targets.append(chosen)
+        return targets
+
+    # Headerless — first column.
+    reader = csv.reader(io.StringIO(text))
+    out: list[str] = []
+    for row in reader:
+        if not row:
+            continue
+        v = (row[0] or "").strip()
+        if v:
+            out.append(v)
+    return out
+
+
+@app.post("/companies-house/lookup")
+def companies_house_lookup(payload: CompaniesHouseLookupPayload):
+    target = (payload.company or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="company is required.")
+    res = companies_house.query_companies_house(target)
+    if res.get("needs_setup"):
+        return {"ok": False, "error": res.get("error"), "needs_setup": res["needs_setup"]}
+    if res.get("error"):
+        return {"ok": False, "error": res["error"]}
+    return {"ok": True, "result": res}
+
+
+@app.post("/companies-house/batch-lookup")
+def companies_house_batch_lookup(payload: CompaniesHouseBatchPayload):
+    """Accept either an explicit `companies` list or a `csv_content` string.
+
+    Returns one normalised result per input row, plus a `truncated` flag if
+    we capped the batch."""
+    if payload.csv_content:
+        targets = _ch_parse_csv(payload.csv_content)
+    else:
+        targets = [str(c).strip() for c in (payload.companies or []) if str(c).strip()]
+
+    if not targets:
+        raise HTTPException(
+            status_code=400,
+            detail="Need either `companies` (list) or `csv_content` (CSV string).",
+        )
+
+    truncated = len(targets) > _CH_BATCH_CAP
+    targets = targets[:_CH_BATCH_CAP]
+
+    # Parallel fan-out — see the rationale in _read_companies_house_batch_lookup.
+    # The HTTP endpoint isn't behind the chat 60s timeout, but batches of 50
+    # would still take ~90s sequentially; parallel keeps it under 10s.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        raw_results = list(pool.map(companies_house.query_companies_house, targets))
+
+    results: list[dict] = []
+    needs_setup_signal: Optional[dict] = None
+    for t, res in zip(targets, raw_results):
+        if res.get("needs_setup") and not needs_setup_signal:
+            needs_setup_signal = res["needs_setup"]
+        results.append({
+            "input": t,
+            "ok": not res.get("error"),
+            "error": res.get("error"),
+            "result": res if not res.get("error") else None,
+        })
+
+    response: dict = {
+        "ok": needs_setup_signal is None,
+        "total_requested": len(targets) + (1 if truncated else 0),
+        "total_processed": len(results),
+        "truncated": truncated,
+        "results": results,
+    }
+    if needs_setup_signal:
+        response["needs_setup"] = needs_setup_signal
+    return response
+
+
+# ---------------------------------------------------------------------------
+# v1.30 — Pluggable enrichment pipeline.
+# ---------------------------------------------------------------------------
+# CSV in → enriched CSV out (download link).
+# Sheets URL in → cells filled in place, same URL out.
+# The pipeline runs each registered enricher in priority order. Today
+# there's one (Companies House); Cognism / Lusha / Pomanda slot in
+# alongside it without redesign — see backend/enrichment/__init__.py.
+
+def _build_enrichment_summary_text(
+    summary: dict,
+    output_url: Optional[str],
+    input_type: str,
+    truncated: bool,
+    download_filename: Optional[str] = None,
+) -> str:
+    """Markdown for the chat reply. Read-action handlers return text
+    that gets spliced inline; this is what Adam will see."""
+    lines: list[str] = []
+    lines.append(f"**Enrichment run** ({input_type.upper()}):")
+    lines.append(
+        f"- Processed {summary['rows_processed']} rows — "
+        f"enriched {summary['rows_enriched']}, unmatched {summary['rows_unmatched']}"
+    )
+    # Per-enricher tally so Adam sees which sources fired.
+    per_source: dict[str, int] = {}
+    for entry in summary.get("per_row_status") or []:
+        for src, status in (entry.get("status") or {}).items():
+            if status.startswith("enriched"):
+                per_source[src] = per_source.get(src, 0) + 1
+    if per_source:
+        for src, n in per_source.items():
+            lines.append(f"- {src}: filled fields on {n} rows")
+    else:
+        lines.append("- No source filled any fields (check that Companies House is connected and the rows include a Company Name or Number).")
+
+    if truncated:
+        lines.append(f"- _Capped at {enrichment_io.MAX_ROWS} rows — re-run with the rest if needed._")
+
+    if output_url:
+        if input_type == "csv":
+            label = download_filename or "enriched.csv"
+            lines.append(f"\n[Download {label}]({output_url})")
+        else:
+            lines.append(f"\n[Open updated sheet]({output_url})")
+
+    return "\n".join(lines)
+
+
+# --- Enrichment workers (used by both the async endpoint AND the
+#     synchronous /chat read-action handler) -------------------------------
+
+def _enrichment_validate_csv(payload: EnrichmentRunPayload) -> tuple[list[dict], list[str], bool, str]:
+    rows, header = enrichment_io.read_csv((payload.csv_content or "").strip())
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV had no data rows.")
+    truncated = False
+    if len(rows) > enrichment_io.MAX_ROWS:
+        truncated = True
+        rows = rows[: enrichment_io.MAX_ROWS]
+    download_filename = (payload.filename or "enriched.csv").rsplit("/", 1)[-1]
+    if not download_filename.lower().endswith(".csv"):
+        download_filename += ".csv"
+    return rows, header, truncated, download_filename
+
+
+def _enrichment_validate_sheets(payload: EnrichmentRunPayload) -> tuple[list[dict], list[str], bool, str]:
+    """Returns (rows, header, truncated, spreadsheet_id). Raises HTTPException on a parse
+    error; raises ValueError on a Sheets read failure (caller decides whether
+    that's a needs_setup or a hard failure)."""
+    sheets_url = (payload.sheets_url or "").strip()
+    spreadsheet_id = enrichment_io.parse_sheets_url(sheets_url)
+    if not spreadsheet_id:
+        raise HTTPException(
+            status_code=400,
+            detail="sheets_url doesn't look like a Google Sheets URL "
+                   "(expected https://docs.google.com/spreadsheets/d/<id>/...).",
+        )
+    rows, header, _meta = enrichment_io.read_sheet(spreadsheet_id)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Sheet had no data rows.")
+    truncated = False
+    if len(rows) > enrichment_io.MAX_ROWS:
+        truncated = True
+        rows = rows[: enrichment_io.MAX_ROWS]
+    return rows, header, truncated, spreadsheet_id
+
+
+async def _enrichment_run_csv_async(
+    job_id: str,
+    rows: list[dict],
+    header: list[str],
+    truncated: bool,
+    download_filename: str,
+) -> dict:
+    """Background worker for the CSV path. Calls into job_manager so the
+    polling endpoint sees per-row progress in real time."""
+    pipeline = EnrichmentPipeline(ENRICHERS)
+    try:
+        results = await pipeline.enrich_batch(rows, job_id=job_id)
+        enriched_rows = [r for r, _ in results]
+        summary = pipeline.summarise(results)
+
+        final_header = enrichment_io.merge_headers(header, enriched_rows)
+        _out_path, token = enrichment_io.write_csv(enriched_rows, final_header)
+        # Backend listens on 127.0.0.1:8001 (see electron/backend-manager.js).
+        # An absolute URL keeps copy-paste behaviour consistent and means the
+        # frontend doesn't need to know the API origin to render a download link.
+        output_url = f"http://127.0.0.1:8001/enrichment/download/{token}"
+
+        body: dict = {
+            "status": "completed",
+            "input_type": "csv",
+            "output_url": output_url,
+            "download_filename": download_filename,
+            "rows_processed": summary["rows_processed"],
+            "rows_enriched": summary["rows_enriched"],
+            "rows_unmatched": summary["rows_unmatched"],
+            "per_row_status": summary["per_row_status"],
+            "credits_used": summary["credits_used"],
+            "truncated": truncated,
+        }
+        body["summary_markdown"] = _build_enrichment_summary_text(
+            summary, output_url, "csv", truncated, download_filename
+        )
+        enrichment_jobs.complete_job(
+            job_id,
+            output_url=output_url,
+            summary=body,
+            download_filename=download_filename,
+            credits_used=summary["credits_used"],
+        )
+        return body
+    except Exception as exc:  # noqa: BLE001
+        enrichment_jobs.fail_job(job_id, str(exc) or "enrichment crashed")
+        raise
+
+
+async def _enrichment_run_sheets_async(
+    job_id: str,
+    spreadsheet_id: str,
+    sheets_url: str,
+    rows: list[dict],
+    header: list[str],
+    truncated: bool,
+) -> dict:
+    pipeline = EnrichmentPipeline(ENRICHERS)
+    try:
+        original_rows_copy = [dict(r) for r in rows]
+        results = await pipeline.enrich_batch(rows, job_id=job_id)
+        enriched_rows = [r for r, _ in results]
+        summary = pipeline.summarise(results)
+
+        write_res = enrichment_io.write_sheet(
+            spreadsheet_id, original_rows_copy, enriched_rows, header,
+        )
+        if not write_res.get("success"):
+            err = write_res.get("error") or "Sheet write failed."
+            enrichment_jobs.fail_job(job_id, err)
+            return {
+                "status": "write_failed",
+                "input_type": "sheets",
+                "error": err,
+                "needs_setup": write_res.get("needs_setup"),
+                "rows_processed": summary["rows_processed"],
+                "per_row_status": summary["per_row_status"],
+            }
+
+        output_url = sheets_url
+        body: dict = {
+            "status": "completed",
+            "input_type": "sheets",
+            "output_url": output_url,
+            "spreadsheet_id": spreadsheet_id,
+            "updated_cells": write_res.get("updated_cells", 0),
+            "rows_processed": summary["rows_processed"],
+            "rows_enriched": summary["rows_enriched"],
+            "rows_unmatched": summary["rows_unmatched"],
+            "per_row_status": summary["per_row_status"],
+            "credits_used": summary["credits_used"],
+            "truncated": truncated,
+        }
+        body["summary_markdown"] = _build_enrichment_summary_text(
+            summary, output_url, "sheets", truncated
+        )
+        enrichment_jobs.complete_job(
+            job_id,
+            output_url=output_url,
+            summary=body,
+            credits_used=summary["credits_used"],
+        )
+        return body
+    except Exception as exc:  # noqa: BLE001
+        enrichment_jobs.fail_job(job_id, str(exc) or "enrichment crashed")
+        raise
+
+
+def _spawn_background_enrichment(coro_factory) -> None:
+    """Run an async enrichment coroutine to completion in a fresh
+    background thread with its own event loop.
+
+    Why a thread, not asyncio.create_task on the request loop: under
+    Uvicorn this would also work, but it ties the job's lifetime to
+    the request loop's idle ticks AND breaks under fastapi.testclient
+    (which closes the loop right after the response returns). A dedicated
+    thread + asyncio.run() is identical in behaviour across both
+    contexts and trivial to reason about."""
+    import threading
+
+    def _runner():
+        try:
+            asyncio.run(coro_factory())
+        except Exception:  # noqa: BLE001
+            # The coroutine itself records failures via job_manager.fail_job;
+            # this catch is purely defensive so a freak crash never escapes
+            # the worker thread silently.
+            import traceback
+            traceback.print_exc()
+
+    threading.Thread(target=_runner, name="enrichment-worker", daemon=True).start()
+
+
+def _enrichment_dispatch(payload: EnrichmentRunPayload, *, mode: str) -> dict:
+    """Shared validation + dispatch.
+
+    `mode='async'` returns immediately with a job_id and runs the work
+    in a background thread. `mode='sync'` runs to completion in the
+    calling thread and returns the final summary.
+
+    The chat read-action handler uses 'async' so the agent reply contains
+    a progress marker that the UI can render right away — without this,
+    a 200-row run would hang the chat round for minutes."""
+    csv_content = (payload.csv_content or "").strip()
+    sheets_url = (payload.sheets_url or "").strip()
+    if not csv_content and not sheets_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either csv_content or sheets_url is required.",
+        )
+
+    if csv_content:
+        rows, header, truncated, download_filename = _enrichment_validate_csv(payload)
+        job_id = enrichment_jobs.create_job(len(rows))
+        if mode == "async":
+            _spawn_background_enrichment(
+                lambda: _enrichment_run_csv_async(job_id, rows, header, truncated, download_filename)
+            )
+            return _enrichment_async_envelope(job_id, "csv", truncated, total=len(rows))
+        return asyncio.run(
+            _enrichment_run_csv_async(job_id, rows, header, truncated, download_filename)
+        )
+
+    # Sheets path
+    try:
+        rows, header, truncated, spreadsheet_id = _enrichment_validate_sheets(payload)
+    except ValueError as exc:
+        msg = str(exc)
+        if "not connected" in msg.lower() or "needs_setup" in msg.lower():
+            return {
+                "status": "needs_setup",
+                "input_type": "sheets",
+                "error": msg,
+                "needs_setup": {
+                    "tools": ["google-workspace"],
+                    "context": "to read and write Google Sheets for enrichment",
+                },
+            }
+        raise HTTPException(status_code=400, detail=msg) from exc
+
+    job_id = enrichment_jobs.create_job(len(rows))
+    if mode == "async":
+        _spawn_background_enrichment(
+            lambda: _enrichment_run_sheets_async(job_id, spreadsheet_id, sheets_url, rows, header, truncated)
+        )
+        return _enrichment_async_envelope(job_id, "sheets", truncated, total=len(rows))
+    return asyncio.run(
+        _enrichment_run_sheets_async(job_id, spreadsheet_id, sheets_url, rows, header, truncated)
+    )
+
+
+def _enrichment_async_envelope(job_id: str, input_type: str, truncated: bool, *, total: int) -> dict:
+    """The shape POST /enrichment/run returns when the work is being
+    processed in the background. Includes the marker the chat splitter
+    looks for ([[enrichment-progress:<job_id>]]) so a chat-triggered
+    run renders the progress card immediately."""
+    return {
+        "status": "processing",
+        "input_type": input_type,
+        "job_id": job_id,
+        "poll_url": f"/enrichment/status/{job_id}",
+        "total": total,
+        "truncated": truncated,
+        "progress_marker": f"[[enrichment-progress:{job_id}]]",
+    }
+
+
+@app.post("/enrichment/run")
+async def enrichment_run(payload: EnrichmentRunPayload):
+    """Kick off an enrichment job. Returns immediately with a job_id;
+    the work runs in a background task and progress is observable via
+    GET /enrichment/status/<job_id>.
+
+    The synchronous behaviour from v1.30 is preserved internally for
+    the chat read-action handler — see `enrichment_run_sync()`."""
+    return _enrichment_dispatch(payload, mode="async")
+
+
+def enrichment_run_sync(payload: EnrichmentRunPayload) -> dict:
+    """Synchronous variant — runs to completion in the calling thread.
+    Kept for compatibility with the v1.30 chat read-action handler tests
+    and any caller that needs the final summary inline."""
+    return _enrichment_dispatch(payload, mode="sync")
+
+
+@app.get("/enrichment/status/{job_id}")
+def enrichment_status(job_id: str):
+    """Return the live state of an enrichment job. Frontend polls this
+    every second while the progress card is visible. Returns 404 once
+    the job has been pruned (TTL ~30 min after completion)."""
+    state = enrichment_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown enrichment job.")
+    return state
+
+
+@app.get("/enrichment/download/{token}")
+def enrichment_download(token: str):
+    """Stream a previously-generated enriched CSV to the browser."""
+    from fastapi.responses import FileResponse
+    path = enrichment_io.resolve_download_path(token)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Enrichment file not found or expired.")
+    return FileResponse(
+        str(path),
+        media_type="text/csv",
+        filename=path.name,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Custom agents — CRUD over ~/.openclaw/workspace/agents/<slug>/.
 # ---------------------------------------------------------------------------
 #
@@ -4307,6 +5380,7 @@ AGENT_TOOL_CATALOGUE = {
     "hubspot":          "CRM contacts, deals, and companies",
     "ghl":              "GoHighLevel marketing CRM (contacts, conversations, opportunities)",
     "pomanda":          "UK Companies House data and shareholder lookup",
+    "companies_house":  "UK Companies House register: officers and persons with significant control (PSC / largest shareholders)",
     "cognism":          "Email and mobile enrichment (primary)",
     "lusha":            "Email and mobile enrichment (fallback)",
 }

@@ -116,6 +116,46 @@ def append_rows(spreadsheet_id: str, range: str, rows: list[list]) -> dict:
     }
 
 
+def values_batch_update(
+    spreadsheet_id: str,
+    updates: list[dict],
+) -> dict:
+    """In-place batch update — write specific cells without disturbing others.
+
+    `updates` is a list of {"range": "<A1>", "values": [[...]]} entries
+    in the same shape Google's spreadsheets.values.batchUpdate accepts.
+    Use this for the "fill missing cells in place" enrichment flow
+    where blanket overwrites would clobber unrelated work.
+    """
+    if not spreadsheet_id:
+        return {"success": False, "updated_cells": 0, "error": "Missing spreadsheet_id"}
+    if not isinstance(updates, list) or not updates:
+        return {"success": False, "updated_cells": 0, "error": "No updates provided"}
+
+    url = f"{BASE}/spreadsheets/{spreadsheet_id}/values:batchUpdate"
+    status, body, needs = _authed_request(
+        "POST",
+        url,
+        context="to update specific cells in a spreadsheet",
+        body={"valueInputOption": "USER_ENTERED", "data": updates},
+    )
+    if needs:
+        return {"success": False, "updated_cells": 0,
+                "error": "Google not connected", "needs_setup": needs}
+    if status not in (200, 201):
+        return _failure({"success": False, "updated_cells": 0}, status, body)
+    return {
+        "success": True,
+        "updated_cells": (body or {}).get("totalUpdatedCells") or 0,
+        "updated_ranges": [
+            r.get("updatedRange") for r in (body or {}).get("responses", [])
+            if isinstance(r, dict)
+        ],
+        "spreadsheet_id": spreadsheet_id,
+        "error": None,
+    }
+
+
 def create_sheet(title: str) -> dict:
     """Create a new spreadsheet titled `title`. Returns its ID + URL."""
     if not title:

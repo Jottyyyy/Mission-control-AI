@@ -3,9 +3,44 @@ import Data from './data.jsx';
 import Icon from './icons.jsx';
 import { renderMarkdown } from './markdown.jsx';
 import ActionCard, { splitByActionCards } from './ActionCard.jsx';
+import EnrichmentProgressCard, { ENRICHMENT_PROGRESS_MARKER_RE } from './EnrichmentProgressCard.jsx';
 import SetupModal from './SetupModal.jsx';
 
 const API_BASE = "http://127.0.0.1:8001";
+
+// Walk a text-split piece and further split it by enrichment-progress
+// markers. Lets the message renderer interleave action cards, enrichment
+// progress cards, and markdown text in any order.
+function splitTextByEnrichmentMarkers(text) {
+  if (!text) return [];
+  const re = new RegExp(ENRICHMENT_PROGRESS_MARKER_RE.source, "g");
+  const out = [];
+  let last = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push({ kind: "text", text: text.slice(last, m.index) });
+    out.push({ kind: "enrichment", jobId: m[1] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push({ kind: "text", text: text.slice(last) });
+  return out;
+}
+
+function splitMessageBody(text) {
+  // First split by [[action-card:...]], then walk text pieces and split
+  // by [[enrichment-progress:...]] so both markers can appear in the
+  // same reply.
+  const pieces = splitByActionCards(text);
+  const out = [];
+  for (const p of pieces) {
+    if (p.kind === "text") {
+      out.push(...splitTextByEnrichmentMarkers(p.text));
+    } else {
+      out.push(p);
+    }
+  }
+  return out;
+}
 
 // Summarise a batch result into a Marketing-agent reply body (markdown).
 function _summaryText(batch, card) {
@@ -831,20 +866,31 @@ function Chat({
                     ? m.text.split("\n").map((line, j) =>
                         line.trim() === "" ? <p key={j}>&nbsp;</p> : <p key={j}>{line}</p>
                       )
-                    : splitByActionCards(m.text).map((piece, j) =>
-                        piece.kind === "card" ? (
-                          <ActionCard
-                            key={`m-${i}-c-${j}-${piece.token}`}
-                            token={piece.token}
-                            onEditRequest={(text) => handleSend(text)}
-                            onNeedsSetup={maybeTriggerSetup}
-                          />
-                        ) : (
+                    : splitMessageBody(m.text).map((piece, j) => {
+                        if (piece.kind === "card") {
+                          return (
+                            <ActionCard
+                              key={`m-${i}-c-${j}-${piece.token}`}
+                              token={piece.token}
+                              onEditRequest={(text) => handleSend(text)}
+                              onNeedsSetup={maybeTriggerSetup}
+                            />
+                          );
+                        }
+                        if (piece.kind === "enrichment") {
+                          return (
+                            <EnrichmentProgressCard
+                              key={`m-${i}-e-${j}-${piece.jobId}`}
+                              jobId={piece.jobId}
+                            />
+                          );
+                        }
+                        return (
                           <React.Fragment key={`m-${i}-t-${j}`}>
                             {renderMarkdown(piece.text, `m-${i}-t-${j}`)}
                           </React.Fragment>
-                        )
-                      )}
+                        );
+                      })}
                 </div>
                 {m.needs_api_enable && <ApiEnableBanner info={m.needs_api_enable} />}
                 {!m.error && <BrainPill model={m.model_used} />}
