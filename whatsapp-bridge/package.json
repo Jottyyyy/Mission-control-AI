@@ -1,0 +1,10 @@
+{
+  "name": "whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bridge inbound WhatsApp dispatch from OpenClaw to Mission Control's FastAPI; suppresses OpenClaw's default agent so Jackson owns the reply path.",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "whatsapp-bridge",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "endpoint": { "type": "string" },
+      "timeoutMs": { "type": "integer", "minimum": 0 }
+    }
+  }
+}
